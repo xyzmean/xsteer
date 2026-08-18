@@ -99,6 +99,16 @@ func unpackPayload(in []byte) Payload {
 // ConnID — номер соединения из принятой нагрузки.
 func (p Payload) ConnID() int { return int(p.Flags & 0x07) }
 
+// FlagSplit — «умею собирать запись, разрезанную между сегментами».
+//
+// Бит в ПОДПИСАННОЙ части рукопожатия, а не отдельное поле: место в аутентификаторе уже есть, а
+// новое поле на проводе стоило бы байт и было бы видно. Сторона, которая про этот бит не знает
+// (реализация на C маскирует flags как 0x07), его не выставит — и разрезанного не получит.
+const FlagSplit = 0x08
+
+// CanSplit — согласована ли сборка разрезанных записей.
+func (p Payload) CanSplit() bool { return p.Flags&FlagSplit != 0 }
+
 // HS — состояние рукопожатия. Живёт от начала до Split и обнуляется сразу после.
 type HS struct {
 	h    [32]byte // транскрипт
@@ -284,7 +294,7 @@ func pubOf(priv [32]byte) ([32]byte, error) {
 // aesPreferred решает, какой шифр будет согласован: порядок наборов в Hello и есть согласование.
 // Решает клиент, потому что узкое место всегда его процессор, а не сервер.
 func (hs *HS) ClientHello(priv, hubPub [32]byte, sni string, mtu, connID int,
-	aesPreferred bool, rnd io.Reader) ([]byte, error) {
+	aesPreferred, pq bool, rnd io.Reader) ([]byte, error) {
 
 	a := AEADChaCha
 	if aesPreferred {
@@ -382,7 +392,7 @@ func (hs *HS) ClientHello(priv, hubPub [32]byte, sni string, mtu, connID int,
 		return nil
 	}
 
-	rec, err := chello.Build(sni, aesPreferred, car, hs.rnd)
+	rec, err := chello.BuildOpt(sni, aesPreferred, pq, car, hs.rnd)
 	if err != nil {
 		if inner != nil {
 			return nil, inner

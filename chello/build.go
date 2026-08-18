@@ -33,7 +33,18 @@ import (
 // едет запечатанный статический ключ.
 const (
 	GroupX25519 = 0x001D
-	ExtECH      = 0xFE0D
+	// GroupMLKEM — X25519MLKEM768, постквантовый обмен, который современный Chrome предлагает
+	// ПЕРВЫМ. Его ключ занимает 1216 байт, и именно из-за него браузерный ClientHello вырос до
+	// ~1700 байт и перестал влезать в один сегмент.
+	//
+	// Зачем он нам, если мы им не пользуемся: без него наш Hello занимал 537 байт против 1759 у
+	// настоящего Chrome (измерено tests/xhttp-compare.sh) и уезжал ОДНИМ сегментом, тогда как
+	// браузерный всегда двумя. И размер, и число сегментов считаются одной строкой, а «Chrome,
+	// который не предлагает постквантовый обмен» — это Chrome позапрошлого года.
+	GroupMLKEM = 0x11EC
+	// MLKEMShare — размер ключа X25519MLKEM768 на проводе: 1184 байта ML-KEM плюс 32 байта X25519.
+	MLKEMShare = 1216
+	ExtECH     = 0xFE0D
 	// ECHPayload — размер набивки ECH. Ровно столько же, сколько у Chrome без настроенного ECH:
 	// расширение целиком выходит 218 байт, и отличие хотя бы в одном байте делает Hello
 	// отличимым по размеру одного расширения.
@@ -120,6 +131,15 @@ func ext(typ int, body []byte) pend { return pend{typ, body} }
 // Hello иначе невозможно сравнить с замороженным эталоном, а без такого сравнения любая правка
 // облика проходит незамеченной.
 func Build(sni string, aesPreferred bool, car *Carrier, rnd io.Reader) ([]byte, error) {
+	return BuildOpt(sni, aesPreferred, true, car, rnd)
+}
+
+// BuildOpt — то же, но с выбором: предлагать ли постквантовый обмен.
+//
+// Выбор нужен не для гибкости, а для совместимости: хаб, который не умеет собирать ClientHello из
+// двух сегментов (реализация на C), большой Hello просто не разберёт. Выключенным постквантовым
+// обменом Hello возвращается к прежним 537 байтам и одному сегменту — вместе с прежним признаком.
+func BuildOpt(sni string, aesPreferred, pq bool, car *Carrier, rnd io.Reader) ([]byte, error) {
 	if car == nil || car.FillECH == nil || car.FillSID == nil {
 		return nil, errors.New("chello: без носителя собирать Hello незачем")
 	}
@@ -288,23 +308,49 @@ func Build(sni string, aesPreferred bool, car *Carrier, rnd io.Reader) ([]byte, 
 		px = append(px, ext(0x000D, s.b))
 	}
 	{
-		// key_share: GREASE-группа с одним нулевым байтом, затем наша половина X25519. Номер
-		// GREASE-группы тот же, что в supported_groups — так делает браузер.
+		// key_share: GREASE-группа с одним нулевым байтом, затем — у современного Chrome —
+		// постквантовый ключ, и только потом X25519. Номер GREASE-группы тот же, что в
+		// supported_groups: так делает браузер.
+		//
+		// Постквантовая половина — случайные байты: мы ею не пользуемся, а хаб её игнорирует. Для
+		// наблюдателя это неотличимо от настоящего ключа (он тоже выглядит шумом), и именно она
+		// делает наш Hello браузерного размера.
 		s := &buf{}
-		s.u16(41)
+		body := 2 + 2 + 1 // GREASE
+		if pq {
+			body += 2 + 2 + MLKEMShare
+		}
+		body += 2 + 2 + 32 // x25519
+		s.u16(body)
 		s.u16(gGroup)
 		s.u16(1)
 		s.u8(0)
+		if pq {
+			pqKey, err := rb(MLKEMShare)
+			if err != nil {
+				return nil, err
+			}
+			s.u16(GroupMLKEM)
+			s.u16(MLKEMShare)
+			s.put(pqKey...)
+		}
 		s.u16(GroupX25519)
 		s.u16(32)
 		s.put(car.Pub[:]...)
 		px = append(px, ext(0x0033, s.b))
 	}
 	{
-		// supported_groups: GREASE, X25519, secp256r1, secp384r1 — ровно набор Chrome.
+		// supported_groups: GREASE, постквантовая, X25519, secp256r1, secp384r1 — набор Chrome.
 		s := &buf{}
-		s.u16(8)
+		n := 8
+		if pq {
+			n += 2
+		}
+		s.u16(n)
 		s.u16(gGroup)
+		if pq {
+			s.u16(GroupMLKEM)
+		}
 		s.u16(GroupX25519)
 		s.u16(0x0017)
 		s.u16(0x0018)

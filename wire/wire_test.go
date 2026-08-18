@@ -446,3 +446,128 @@ func TestОграничительЧастоты(t *testing.T) {
 		t.Error("подавленные обязаны попасть в строку")
 	}
 }
+
+func TestПачкаКадров(t *testing.T) {
+	frames := [][]byte{
+		bytes.Repeat([]byte{0x45}, 40),
+		bytes.Repeat([]byte{0x46}, 1439),
+		{0x47},
+	}
+	dst := make([]byte, MTUDefault*8)
+	n := BatchBuild(dst, frames)
+	if n == 0 {
+		t.Fatal("пачка не собралась")
+	}
+	if FrameKind(dst[:n]) != KindCtl {
+		t.Error("контейнер обязан опознаваться как служебный кадр")
+	}
+	var got [][]byte
+	if !BatchIter(dst[:n], func(f []byte) { got = append(got, append([]byte(nil), f...)) }) {
+		t.Fatal("своя же пачка не разобралась")
+	}
+	if len(got) != len(frames) {
+		t.Fatalf("кадров вышло %d, а клали %d", len(got), len(frames))
+	}
+	for i := range frames {
+		if !bytes.Equal(got[i], frames[i]) {
+			t.Errorf("кадр %d испортился", i)
+		}
+	}
+	// Накладные расходы пачки обязаны быть меньше, чем у тех же кадров поодиночке: ради этого
+	// она и заведена, и если однажды станет наоборот — тест скажет.
+	alone := 0
+	for _, f := range frames {
+		alone += Overhead + len(f)
+	}
+	batched := HdrRoom + n + Tag + (len(frames)-1)*0 // одна запись, сегментов может быть больше
+	segs := (n + Tag + MTUDefault - 1) / MTUDefault
+	batched = segs*(IPHdr+TCPHdr) + RecHdr + Tag + n
+	if batched >= alone {
+		t.Errorf("пачка (%d байт) не дешевле одиночных (%d)", batched, alone)
+	}
+
+	// Один кадр в контейнер не кладётся: одиночная запись дешевле на байт.
+	if BatchBuild(dst, frames[:1]) != 0 {
+		t.Error("один кадр упакован в контейнер")
+	}
+	// Битый контейнер обязан отвергаться целиком, а не разбираться до половины.
+	bad := append([]byte(nil), dst[:n]...)
+	bad[1] = 0xFF
+	if BatchIter(bad, func([]byte) {}) {
+		t.Error("контейнер с завышенной длиной кадра принят")
+	}
+	if BatchIter(dst[:2], func([]byte) {}) {
+		t.Error("обрезок контейнера принят")
+	}
+}
+
+func TestОбратнаяСвязьПоСборке(t *testing.T) {
+	pt := make([]byte, 8)
+	if LossBuild(pt, 7) != 3 {
+		t.Fatal("сообщение о потерях обязано быть тремя байтами")
+	}
+	if LossValue(pt[:3]) != 7 {
+		t.Error("значение не читается обратно")
+	}
+	if LossValue([]byte{CtlProbe, 0, 7}) != -1 {
+		t.Error("проба принята за сообщение о потерях")
+	}
+}
+
+func TestСборкаРазрезаннойЗаписи(t *testing.T) {
+	// Запись на 3000 байт, разрезанная на три сегмента: собраться обязана, смещение для nonce —
+	// от ПЕРВОГО сегмента.
+	const isn = 1000
+	body := bytes.Repeat([]byte{0xAB}, 3000)
+	rec := make([]byte, RecHdr+len(body))
+	if err := RecBuild(rec, len(body)); err != nil {
+		t.Fatal(err)
+	}
+	copy(rec[RecHdr:], body)
+
+	var r Reasm
+	parts := [][]byte{rec[:1400], rec[1400:2800], rec[2800:]}
+	seq := uint32(isn + 1)
+	var out []byte
+	var rel uint32
+	for i, p := range parts {
+		b, hdr, rl, ok := r.Feed(seq, isn, p)
+		if ok && len(hdr) != RecHdr {
+			t.Fatalf("заголовок записи отдан длиной %d", len(hdr))
+		}
+		if ok {
+			if i != len(parts)-1 {
+				t.Fatalf("запись собралась на части %d раньше времени", i)
+			}
+			out, rel = b, rl
+		}
+		seq += uint32(len(p))
+	}
+	if out == nil {
+		t.Fatal("запись не собралась")
+	}
+	if rel != 1 {
+		t.Errorf("смещение для nonce = %d, а обязано быть от первого сегмента (1)", rel)
+	}
+	if !bytes.Equal(out, body) {
+		t.Error("собранная запись не совпала с исходной")
+	}
+
+	// Пропавший средний сегмент: запись обязана быть выброшена, а не склеена из чужих байтов.
+	r = Reasm{}
+	r.Feed(1, 0, rec[:1400])
+	if _, _, _, ok := r.Feed(1400+1000, 0, rec[2800:]); ok {
+		t.Error("собралась запись из несмежных сегментов")
+	}
+	if r.Dropped == 0 {
+		t.Error("выброшенная сборка не посчитана — обратной связи неоткуда будет взяться")
+	}
+
+	// Целая запись в одном сегменте по-прежнему разбирается сразу.
+	r = Reasm{}
+	one := make([]byte, RecHdr+Tag+10)
+	_ = RecBuild(one, Tag+10)
+	if _, _, _, ok := r.Feed(5, 0, one); !ok {
+		t.Error("целая запись в одном сегменте не разобралась")
+	}
+}

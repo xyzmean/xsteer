@@ -7,13 +7,20 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
+// linuxDev держит СЫРОЙ дескриптор, а не os.File, и это не мелочь.
+//
+// os.File отдаёт дескриптор сетевому опросчику Go, и тогда Read блокируется до появления данных —
+// узнать «сейчас пусто» становится нечем, а без этого нельзя собрать пачку из того, что уже
+// пришло, не заводя отдельной горутины с каналом. Канал стоил шестикратного падения скорости
+// (255 Мбит/с против 1582 на том же железе): на каждый пакет приходилось переключение горутин.
 type linuxDev struct {
-	f    *os.File
+	fd   int
 	name string
 }
 
@@ -31,7 +38,7 @@ type ifreq struct {
 func Open(name string) (Device, error) { return openOne(name, false) }
 
 func openOne(name string, multiQueue bool) (Device, error) {
-	f, err := os.OpenFile("/dev/net/tun", os.O_RDWR, 0)
+	fd, err := unix.Open("/dev/net/tun", unix.O_RDWR|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("%w: /dev/net/tun (%v) — на Linux нужен модуль tun и права root",
 			ErrNoDevice, err)
@@ -44,16 +51,16 @@ func openOne(name string, multiQueue bool) (Device, error) {
 	if multiQueue {
 		req.flags |= unix.IFF_MULTI_QUEUE
 	}
-	if _, _, e := unix.Syscall(unix.SYS_IOCTL, f.Fd(), uintptr(unix.TUNSETIFF),
+	if _, _, e := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(unix.TUNSETIFF),
 		uintptr(unsafe.Pointer(&req))); e != 0 {
-		f.Close()
+		unix.Close(fd)
 		return nil, fmt.Errorf("%w: TUNSETIFF %s: %v", ErrNoDevice, name, e)
 	}
 	got := string(req.name[:])
 	if i := indexZero(req.name[:]); i >= 0 {
 		got = string(req.name[:i])
 	}
-	return &linuxDev{f: f, name: got}, nil
+	return &linuxDev{fd: fd, name: got}, nil
 }
 
 // OpenQueues открывает устройство с НЕСКОЛЬКИМИ очередями: по одной на воркера.
@@ -95,10 +102,54 @@ func indexZero(b []byte) int {
 	return -1
 }
 
-func (d *linuxDev) Read(p []byte) (int, error)  { return d.f.Read(p) }
-func (d *linuxDev) Write(p []byte) (int, error) { return d.f.Write(p) }
-func (d *linuxDev) Name() string                { return d.name }
-func (d *linuxDev) Close() error                { return d.f.Close() }
+func (d *linuxDev) Read(p []byte) (int, error) {
+	for {
+		n, err := unix.Read(d.fd, p)
+		switch err {
+		case nil:
+			return n, nil
+		case unix.EINTR:
+			continue
+		case unix.EAGAIN:
+			return 0, ErrAgain
+		default:
+			return 0, err
+		}
+	}
+}
+
+func (d *linuxDev) Write(p []byte) (int, error) {
+	for {
+		n, err := unix.Write(d.fd, p)
+		if err == unix.EINTR {
+			continue
+		}
+		// EAGAIN на записи означает переполненную очередь устройства: пакет потерян, и это
+		// нормальная перегрузка, а не отказ — повторять его смысла нет, внутренний TCP разберётся.
+		if err == unix.EAGAIN {
+			return 0, ErrAgain
+		}
+		return n, err
+	}
+}
+
+func (d *linuxDev) WaitRead(timeout time.Duration) (bool, error) {
+	fds := []unix.PollFd{{Fd: int32(d.fd), Events: unix.POLLIN}}
+	ms := int(timeout / time.Millisecond)
+	for {
+		n, err := unix.Poll(fds, ms)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		return n > 0, nil
+	}
+}
+
+func (d *linuxDev) Name() string { return d.name }
+func (d *linuxDev) Close() error { return unix.Close(d.fd) }
 
 // SetMTU и SetAddr сделаны через `ip`, а не через netlink.
 //

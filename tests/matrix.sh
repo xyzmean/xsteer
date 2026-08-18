@@ -7,6 +7,12 @@
 # проверяется согласованность реализации с самой собой, а не формат на проводе. Расхождение видно
 # только в перекрёстных клетках, и именно они здесь и гоняются.
 #
+# ПЕРЕКРЁСТНЫЕ КЛЕТКИ ИДУТ В РЕЖИМЕ СОВМЕСТИМОСТИ (--no-batch). Реализация на Go ушла вперёд:
+# кадры собираются в одну запись, записи разрезаются между сегментами, ClientHello браузерного
+# размера едет двумя сегментами. Движок на C этого пока не умеет, и это осознанный долг, а не
+# поломка: облик на проводе стоил того, а перенос в C — отдельная работа. Ключ --no-batch
+# возвращает прежний формат, и им перекрёстные клетки продолжают сходиться.
+#
 # Каждая клетка — отдельные пространства имён, свои ключи, полный подъём с нуля.
 #
 #     sudo sh tests/matrix.sh            все четыре клетки
@@ -111,11 +117,15 @@ EOF
     # Перепроверка пути раз в три секунды: стенду надо увидеть работу согласования.
     export STEER_XS_PROBE_MS=3000
 
+    # Режим совместимости включается ровно тог, когда в клетке есть половина на C.
+    compat=""
+    if [ "$hub_kind" = c ] || [ "$cli_kind" = c ]; then compat="--no-batch"; fi
+
     if [ "$hub_kind" = c ]; then
         ip netns exec $NSH "$HUB_C" xsteer-hub --config "$WORK/hub.conf" \
             --state-dir "$WORK/state" > "$WORK/hub.log" 2>&1 &
     else
-        ip netns exec $NSH "$GO" hub "$WORK/hub.conf" > "$WORK/hub.log" 2>&1 &
+        ip netns exec $NSH "$GO" hub "$WORK/hub.conf" $compat > "$WORK/hub.log" 2>&1 &
     fi
     sleep 0.8
 
@@ -127,9 +137,9 @@ EOF
             --state-dir "$WORK/state" > "$WORK/b.log" 2>&1 &
     else
         deva=xsa; devb=xsb
-        ip netns exec $NSA "$GO" up "$WORK/a.conf" --dev xsa --probe-ms 3000 \
+        ip netns exec $NSA "$GO" up "$WORK/a.conf" --dev xsa --probe-ms 3000 $compat \
             > "$WORK/a.log" 2>&1 &
-        ip netns exec $NSB "$GO" up "$WORK/b.conf" --dev xsb --probe-ms 3000 \
+        ip netns exec $NSB "$GO" up "$WORK/b.conf" --dev xsb --probe-ms 3000 $compat \
             > "$WORK/b.log" 2>&1 &
     fi
 

@@ -63,6 +63,13 @@ type Options struct {
 	// Routes — направить ли AllowedIPs хаба в устройство. Ложь нужна тогда, когда маршрутами
 	// распоряжается кто-то другой.
 	Routes bool
+	// NoBatch — не собирать кадры в одну запись и не разрезать записи между сегментами.
+	//
+	// Нужно ровно для одного: разговора с хабом на C, который ни пачек, ни сборки пока не умеет.
+	// Пока перенос в C не сделан, это единственный способ подключить десктоп к уже работающему
+	// серверу — и цена названа прямо: облик на проводе возвращается к тому, который отличается от
+	// настоящего TLS первым же признаком (запись всегда кончается на границе сегмента).
+	NoBatch bool
 }
 
 // Client — поднятый туннель.
@@ -95,6 +102,20 @@ type hubInfo struct {
 	pub  [32]byte
 	str  string
 }
+
+// Обратная связь по сборке разрезанных записей.
+const (
+	// reasmCooldownMS — сколько везти по одному кадру после жалобы той стороны. Десять секунд:
+	// достаточно, чтобы всплеск потерь прошёл, и мало, чтобы не терять выигрыш пачек надолго.
+	reasmCooldownMS = 10000
+	// reasmReportMS — как часто сообщать о несобравшихся записях. Две секунды: чаще — лишний
+	// служебный трафик, реже — та сторона слишком долго везёт пачками в рвущийся путь.
+	reasmReportMS = 2000
+	// reasmGrowMS — как быстро наращивать пачку обратно на чистом пути.
+	reasmGrowMS = 3000
+)
+
+func nowMS() int64 { return time.Now().UnixNano() / int64(time.Millisecond) }
 
 func (c *Client) logf(f string, a ...any) {
 	if c.opt.Logf != nil {
@@ -299,6 +320,25 @@ type sess struct {
 	// НЕБЛОКИРУЮЩАЯ: потерянное эхо стоит одного повтора пробы, а придержанная горутина приёма
 	// стоила бы задержки всему трафику.
 	packs chan int
+
+	// ---- пачки и сборка разрезанных записей ----
+	//
+	// reasm принадлежит горутине приёма, batchMax и coolUntil — читаются отправкой и правятся
+	// горутиной времени по обратной связи. Величины целые и меняются раз в секунды, поэтому
+	// согласовывать их сложнее, чем стоит: худшее, что даст расхождение на такт, — одна запись,
+	// собранная не с тем размером пачки.
+	reasm     wire.Reasm
+	lastDrops uint64
+	// batchMax — сколько кадров класть в одну запись СЕЙЧАС. Не постоянная: разрезанная запись
+	// гибнет целиком при потере любого сегмента, поэтому на рваном пути пачка обязана схлопываться
+	// до одного кадра. Растёт по чистой обратной связи, падает мгновенно.
+	batchMax   int
+	coolUntil  int64
+	lastReport int64
+	lastGrow   int64
+
+	// keepNext — через сколько отправить следующий keepalive. Разное каждый раз: см. timeLoop.
+	keepNext int64
 }
 
 func (c *Client) session(ctx context.Context, id int, dev tun.Device, devName string) error {
@@ -321,7 +361,10 @@ func (c *Client) session(ctx context.Context, id int, dev tun.Device, devName st
 	// делает» неотличимым от «SYN не уходит», и ровно на это уходит первый живой прогон.
 	c.logf("соединение %d: подключаюсь к %s с порта %d", id, c.hub.str, conn.SPort)
 
-	s := &sess{conn: conn, packs: make(chan int, 4)}
+	s := &sess{conn: conn, packs: make(chan int, 4), batchMax: 2}
+	if c.opt.NoBatch {
+		s.batchMax = 1
+	}
 	s.mtuCap = c.opt.Conf.MTU
 	buf := make([]byte, wire.Row)
 
@@ -372,13 +415,25 @@ func (c *Client) session(ctx context.Context, id int, dev tun.Device, devName st
 	if mtuSay == 0 {
 		mtuSay = int(c.mtuNow.Load())
 	}
+	// Постквантовый ключ в Hello — то, что делает его браузерного размера (1759 байт против 537).
+	// В режиме совместимости его нет: хаб на C собирать Hello из двух сегментов не умеет.
 	hello, err := hs.ClientHello(c.opt.Sec.Priv, c.hub.pub, c.opt.Conf.SNI, mtuSay, id,
-		c.opt.AESPreferred, nil)
+		c.opt.AESPreferred, !c.opt.NoBatch, nil)
 	if err != nil {
 		return fmt.Errorf("рукопожатие не собралось: %w", err)
 	}
-	if err := conn.Send(link.PSH|link.ACK, hello); err != nil {
-		return err
+	// Hello уезжает ПО СЕГМЕНТАМ, как у браузера: он больше одного сегмента по построению.
+	// Отправлять его одним куском нельзя — такой пакет либо не дойдёт, либо приедет
+	// фрагментированным, и то и другое видно на проводе сразу.
+	maxSeg := wire.MTUDefault + wire.Overhead - 40
+	for off := 0; off < len(hello); off += maxSeg {
+		end := off + maxSeg
+		if end > len(hello) {
+			end = len(hello)
+		}
+		if err := conn.Send(link.PSH|link.ACK, hello[off:end]); err != nil {
+			return err
+		}
 	}
 
 	// Ответ хаба приходит одним сегментом: он собран так, чтобы влезть. Но склеить два мы всё
@@ -479,35 +534,81 @@ func (c *Client) session(ctx context.Context, id int, dev tun.Device, devName st
 	return nil
 }
 
-// outbound: TUN → поддельный TCP. Шифрование НА МЕСТЕ, заголовки ПЕРЕД нагрузкой в том же буфере,
-// ни одной копии нагрузки.
+// outbound: TUN → поддельный TCP.
+//
+// Чтение неблокирующее, поэтому пачка собирается из того, что УЖЕ пришло, и ни одного ожидания не
+// добавляет: при потоковой загрузке очередь устройства не пуста и кадры набираются сами, при
+// интерактивном трафике в пачке один кадр и всё работает как прежде.
+//
+// Отдельной горутины с каналом здесь нет намеренно: она стоила бы переключения на каждый пакет —
+// замерено, 255 Мбит/с против 1582 на том же коде и том же железе.
 func (c *Client) outbound(ctx context.Context, id int, s *sess, dev tun.Device) {
-	row := make([]byte, wire.Row+wire.Tag)
+	row := make([]byte, wire.HdrRoom+wire.MaxRecord+wire.Tag)
+	scratch := make([]byte, 20+wire.Row)
+	// Кадры пачки лежат в одной плоской памяти: она копируется в запись при сборке, поэтому
+	// отдельные буферы нужны только до этого момента.
+	slab := make([]byte, wire.BatchFramesMax*wire.MTUDefault)
+	frames := make([][]byte, 0, wire.BatchFramesMax)
 	for ctx.Err() == nil {
-		n, err := dev.Read(row[wire.HdrRoom : wire.HdrRoom+int(c.mtuNow.Load())])
+		ok, err := dev.WaitRead(200 * time.Millisecond)
 		if err != nil {
 			if ctx.Err() == nil {
-				c.logf("соединение %d: чтение устройства: %v", id, err)
+				c.logf("соединение %d: ожидание устройства: %v", id, err)
 			}
 			return
 		}
-		if n <= 0 {
+		if !ok {
 			continue
 		}
-		pt := row[wire.HdrRoom : wire.HdrRoom+n]
-		// Подрезка MSS в ОБОИХ направлениях, и это не перестраховка: сюда приходят SYN от узлов
-		// локальной сети, а из туннеля — SYN-ACK от узлов интернета, которые объявляют MSS по
-		// СВОЕМУ каналу и ничего не знают про наш.
-		route.MSSClamp(pt, int(c.mtuNow.Load()))
-		if err := c.sendFrame(s, row, n); err != nil {
-			c.stats.dropped.Add(1)
+		mtu := int(c.mtuNow.Load())
+		max := s.batchMax
+		if nowMS() < s.coolUntil {
+			max = 1
+		}
+		frames = frames[:0]
+		used, total := 0, wire.BatchHdr
+		for len(frames) < max {
+			// Проверка ДО чтения: прочитанный пакет девать некуда, если он не влезет в запись, а
+			// откладывать его до следующего круга значило бы менять порядок пакетов в потоке.
+			if len(frames) > 0 && total+2+mtu > wire.MaxRecord {
+				break
+			}
+			n, err := dev.Read(slab[used : used+wire.MTUDefault])
+			if errors.Is(err, tun.ErrAgain) {
+				break
+			}
+			if err != nil {
+				if ctx.Err() == nil {
+					c.logf("соединение %d: чтение устройства: %v", id, err)
+				}
+				return
+			}
+			if n <= 0 {
+				break
+			}
+			f := slab[used : used+n]
+			// Подрезка MSS в ОБОИХ направлениях, и это не перестраховка: сюда приходят SYN от
+			// узлов локальной сети, а из туннеля — SYN-ACK от узлов интернета, которые объявляют
+			// MSS по СВОЕМУ каналу и ничего не знают про наш.
+			route.MSSClamp(f, mtu)
+			frames = append(frames, f)
+			used += n
+			total += 2 + n
+		}
+		if len(frames) == 0 {
+			continue
+		}
+		if err := c.sendFrames(s, row, scratch, frames, mtu); err != nil {
+			c.stats.dropped.Add(uint64(len(frames)))
 			if errors.Is(err, link.ErrDead) {
 				return
 			}
-			continue
+		} else {
+			c.stats.txPkts.Add(uint64(len(frames)))
+			for _, f := range frames {
+				c.stats.txBytes.Add(uint64(len(f)))
+			}
 		}
-		c.stats.txPkts.Add(1)
-		c.stats.txBytes.Add(uint64(n))
 		// Ретайр: смещение подошло к пределу или соединение старое. Замолчать ОБЯЗАНЫ — иначе
 		// повтор nonce, то есть полная потеря защиты AEAD.
 		if wire.RetireDue(s.conn.RelNext(), s.conn.Age()) {
@@ -515,6 +616,30 @@ func (c *Client) outbound(ctx context.Context, id int, s *sess, dev tun.Device) 
 			return
 		}
 	}
+}
+
+// sendFrames увозит кадры одной записью: один кадр — как есть, несколько — в контейнере.
+func (c *Client) sendFrames(s *sess, row, scratch []byte, frames [][]byte, mtu int) error {
+	var n int
+	if len(frames) == 1 {
+		n = copy(row[wire.HdrRoom:], frames[0])
+	} else {
+		n = wire.BatchBuild(row[wire.HdrRoom:], frames)
+		if n == 0 {
+			return fmt.Errorf("пачка не собралась")
+		}
+	}
+	// Сегмент не больше того, что несёт путь: MTU туннеля плюс наши же накладные минус заголовки
+	// IP и TCP. Ровно это число согласовано пробами, и превышать его нельзя.
+	maxSeg := mtu + wire.Overhead - 40
+	rec := row[wire.HdrRoom-wire.RecHdr : wire.HdrRoom]
+	return s.conn.SendRecord(row, wire.RecHdr+n+wire.Tag, maxSeg, scratch, func(rel uint32) error {
+		if err := wire.RecBuild(rec, n+wire.Tag); err != nil {
+			return err
+		}
+		_, err := s.tx.Seal(row[wire.HdrRoom:wire.HdrRoom+n+wire.Tag], n, rec, uint64(rel))
+		return err
+	})
 }
 
 // sendFrame шифрует кадр открытого текста, лежащий по row[wire.HdrRoom:], и отправляет его.
@@ -539,6 +664,7 @@ func (c *Client) sendFrame(s *sess, row []byte, n int) error {
 // inbound: поддельный TCP → TUN.
 func (c *Client) inbound(ctx context.Context, id int, s *sess, dev tun.Device, devName string) {
 	buf := make([]byte, wire.Row)
+	isn := s.conn.ISNRX()
 	for ctx.Err() == nil {
 		ok, err := s.conn.WaitRead(200 * time.Millisecond)
 		if err != nil {
@@ -562,43 +688,68 @@ func (c *Client) inbound(ctx context.Context, id int, s *sess, dev tun.Device, d
 		if !data {
 			continue
 		}
-		// Предфильтр до всякой криптографии: три сравнения отбивают чужое.
-		body, err := wire.RecParse(seg.Payload)
-		if err != nil {
+		// Сборка записи, которая могла быть разрезана между сегментами. Она же служит предфильтром:
+		// сегмент, не начинающийся с заголовка записи и не продолжающий начатую, отбрасывается до
+		// всякой криптографии.
+		body, hdr, rel, done := s.reasm.Feed(seg.Seq, isn, seg.Payload)
+		if !done {
 			continue
 		}
-		rel := s.conn.RelOf(seg.Seq)
 		if !s.win.Check(rel) {
 			continue
 		}
-		pt, err := s.rx.Open(body, seg.Payload[:wire.RecHdr], uint64(rel))
+		// AAD — заголовок записи, как в TLS 1.3: для разрезанной это байты ПЕРВОГО сегмента, то
+		// есть у обеих сторон одни и те же.
+		pt, err := s.rx.Open(body, hdr, uint64(rel))
 		if err != nil {
 			continue
 		}
 		// Коммит окна ТОЛЬКО после сошедшегося тега: иначе подделанный пакет с далёким смещением
 		// выбил бы из окна весь честный поток.
 		s.win.Commit(rel)
-		switch wire.FrameKind(pt) {
-		case wire.KindIPv4, wire.KindIPv6:
-			route.MSSClamp(pt, int(c.mtuNow.Load()))
-			if _, err := dev.Write(pt); err != nil {
+		if len(pt) > 0 && pt[0] == wire.CtlBatch {
+			if !wire.BatchIter(pt, func(f []byte) { c.onFrame(s, id, f, dev) }) {
 				c.stats.dropped.Add(1)
-				continue
 			}
-			c.stats.rxPkts.Add(1)
-			c.stats.rxBytes.Add(uint64(len(pt)))
-		case wire.KindCtl:
-			// Эхо на пробу пути — единственный служебный кадр, который клиент получает. Остальное
-			// молча пропускаем: неизвестный служебный кадр от новой версии хаба не повод рвать
-			// туннель.
-			if acked := wire.PackSize(pt); acked > 0 {
-				select {
-				case s.packs <- acked:
-				default:
-				}
-			}
+			continue
 		}
-		// keepalive молча учтён: он уже обновил время последнего приёма.
+		c.onFrame(s, id, pt, dev)
+	}
+}
+
+// onFrame — один кадр открытого текста: внутренний пакет или служебное сообщение.
+func (c *Client) onFrame(s *sess, id int, pt []byte, dev tun.Device) {
+	switch wire.FrameKind(pt) {
+	case wire.KindIPv4, wire.KindIPv6:
+		route.MSSClamp(pt, int(c.mtuNow.Load()))
+		if _, err := dev.Write(pt); err != nil {
+			c.stats.dropped.Add(1)
+			return
+		}
+		c.stats.rxPkts.Add(1)
+		c.stats.rxBytes.Add(uint64(len(pt)))
+	case wire.KindCtl:
+		c.onCtlFrame(s, id, pt)
+	}
+	// keepalive молча учтён: он уже обновил время последнего приёма.
+}
+
+// onCtlFrame — служебные кадры от хаба.
+func (c *Client) onCtlFrame(s *sess, id int, pt []byte) {
+	if acked := wire.PackSize(pt); acked > 0 {
+		select {
+		case s.packs <- acked:
+		default:
+		}
+		return
+	}
+	// Хаб сообщает, что у него не собираются наши записи: значит путь рвёт сегменты, и пачку надо
+	// схлопнуть немедленно. Без этой обратной связи одна потеря стоила бы всей пачки, и на рваном
+	// пути пачки делали бы хуже, а не лучше.
+	if n := wire.LossValue(pt); n > 0 {
+		s.batchMax = 1
+		s.coolUntil = nowMS() + reasmCooldownMS
+		c.logf("соединение %d: хаб не собрал %d записей — везу по одному кадру", id, n)
 	}
 }
 
@@ -627,6 +778,9 @@ func (c *Client) timeLoop(ctx context.Context, id int, s *sess, dev tun.Device, 
 	t := time.NewTicker(link.TickMS * time.Millisecond)
 	defer t.Stop()
 	keepalive := int64(c.opt.Conf.Peers[0].Keepalive) * 1000
+	if keepalive > 0 && s.keepNext == 0 {
+		s.keepNext = keepalive*8/10 + rand.Int64N(keepalive*4/10+1)
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -698,11 +852,39 @@ func (c *Client) timeLoop(ctx context.Context, id int, s *sess, dev tun.Device, 
 			}
 		}
 
+		// Обратная связь по сборке: если у НАС не собираются записи, надо сказать об этом той
+		// стороне — она одна может уменьшить пачку. Молча терпеть значило бы, что на рваном пути
+		// пачки делают хуже, а не лучше, и никто об этом не узнает.
+		if drops := s.reasm.Dropped; drops > s.lastDrops && now-s.lastReport >= reasmReportMS {
+			frame := make([]byte, wire.HdrRoom+8+wire.Tag)
+			if n := wire.LossBuild(frame[wire.HdrRoom:wire.HdrRoom+8], int(drops-s.lastDrops)); n > 0 {
+				if c.sendFrame(s, frame, n) == nil {
+					s.lastDrops = drops
+					s.lastReport = now
+				}
+			}
+		}
+		// Рост пачки на чистом пути: медленно вверх, мгновенно вниз (см. onCtlFrame).
+		if !c.opt.NoBatch && now >= s.coolUntil && now-s.lastGrow >= reasmGrowMS &&
+			s.batchMax < wire.BatchFramesMax {
+			s.batchMax *= 2
+			if s.batchMax > wire.BatchFramesMax {
+				s.batchMax = wire.BatchFramesMax
+			}
+			s.lastGrow = now
+		}
+
 		// Keepalive: пустая запись. Пир за NAT обязан поддерживать отображение живым, потому что
 		// дозвониться до него хаб не может.
-		if keepalive > 0 && s.conn.SinceTX() >= keepalive {
+		//
+		// ИНТЕРВАЛ С РАЗБРОСОМ, а не ровный. Ровный интервал — это признак сам по себе: пакет
+		// одного и того же размера ровно каждые пятнадцать секунд не встречается ни в одном
+		// браузерном соединении, и находится он простым подсчётом пауз между мелкими пакетами.
+		// Разброс ±20% ничего не стоит и делает такой подсчёт бессмысленным.
+		if keepalive > 0 && s.conn.SinceTX() >= s.keepNext {
 			frame := make([]byte, wire.HdrRoom+wire.Tag)
 			_ = c.sendFrame(s, frame, 0)
+			s.keepNext = keepalive*8/10 + rand.Int64N(keepalive*4/10+1)
 		}
 	}
 }

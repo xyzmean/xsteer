@@ -42,7 +42,7 @@ func runHandshake(t *testing.T, aes bool, mtuC, mtuH, connID int) (
 	hPriv, hPub := keypair(t, 2)
 
 	cli, hub = &HS{}, &HS{}
-	hello, err := cli.ClientHello(cPriv, hPub, "www.microsoft.com", mtuC, connID, aes,
+	hello, err := cli.ClientHello(cPriv, hPub, "www.microsoft.com", mtuC, connID, aes, true,
 		seeded{rand.New(rand.NewSource(11))})
 	if err != nil {
 		t.Fatalf("ClientHello: %v", err)
@@ -196,7 +196,7 @@ func TestПодделкиНеПроходят(t *testing.T) {
 	// в транскрипт как предварительное сообщение, и это то, что связывает рукопожатие с
 	// конкретным хабом.
 	cli := &HS{}
-	hello, err := cli.ClientHello(cPriv, otherPub, "x", 1439, 0, true, seeded{rand.New(rand.NewSource(5))})
+	hello, err := cli.ClientHello(cPriv, otherPub, "x", 1439, 0, true, true, seeded{rand.New(rand.NewSource(5))})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +210,7 @@ func TestПодделкиНеПроходят(t *testing.T) {
 	// Честный Hello с испорченным байтом: каждый байт по очереди. Ни один не должен привести к
 	// принятию, и ни один — к панике: сюда приходит что угодно из интернета.
 	cli2 := &HS{}
-	good, err := cli2.ClientHello(cPriv, hPub, "www.microsoft.com", 1439, 0, true,
+	good, err := cli2.ClientHello(cPriv, hPub, "www.microsoft.com", 1439, 0, true, true,
 		seeded{rand.New(rand.NewSource(6))})
 	if err != nil {
 		t.Fatal(err)
@@ -265,7 +265,7 @@ func TestОтветНеБайтОдинаковый(t *testing.T) {
 	hPriv, hPub := keypair(t, 2)
 	for i := 0; i < 12; i++ {
 		cli := &HS{}
-		hello, err := cli.ClientHello(cPriv, hPub, "www.microsoft.com", 1439, 0, true, nil)
+		hello, err := cli.ClientHello(cPriv, hPub, "www.microsoft.com", 1439, 0, true, true, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

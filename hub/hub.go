@@ -68,6 +68,11 @@ const (
 	KeepaliveMS = 10000
 	// Device — имя устройства. Постоянное: его же ищет диагностика и правила оператора.
 	Device = "xshub0"
+	// Обратная связь по сборке разрезанных записей — те же числа, что у клиента, и по тем же
+	// причинам (см. константы в пакете client).
+	reasmCooldownMS = 10000
+	reasmReportMS   = 2000
+	reasmGrowMS     = 3000
 )
 
 // фазы сессии
@@ -101,6 +106,10 @@ type Options struct {
 	// Decoy — что делать с тем, кто не опознан. Пусто означает «ответить фатальным оповещением
 	// TLS», см. onStranger.
 	Decoy DecoyMode
+	// NoBatch — не собирать кадры в одну запись и не разрезать записи между сегментами. Нужно для
+	// разговора с клиентом на C, который этого пока не умеет; цена — облик на проводе (см. те же
+	// поля в client.Options).
+	NoBatch bool
 }
 
 // Hub — поднятый хаб.
@@ -143,13 +152,27 @@ type session struct {
 	rx   *noise.Keys
 	win  wire.Window
 
-	phase       int
+	phase int
+	// hsBuf — накопленные байты ClientHello: он приходит несколькими сегментами.
+	hsBuf       []byte
 	peer        int // индекс пира или -1, пока не опознан
 	connID      int
 	mtu         int // MTU, о котором договорились с ЭТИМ пиром; 0 — ещё нет
 	handshakeAt time.Time
 
 	upPkts, downPkts uint64
+
+	// ---- пачки и сборка разрезанных записей ----
+	//
+	// reasm принадлежит воркеру-владельцу сессии; batchMax читается отправкой из любого воркера и
+	// правится владельцем по обратной связи от пира.
+	reasm      wire.Reasm
+	lastDrops  uint64
+	batchMax   int
+	coolUntil  int64
+	lastReport int64
+	lastGrow   int64
+	keepNext   int64
 
 	// up — соединение к сайту-прикрытию в фазе phProxy. Nil во всех остальных.
 	up netConn
@@ -180,8 +203,9 @@ type worker struct {
 	// чужие сегменты сюда не придут), поэтому замка у неё нет.
 	sess map[skey]*session
 
-	row  []byte // строка для пересылки: заголовки пишутся перед нагрузкой
-	hbuf []byte // отдельный буфер под ответ рукопожатия: он до ~1300 байт и в строку пакета не влезет
+	row     []byte // строка для пересылки: заголовки пишутся перед нагрузкой
+	scratch []byte // буфер под продолжение разрезанной записи
+	hbuf    []byte // отдельный буфер под ответ рукопожатия: он до ~1300 байт и в строку пакета не влезет
 
 	// Ограничители на строки, которые вызывает ЧУЖОЙ пакет: до них добирается кто угодно из
 	// интернета, и без ограничителя одна такая строка — способ залить журнал сервера. Свои у
@@ -266,9 +290,10 @@ func Run(ctx context.Context, opt Options) error {
 		}
 		w := &worker{
 			id: i, n: n, mask: mask, h: h, rx: rx,
-			sess: make(map[skey]*session),
-			row:  make([]byte, wire.Row+wire.Tag),
-			hbuf: make([]byte, 2048),
+			sess:    make(map[skey]*session),
+			row:     make([]byte, wire.HdrRoom+wire.MaxRecord+wire.Tag),
+			scratch: make([]byte, 20+wire.Row),
+			hbuf:    make([]byte, 2048),
 		}
 		if len(h.dev) > 0 {
 			w.dev = h.dev[i%len(h.dev)]

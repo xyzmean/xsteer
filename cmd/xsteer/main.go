@@ -50,11 +50,14 @@ func usage() {
     --managed         устройство настраивает кто-то другой: не трогать адрес и MTU
     --probe-ms <N>    как часто перепроверять путь (по умолчанию %d)
     --chacha          заставить ChaCha20-Poly1305 (по умолчанию решает наличие AES в процессоре)
+    --no-batch        не собирать кадры в одну запись: нужно для разговора с хабом на C,
+                      пока перенос не сделан. Облик на проводе при этом хуже
 
 Ключи для hub:
     --dev <имя>       имя устройства (по умолчанию %s)
     --workers <N>     воркеров (по умолчанию по числу ядер, не больше %d)
     --no-tun          не поднимать устройство: только трафик пир↔пир
+    --no-batch        не собирать кадры в одну запись: для клиента на C
     --decoy <режим>   что отвечать НЕОПОЗНАННЫМ: alert (по умолчанию), silent, reset
                       или proxy — отдавать соединение настоящему серверу
     --decoy-dest <host:port>   куда отдавать в режиме proxy
@@ -182,6 +185,8 @@ func cmdUp(args []string) error {
 			opt.Managed = true
 		case "--chacha":
 			forceChaCha = true
+		case "--no-batch":
+			opt.NoBatch = true
 		default:
 			return fmt.Errorf("неизвестный ключ %s (подсказка: xsteer --help)", key)
 		}
@@ -245,6 +250,8 @@ func cmdHub(args []string) error {
 			}
 		case "--no-tun":
 			opt.NoTUN = true
+		case "--no-batch":
+			opt.NoBatch = true
 		case "--decoy":
 			v, ok := value()
 			if !ok {

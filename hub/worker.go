@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	mrand "math/rand/v2"
 	"time"
 
 	"github.com/xyzmean/xsteer/conf"
@@ -116,7 +117,11 @@ func (w *worker) accept(k skey, seg *link.Seg) {
 		raw.Close()
 		return
 	}
-	w.sess[k] = &session{conn: conn, phase: phSyn, peer: -1, connID: -1}
+	bm := 2
+	if w.h.opt.NoBatch {
+		bm = 1
+	}
+	w.sess[k] = &session{conn: conn, phase: phSyn, peer: -1, connID: -1, batchMax: bm}
 }
 
 // evict освобождает место: сперва самую давнюю НЕподтверждённую, и только если таких нет — самую
@@ -167,9 +172,32 @@ func (w *worker) free(k skey, s *session) {
 }
 
 // handshake — разобрать Hello пира и ответить.
+//
+// СОБИРАЕМ ИЗ СЕГМЕНТОВ. Браузерный ClientHello больше одного сегмента (у современного Chrome он
+// около 1700 байт из-за постквантового ключа), и наш такой же — иначе размер Hello сам по себе
+// признак. Значит первый сегмент почти всегда неполон, и разбирать его сразу нельзя.
+//
+// Предел на накопленное обязателен: сюда пишет кто угодно из интернета, и «копим, пока не
+// разберётся» без предела — это способ съесть память хаба чужими байтами.
 func (w *worker) handshake(k skey, s *session, seg *link.Seg) {
+	const helloMax = 4096
+	if len(s.hsBuf)+len(seg.Payload) > helloMax {
+		w.h.stats.strangers.Add(1)
+		w.onStranger(k, s, seg, nil)
+		return
+	}
+	s.hsBuf = append(s.hsBuf, seg.Payload...)
+	// Ждём, пока запись рукопожатия придёт целиком: длина её заявлена в первых пяти байтах.
+	if len(s.hsBuf) < 5 {
+		return
+	}
+	if want := 5 + int(s.hsBuf[3])<<8 + int(s.hsBuf[4]); len(s.hsBuf) < want {
+		return
+	}
+	full := s.hsBuf
+	s.hsBuf = nil
 	hs := &noise.HS{}
-	if err := hs.ServerRead(w.h.opt.Sec.Priv, seg.Payload, nil); err != nil {
+	if err := hs.ServerRead(w.h.opt.Sec.Priv, full, nil); err != nil {
 		w.h.stats.strangers.Add(1)
 		w.onStranger(k, s, seg, err)
 		return
@@ -275,36 +303,44 @@ func (w *worker) confirm(k skey, s *session, seg *link.Seg) {
 		ip4b(k.addr), k.port, peerMTU, kind)
 }
 
-// onData — расшифровать запись и развести пакет.
+// onData — собрать запись, расшифровать и развести пакеты.
 func (w *worker) onData(s *session, seg *link.Seg) {
-	body, err := wire.RecParse(seg.Payload)
-	if err != nil {
+	// Сборка записи, которая могла быть разрезана между сегментами. Она же предфильтр: сегмент, не
+	// начинающийся с заголовка записи и не продолжающий начатую, отбрасывается до криптографии.
+	body, hdr, rel, done := s.reasm.Feed(seg.Seq, s.conn.ISNRX(), seg.Payload)
+	if !done {
 		return
 	}
-	rel := s.conn.RelOf(seg.Seq)
 	if !s.win.Check(rel) {
 		return
 	}
-	// Расшифровка НА МЕСТЕ, в приёмном буфере сегмента. Открытый текст оказывается там же, где
-	// лежал шифротекст, поэтому пересылка другому пиру не требует копии... но копия ОДНА всё же
-	// нужна: приёмный буфер не имеет запаса под заголовки впереди (сегмент пришёл со своим
-	// заголовком IP переменной длины), а исходящий пакет собирается «заголовки перед нагрузкой».
-	// Перенос делается один раз и только для пакетов, которые действительно пойдут дальше.
-	pt, err := s.rx.Open(body, seg.Payload[:wire.RecHdr], uint64(rel))
+	pt, err := s.rx.Open(body, hdr, uint64(rel))
 	if err != nil {
 		return
 	}
 	// Коммит окна ТОЛЬКО после сошедшегося тега: иначе подделанный пакет с далёким смещением
 	// выбил бы из окна весь честный поток.
 	s.win.Commit(rel)
+	if len(pt) > 0 && pt[0] == wire.CtlBatch {
+		if !wire.BatchIter(pt, func(f []byte) { w.onFrame(s, f) }) {
+			w.h.stats.dropped.Add(1)
+		}
+		return
+	}
+	w.onFrame(s, pt)
+}
+
+// onFrame — один кадр открытого текста от пира.
+func (w *worker) onFrame(s *session, pt []byte) {
 	s.upPkts++
 	w.h.stats.rxPkts.Add(1)
 	w.h.stats.rxBytes.Add(uint64(len(pt)))
-
 	switch wire.FrameKind(pt) {
 	case wire.KindCtl:
 		w.onCtl(s, pt)
 	case wire.KindIPv4, wire.KindIPv6:
+		// Копия обязательна: пакет поедет дальше из строки с местом под заголовки впереди, а
+		// пришёл он в приёмном буфере, где такого места нет.
 		n := copy(w.row[wire.HdrRoom:], pt)
 		w.route(s, w.row[wire.HdrRoom:wire.HdrRoom+n])
 	}
@@ -318,6 +354,16 @@ func (w *worker) onCtl(s *session, pt []byte) {
 	if psz := wire.ProbeSize(pt); psz > 0 {
 		n := wire.PackBuild(w.row[wire.HdrRoom:], psz)
 		w.sendTo(s, w.row, n)
+		return
+	}
+	// Пир не собирает наши записи: путь рвёт сегменты. Схлопываем пачку немедленно — на рваном
+	// пути она делает хуже, а не лучше.
+	if n := wire.LossValue(pt); n > 0 {
+		s.batchMax = 1
+		s.coolUntil = nowMS() + reasmCooldownMS
+		if ok, held := w.rlProbe.Allow(nowMS(), wire.LogEveryMS); ok {
+			w.h.logf("пир не собрал %d записей — везу по одному кадру%s", n, wire.HeldSuffix(held))
+		}
 		return
 	}
 	// Итог согласования: пир проверил путь и называет рабочий размер. Берём минимум со своим
@@ -382,31 +428,90 @@ func (w *worker) route(from *session, pt []byte) {
 }
 
 // tunLoop — из ядра (интернет и локальные ответы) к пирам.
+//
+// Это ГЛАВНОЕ направление загрузки, и именно здесь пачка окупается: подряд идущие пакеты одному и
+// тому же пиру уезжают одной записью, которая больше сегмента и потому разрезается между ними —
+// ровно так, как ведёт себя настоящий TLS. Ждать ради пачки нечего: чтение неблокирующее, берётся
+// только то, что уже пришло.
 func (w *worker) tunLoop(ctx context.Context) {
-	row := make([]byte, wire.Row+wire.Tag)
+	row := make([]byte, wire.HdrRoom+wire.MaxRecord+wire.Tag)
+	slab := make([]byte, wire.BatchFramesMax*wire.MTUDefault)
+	frames := make([][]byte, 0, wire.BatchFramesMax)
 	for ctx.Err() == nil {
-		n, err := w.dev.Read(row[wire.HdrRoom : wire.HdrRoom+wire.MTUDefault])
+		ok, err := w.dev.WaitRead(200 * time.Millisecond)
 		if err != nil {
 			return
 		}
-		if n <= 20 {
+		if !ok {
 			continue
 		}
-		pt := row[wire.HdrRoom : wire.HdrRoom+n]
-		dst := binary.BigEndian.Uint32(pt[16:20])
-		to := w.h.router.Lookup(dst, nil)
-		if to < 0 {
-			continue
+		frames = frames[:0]
+		used, total := 0, wire.BatchHdr
+		var dst *session
+		for {
+			if len(frames) > 0 && (len(frames) >= dst.batchMax ||
+				total+2+wire.MTUDefault > wire.MaxRecord) {
+				break
+			}
+			n, err := w.dev.Read(slab[used : used+wire.MTUDefault])
+			if err != nil || n <= 20 {
+				break
+			}
+			pkt := slab[used : used+n]
+			to := w.h.router.Lookup(binary.BigEndian.Uint32(pkt[16:20]), nil)
+			var d *session
+			if to >= 0 {
+				d = w.h.pick(to, pkt)
+			}
+			if d == nil {
+				continue // нет живого соединения к этому пиру — отбросить, память не тратим
+			}
+			if d.mtu > 0 {
+				route.MSSClamp(pkt, d.mtu)
+			}
+			// Пачка собирается только для ОДНОГО получателя: у каждой сессии свои ключи и свой
+			// номер последовательности, и «одна запись двум пирам» бессмысленна. Пакет другому
+			// пиру закрывает набор и уезжает следующим кругом сам.
+			if dst != nil && d != dst {
+				w.sendFrames(dst, row, frames)
+				frames = frames[:0]
+				used, total = 0, wire.BatchHdr
+				n = copy(slab, pkt)
+				pkt = slab[:n]
+			}
+			dst = d
+			frames = append(frames, pkt)
+			used += n
+			total += 2 + n
 		}
-		d := w.h.pick(to, pt)
-		if d == nil {
-			continue // нет живого соединения к этому пиру — отбросить
+		if len(frames) > 0 && dst != nil {
+			w.sendFrames(dst, row, frames)
 		}
-		if d.mtu > 0 {
-			route.MSSClamp(pt, d.mtu)
-		}
-		w.sendTo(d, row, n)
 	}
+}
+
+// batchFull — влезет ли ещё один кадр в запись.
+func batchFull(frames [][]byte, next int) bool {
+	total := wire.BatchHdr
+	for _, f := range frames {
+		total += 2 + len(f)
+	}
+	return total+2+next > wire.MaxRecord
+}
+
+// sendFrames увозит кадры одной записью: один кадр — как есть, несколько — в контейнере.
+func (w *worker) sendFrames(d *session, row []byte, frames [][]byte) {
+	if len(frames) == 1 {
+		n := copy(row[wire.HdrRoom:], frames[0])
+		w.sendTo(d, row, n)
+		return
+	}
+	n := wire.BatchBuild(row[wire.HdrRoom:], frames)
+	if n == 0 {
+		w.h.stats.dropped.Add(uint64(len(frames)))
+		return
+	}
+	w.sendTo(d, row, n)
 }
 
 // pick — выбрать соединение пира для этого пакета.
@@ -446,7 +551,12 @@ func (w *worker) sendTo(d *session, row []byte, plen int) {
 		return
 	}
 	rec := row[wire.HdrRoom-wire.RecHdr : wire.HdrRoom]
-	err := d.conn.SendData(row, wire.RecHdr+plen+wire.Tag, func(rel uint32) error {
+	mtu := d.mtu
+	if mtu <= 0 {
+		mtu = wire.MTUDefault
+	}
+	maxSeg := mtu + wire.Overhead - 40
+	err := d.conn.SendRecord(row, wire.RecHdr+plen+wire.Tag, maxSeg, w.scratch, func(rel uint32) error {
 		if err := wire.RecBuild(rec, plen+wire.Tag); err != nil {
 			return err
 		}
@@ -477,10 +587,38 @@ func (w *worker) maintain() {
 				continue
 			}
 		}
+		// Обратная связь по сборке: если у НАС не собираются записи пира, сказать об этом обязаны
+		// мы — уменьшить пачку может только он.
+		if s.phase == phEst {
+			now := nowMS()
+			if drops := s.reasm.Dropped; drops > s.lastDrops && now-s.lastReport >= reasmReportMS {
+				if n := wire.LossBuild(w.row[wire.HdrRoom:wire.HdrRoom+8], int(drops-s.lastDrops)); n > 0 {
+					w.sendTo(s, w.row, n)
+					s.lastDrops = drops
+					s.lastReport = now
+				}
+			}
+			if !w.h.opt.NoBatch && now >= s.coolUntil && now-s.lastGrow >= reasmGrowMS &&
+				s.batchMax < wire.BatchFramesMax {
+				s.batchMax *= 2
+				if s.batchMax > wire.BatchFramesMax {
+					s.batchMax = wire.BatchFramesMax
+				}
+				s.lastGrow = now
+			}
+		}
 		// Пустая запись и есть keepalive: длина нагрузки ноль, тип кадра пир опознаёт по пустоте.
 		// Отдельного вида кадра для этого не нужно.
-		if s.phase == phEst && s.conn.NeedKeepalive(KeepaliveMS) {
-			w.sendTo(s, w.row, 0)
+		// Keepalive с разбросом по той же причине, что у клиента: ровный интервал находится
+		// подсчётом пауз между мелкими пакетами и не встречается в браузерных соединениях.
+		if s.phase == phEst {
+			if s.keepNext == 0 {
+				s.keepNext = KeepaliveMS*8/10 + mrand.Int64N(KeepaliveMS*4/10+1)
+			}
+			if s.conn.NeedKeepalive(s.keepNext) {
+				w.sendTo(s, w.row, 0)
+				s.keepNext = KeepaliveMS*8/10 + mrand.Int64N(KeepaliveMS*4/10+1)
+			}
 		}
 		if err := s.conn.Tick(); err != nil {
 			w.free(k, s)
