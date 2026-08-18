@@ -187,6 +187,18 @@ func (w *worker) handshake(k skey, s *session, seg *link.Seg) {
 		return
 	}
 	s.hsBuf = append(s.hsBuf, seg.Payload...)
+	// НЕ ПОХОЖЕ НА РУКОПОЖАТИЕ TLS ВООБЩЕ — отвечаем сразу, не ожидая продолжения.
+	//
+	// Это про зондирование, а не про аккуратность. Прибор первым делом пробует не только настоящий
+	// ClientHello: он присылает и «GET / HTTP/1.1», и просто мусор. Пока проверки не было, такие
+	// байты копились до предела в надежде, что придёт заявленная длина, — то есть открытый порт
+	// молчал в ответ на запрос HTTP, чего настоящий сервер не делает никогда. Молчание в ответ на
+	// мусор отличимо не хуже, чем молчание в ответ на Hello.
+	if len(s.hsBuf) >= 2 && (s.hsBuf[0] != 0x16 || s.hsBuf[1] != 0x03) {
+		w.h.stats.strangers.Add(1)
+		w.onStranger(k, s, seg, nil)
+		return
+	}
 	// Ждём, пока запись рукопожатия придёт целиком: длина её заявлена в первых пяти байтах.
 	if len(s.hsBuf) < 5 {
 		return
@@ -575,6 +587,15 @@ func (w *worker) sendTo(d *session, row []byte, plen int) {
 // maintain — обслуживание СВОИХ сессий: уборка, keepalive, подтверждения.
 func (w *worker) maintain() {
 	for k, s := range w.sess {
+		// Сессию, помеченную к уборке (например, прикрытие закрылось), убирает ВЛАДЕЛЕЦ: таблица
+		// его личная.
+		if s.dead.Load() {
+			if s.up != nil {
+				s.up.Close()
+			}
+			w.free(k, s)
+			continue
+		}
 		if s.conn.Idle() > IdleMS {
 			w.free(k, s)
 			continue

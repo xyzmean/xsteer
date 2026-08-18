@@ -161,6 +161,17 @@ else
     bad "хаб назвал это в журнале"
 fi
 
+# Мусор вместо TLS: прибор пробует и это, и открытый порт обязан отвечать, а не молчать. Настоящий
+# сервер HTTPS на запрос HTTP отвечает отказом или закрывает соединение — важно, что БЫСТРО.
+start=$(date +%s)
+ip netns exec $NSA timeout 6 curl -s -o /dev/null --max-time 5 http://10.213.1.1:443/ 2>/dev/null || true
+took=$(( $(date +%s) - start ))
+if [ "$took" -lt 4 ]; then
+    ok "запрос HTTP на порт получил ответ за ${took} с, а не тишину"
+else
+    bad "запрос HTTP на порт получил ответ быстро (ушло ${took} с)"
+fi
+
 # И главное: защита не должна мешать своим. Пир поднимается на том же хабе, в том же режиме.
 ip netns exec $NSA "$GO" up "$WORK/a.conf" --dev xsa --probe-ms 3000 > "$WORK/a.log" 2>&1 &
 for i in $(seq 1 60); do grep -q 'поднялся' "$HUBLOG" && break; sleep 0.25; done

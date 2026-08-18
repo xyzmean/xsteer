@@ -2,7 +2,7 @@ package hub
 
 import (
 	"fmt"
-	"io"
+
 	"net"
 	"strings"
 	"time"
@@ -135,6 +135,17 @@ func (w *worker) onStranger(k skey, s *session, seg *link.Seg, hsErr error) {
 func (w *worker) startProxy(k skey, s *session, seg *link.Seg) bool {
 	d := w.h.opt.Decoy
 	dest := d.Dest
+	// Предел на число одновременно проксируемых, и он обязателен: каждое такое соединение — это
+	// настоящий сокет к сайту-прикрытию и горутина. Без предела поток зондирования превращался бы в
+	// нашу же атаку на прикрытие и на собственные дескрипторы.
+	if w.h.decoyLive.Add(1) > decoyMax {
+		w.h.decoyLive.Add(-1)
+		if ok, held := w.rlProbe.Allow(nowMS(), wire.LogEveryMS); ok {
+			w.h.logf("неопознанных больше %d одновременно — этому отказываю%s", decoyMax,
+				wire.HeldSuffix(held))
+		}
+		return false
+	}
 	// Имя из SNI — то, ради чего прибор и пришёл. Отдав ему сертификат другого сайта, мы сообщим
 	// ровно то, что пытались скрыть.
 	if d.FollowSNI {
@@ -153,6 +164,7 @@ func (w *worker) startProxy(k skey, s *session, seg *link.Seg) bool {
 	}
 	up, err := net.DialTimeout("tcp", dest, timeout)
 	if err != nil {
+		w.h.decoyLive.Add(-1)
 		if ok, held := w.rlProbe.Allow(nowMS(), wire.LogEveryMS); ok {
 			w.h.logf("неопознанный с %s: сайт-прикрытие %s недоступен (%v)%s",
 				ip4b(k.addr), dest, err, wire.HeldSuffix(held))
@@ -163,13 +175,19 @@ func (w *worker) startProxy(k skey, s *session, seg *link.Seg) bool {
 		w.h.logf("неопознанный с %s: отдаю настоящему серверу %s%s", ip4b(k.addr), dest,
 			wire.HeldSuffix(held))
 	}
-	// Первым делом уходит ЕГО ClientHello — целиком и без правок. Любая правка означала бы, что
-	// сайт-прикрытие видит не тот отпечаток, который прислал прибор, и ответил бы иначе, чем
-	// ответил бы ему напрямую.
-	hello := make([]byte, len(seg.Payload))
-	copy(hello, seg.Payload)
+	// Первым делом уходит ВСЁ, что он прислал, — целиком и без правок. Именно всё накопленное, а
+	// не последний сегмент: Hello браузерного размера приходит несколькими сегментами, и отдать
+	// прикрытию только последний значило бы, что оно видит обрубок и отвечает не так, как ответило
+	// бы прибору напрямую.
+	sent := s.hsBuf
+	if len(sent) == 0 {
+		sent = seg.Payload
+	}
+	hello := make([]byte, len(sent))
+	copy(hello, sent)
 	if _, err := up.Write(hello); err != nil {
 		up.Close()
+		w.h.decoyLive.Add(-1)
 		return false
 	}
 	s.phase = phProxy
@@ -184,6 +202,7 @@ func (w *worker) startProxy(k skey, s *session, seg *link.Seg) bool {
 // proxyDown переливает ответ сайта-прикрытия прибору.
 func (w *worker) proxyDown(k skey, s *session, up net.Conn) {
 	defer up.Close()
+	defer w.h.decoyLive.Add(-1)
 	buf := make([]byte, 1200)
 	_ = up.SetReadDeadline(time.Now().Add(30 * time.Second))
 	for {
@@ -204,9 +223,22 @@ func (w *worker) proxyDown(k skey, s *session, up net.Conn) {
 			_ = up.SetReadDeadline(time.Now().Add(30 * time.Second))
 		}
 		if err != nil {
-			if err != io.EOF {
-				return
+			// Прикрытие закрыло соединение (или ответило и закрыло) — ЗАКРЫВАЕМ И МЫ, и это не
+			// вежливость.
+			//
+			// Настоящий сервер HTTPS на запрос HTTP отвечает отказом или закрывает соединение, но
+			// делает это БЫСТРО. Пока этого не было, прибор, приславший «GET / HTTP/1.1», не
+			// получал ничего: прикрытие закрывалось, а наше поддельное соединение оставалось
+			// висеть, и снаружи это выглядело как открытый порт, который молчит — то есть как
+			// ровно тот признак, ради устранения которого вся дорожка и заведена. Стенд поймал это
+			// пятисекундным ожиданием curl.
+			s.mu.Lock()
+			alive := s.phase == phProxy
+			s.mu.Unlock()
+			if alive {
+				_ = s.conn.Send(link.FIN|link.ACK, nil)
 			}
+			s.dead.Store(true)
 			return
 		}
 	}
