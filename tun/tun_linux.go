@@ -172,6 +172,23 @@ func AddRoute(name, cidr string) error {
 	return run("ip", "route", "replace", cidr, "dev", name)
 }
 
+// SetupRoutes ставит маршруты AllowedIPs. На Linux расщепление маршрута по умолчанию и обход
+// для хаба здесь не нужны: полным туннелем на роутере управляет движок steer своими таблицами
+// и правилами (fwmark), а не этот клиент. Поэтому просто раскладываем префиксы как есть; аргумент
+// endpoints не используется и оставлен ради единой сигнатуры с Windows.
+func SetupRoutes(name string, cidrs, endpoints []string) error {
+	_ = endpoints
+	for _, c := range cidrs {
+		if err := AddRoute(name, c); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// TeardownRoutes на Linux снимать нечего: маршруты уходят с устройством.
+func TeardownRoutes(name string) { _ = name }
+
 // DevMTU — MTU, который сейчас стоит на устройстве.
 func DevMTU(name string) int {
 	b, err := os.ReadFile("/sys/class/net/" + name + "/mtu")

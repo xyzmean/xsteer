@@ -4,6 +4,7 @@ package tun
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"net/netip"
 	"strings"
@@ -237,6 +238,137 @@ func AddRoute(name, cidr string) error {
 		return nil
 	}
 	return err
+}
+
+// bypassRoute — маршрут /32 к адресу хаба, поставленный НЕ на туннель, а на физический
+// интерфейс. Его надо запомнить, чтобы снять при выходе: он живёт на чужом интерфейсе и сам
+// вместе с адаптером Wintun не исчезнет.
+type bypassRoute struct {
+	luid winipcfg.LUID
+	pfx  netip.Prefix
+	gw   netip.Addr
+}
+
+var (
+	bypassMu sync.Mutex
+	bypass   = map[string][]bypassRoute{}
+)
+
+// SetupRoutes ставит на устройство маршруты AllowedIPs. В обычном случае это просто набор
+// префиксов, но полный туннель (0.0.0.0/0) на Windows требует ещё двух вещей, без которых он
+// молча не работает — трафик продолжает идти мимо туннеля, ровно как «handshake прошёл, а
+// через xsteer ничего не идёт».
+//
+// Первое — ОБХОД для адресов хаба. Маршрут по умолчанию мы уводим в туннель, но собственные
+// пакеты клиента к хабу тоже подпадают под 0.0.0.0/0 и ушли бы в туннель — петля, туннель
+// рвёт сам себя. Поэтому к каждому адресу хаба ставится /32 через прежний физический шлюз, и
+// встать он обязан ПЕРВЫМ, до того как маршрут по умолчанию уедет.
+//
+// Второе — РАСЩЕПЛЕНИЕ маршрута по умолчанию на 0.0.0.0/1 и 128.0.0.0/1. Простой 0.0.0.0/0 на
+// туннеле спорит с физическим 0.0.0.0/0 по метрикам интерфейсов, и кто победит — как повезёт;
+// именно поэтому «трафик не идёт через туннель». У двух половин маска на бит длиннее, а по
+// правилу «самый длинный префикс побеждает» они бьют любой /0 независимо от метрик. Тот же
+// приём использует WireGuard для Windows.
+func SetupRoutes(name string, cidrs, endpoints []string) error {
+	luid, err := luidOf(name)
+	if err != nil {
+		return err
+	}
+	full := false
+	for _, c := range cidrs {
+		if p, e := netip.ParsePrefix(strings.TrimSpace(c)); e == nil && p.Bits() == 0 && p.Addr().Is4() {
+			full = true
+			break
+		}
+	}
+	if full {
+		if err := addEndpointBypass(name, endpoints); err != nil {
+			return err
+		}
+	}
+	for _, c := range cidrs {
+		p, err := netip.ParsePrefix(strings.TrimSpace(c))
+		if err != nil {
+			return fmt.Errorf("маршрут %q не разобран: %w", c, err)
+		}
+		if p.Bits() == 0 && p.Addr().Is4() {
+			for _, half := range []string{"0.0.0.0/1", "128.0.0.0/1"} {
+				hp := netip.MustParsePrefix(half)
+				if e := luid.AddRoute(hp, netip.IPv4Unspecified(), 0); e != nil && e != windows.ERROR_OBJECT_ALREADY_EXISTS {
+					return fmt.Errorf("половина маршрута по умолчанию %s не встала: %w", half, e)
+				}
+			}
+			continue
+		}
+		if e := luid.AddRoute(p, netip.IPv4Unspecified(), 0); e != nil && e != windows.ERROR_OBJECT_ALREADY_EXISTS {
+			return fmt.Errorf("маршрут %s не встал: %w", c, e)
+		}
+	}
+	return nil
+}
+
+// addEndpointBypass ставит /32 к каждому адресу хаба через ПРЕЖНИЙ маршрут по умолчанию —
+// тот, что был до туннеля, — чтобы пакеты самого туннеля продолжали ходить физическим каналом.
+func addEndpointBypass(name string, endpoints []string) error {
+	tunLUID, err := luidOf(name)
+	if err != nil {
+		return err
+	}
+	rows, err := winipcfg.GetIPForwardTable2(windows.AF_INET)
+	if err != nil {
+		return fmt.Errorf("таблица маршрутов не прочиталась: %w", err)
+	}
+	// Лучший физический маршрут по умолчанию: нулевой префикс, не наш туннель, наименьшая
+	// метрика. Его шлюз и интерфейс и станут обходом для хаба.
+	var best *winipcfg.MibIPforwardRow2
+	for i := range rows {
+		r := &rows[i]
+		if r.InterfaceLUID == tunLUID {
+			continue
+		}
+		dp := r.DestinationPrefix.Prefix()
+		if dp.Bits() != 0 || !dp.Addr().Is4() {
+			continue
+		}
+		if best == nil || r.Metric < best.Metric {
+			best = r
+		}
+	}
+	if best == nil {
+		return errors.New("не нашёл физический маршрут по умолчанию — обход для хаба поставить не на что")
+	}
+	gw := best.NextHop.Addr()
+	physLUID := best.InterfaceLUID
+
+	var installed []bypassRoute
+	for _, ep := range endpoints {
+		addr, err := netip.ParseAddr(strings.TrimSpace(ep))
+		if err != nil || !addr.Is4() {
+			continue
+		}
+		pfx := netip.PrefixFrom(addr, 32)
+		if e := physLUID.AddRoute(pfx, gw, 0); e != nil && e != windows.ERROR_OBJECT_ALREADY_EXISTS {
+			return fmt.Errorf("обход к хабу %s не встал: %w", ep, e)
+		}
+		installed = append(installed, bypassRoute{luid: physLUID, pfx: pfx, gw: gw})
+	}
+	bypassMu.Lock()
+	bypass[name] = append(bypass[name], installed...)
+	bypassMu.Unlock()
+	return nil
+}
+
+// TeardownRoutes снимает обходы для хаба, поставленные SetupRoutes. Маршруты самого туннеля
+// уходят вместе с адаптером Wintun при его закрытии, а обход живёт на физическом интерфейсе и
+// без этого остался бы висеть после выхода.
+func TeardownRoutes(name string) {
+	bypassMu.Lock()
+	rs := bypass[name]
+	delete(bypass, name)
+	bypassMu.Unlock()
+	for _, r := range rs {
+		_ = r.luid.DeleteRoute(r.pfx, r.gw)
+	}
 }
 
 // DevMTU — MTU, который сейчас стоит на устройстве.

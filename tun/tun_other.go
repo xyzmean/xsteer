@@ -41,4 +41,8 @@ func SetAddr(name, cidr string) error { return fmt.Errorf("не сделано �
 func AddRoute(name, cidr string) error {
 	return fmt.Errorf("не сделано на %s", runtime.GOOS)
 }
-func DevMTU(name string) int { return 0 }
+func SetupRoutes(name string, cidrs, endpoints []string) error {
+	return fmt.Errorf("не сделано на %s", runtime.GOOS)
+}
+func TeardownRoutes(name string) {}
+func DevMTU(name string) int     { return 0 }

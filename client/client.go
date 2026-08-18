@@ -190,12 +190,17 @@ func Run(ctx context.Context, opt Options) error {
 		}
 		c.logf("%s: адрес %s, MTU %d (накладные %d)", name, cidr, mtu, wire.Overhead)
 		if opt.Routes {
+			cidrs := make([]string, 0, len(p.Allowed))
 			for _, a := range p.Allowed {
-				cidr := fmt.Sprintf("%s/%d", ip4str(a.Net), a.Plen)
-				if err := tun.AddRoute(name, cidr); err != nil {
-					c.logf("маршрут %s не встал: %v", cidr, err)
-				}
+				cidrs = append(cidrs, fmt.Sprintf("%s/%d", ip4str(a.Net), a.Plen))
 			}
+			// Адрес хаба нужен для обхода: при полном туннеле (0.0.0.0/0) собственные пакеты
+			// клиента к хабу иначе ушли бы в туннель — петля. Снимаем маршруты при выходе тем же
+			// TeardownRoutes: обход живёт на физическом интерфейсе и сам не исчезнет.
+			if err := tun.SetupRoutes(name, cidrs, []string{p.Endpoint}); err != nil {
+				c.logf("маршруты не встали: %v", err)
+			}
+			defer tun.TeardownRoutes(name)
 		}
 	} else {
 		if got := tun.DevMTU(name); got > 0 {

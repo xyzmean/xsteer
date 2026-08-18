@@ -46,8 +46,10 @@ func usage() {
     --dev <имя>       имя устройства (по умолчанию xs0)
     --conns <N>       соединений к хабу (по умолчанию по одному на ядро, не больше %d)
     --state <путь>    писать состояние в JSON
-    --routes          направить AllowedIPs хаба в устройство
-    --managed         устройство настраивает кто-то другой: не трогать адрес и MTU
+    --routes          направить AllowedIPs хаба в устройство (по умолчанию ДА, как в WireGuard;
+                      при 0.0.0.0/0 ставится полный туннель: расщепление маршрута и обход хаба)
+    --no-routes       НЕ трогать маршруты: их ставит кто-то другой
+    --managed         устройство настраивает кто-то другой: не трогать адрес, MTU и маршруты
     --probe-ms <N>    как часто перепроверять путь (по умолчанию %d)
     --chacha          заставить ChaCha20-Poly1305 (по умолчанию решает наличие AES в процессоре)
     --no-batch        не собирать кадры в одну запись: нужно для разговора с хабом на C,
@@ -70,7 +72,7 @@ func usage() {
                                (точка в начале разрешает поддомены: .example.com)
 
 Примеры:
-    sudo xsteer up /etc/xsteer/hub.conf --routes
+    sudo xsteer up /etc/xsteer/hub.conf
     sudo xsteer hub /etc/xsteer/hub.conf --decoy proxy --decoy-dest www.microsoft.com:443
 `, Version, wire.ConnsMax, wire.ProbeEveryMS, hub.Device, hub.WorkersMax)
 }
@@ -139,7 +141,12 @@ func cmdUp(args []string) error {
 		return fmt.Errorf("нужен путь к файлу конфигурации (подсказка: xsteer --help)")
 	}
 	path := args[0]
-	opt := client.Options{AESPreferred: aesPreferred()}
+	// Routes включены по умолчанию: как в WireGuard, AllowedIPs означает «направь это в
+	// туннель». Раньше без ключа --routes конфигурация с `AllowedIPs = 0.0.0.0/0` молча ни на
+	// что не влияла — интерфейс поднимался, а трафик шёл мимо, и это выглядело как «туннель
+	// есть, а через него ничего не идёт». Выключается явно: --no-routes или --managed (там
+	// устройством и маршрутами распоряжается кто-то другой).
+	opt := client.Options{AESPreferred: aesPreferred(), Routes: true}
 	forceChaCha := false
 	// Разбор строгий и без библиотеки flag: она принимает `-conns=2` и `--conns 2` одинаково, но
 	// молча съедает неизвестный ключ после первого позиционного аргумента. Здесь опечатка в ключе
@@ -186,8 +193,11 @@ func cmdUp(args []string) error {
 			opt.ProbeEvery = time.Duration(ms) * time.Millisecond
 		case "--routes":
 			opt.Routes = true
+		case "--no-routes":
+			opt.Routes = false
 		case "--managed":
 			opt.Managed = true
+			opt.Routes = false
 		case "--chacha":
 			forceChaCha = true
 		case "--no-batch":
