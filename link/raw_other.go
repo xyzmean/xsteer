@@ -44,3 +44,22 @@ func GuardUp(label, peerAddr string, port int) (*Guard, error) {
 }
 
 func (g *Guard) Down() {}
+
+// Слушающая половина на прочих системах не нужна и не сделана: хаб живёт на сервере с Linux.
+//
+// Заглушки существуют ровно для того, чтобы пакет собирался под Windows и macOS — там нужен
+// КЛИЕНТ, и он в режиме потока сырых сокетов не требует вовсе. Отказ называет это прямо, а не
+// притворяется, будто хаб можно поднять и он просто не работает.
+func OpenRawListen(port uint16, mask, id uint16) (Raw, error) {
+	return nil, fmt.Errorf("хаб на %s не поддерживается: слушающая половина живёт на сервере с Linux",
+		runtime.GOOS)
+}
+
+func OpenRawSend(daddr [4]byte) (Raw, error) {
+	return nil, fmt.Errorf("сырой сокет на %s не сделан: клиент здесь работает режимом потока (--stream)",
+		runtime.GOOS)
+}
+
+func GuardUpServer(port int) (*Guard, error) {
+	return nil, fmt.Errorf("правило против RST на %s не сделано", runtime.GOOS)
+}
