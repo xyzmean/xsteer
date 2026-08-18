@@ -20,6 +20,12 @@ MB="${1:-8}"
 # скорости, на которой протокол работает у людей.
 RATE="${RATE:-12M}"
 GO=${XSTEER_BIN:-./build/xsteer}
+# XS_IMPL=c снимает запись с реализации на C (движок steer) вместо реализации на Go. Нужно ровно
+# для одного: убедиться, что перенос формата в C дал ТУ ЖЕ форму на проводе, а не только
+# совместимость. «Собралось и соединилось» и «выглядит так же» — разные утверждения.
+XS_IMPL="${XS_IMPL:-go}"
+C_HUB=${STEER_HUB_BIN:-../steer/build/steer-hub}
+C_EXT=${STEER_EXT_BIN:-../steer/build/steer-ext}
 XRAY=${XRAY_BIN:-}
 IDLE="${IDLE:-25}"     # сколько молчать после передачи: за это время видно keepalive
 NSC=xc-cli
@@ -139,12 +145,30 @@ chmod 600 "$WORK"/*.conf
 # «стало лучше» пришлось бы утверждать по памяти.
 ip netns exec $NSS tcpdump -i sc -n -s 0 -w "$WORK/xsteer.pcap" 'tcp port 443' >/dev/null 2>&1 &
 sleep 0.5
-ip netns exec $NSS "$GO" hub "$WORK/hub.conf" ${XS_FLAGS:-} > "$WORK/hub.log" 2>&1 &
+if [ "$XS_IMPL" = c ]; then
+    mkdir -p "$WORK/state"
+    ip netns exec $NSS "$C_HUB" xsteer-hub --config "$WORK/hub.conf" \
+        --state-dir "$WORK/state" > "$WORK/hub.log" 2>&1 &
+else
+    ip netns exec $NSS "$GO" hub "$WORK/hub.conf" ${XS_FLAGS:-} > "$WORK/hub.log" 2>&1 &
+fi
 sleep 1
 # Одно соединение, а не по одному на ядро: сравниваем ФОРМУ одного потока с формой одного потока
 # xhttp. Четыре соединения — отдельный признак, и о нём говорится в разборе отдельно.
-ip netns exec $NSC "$GO" up "$WORK/a.conf" --dev xsa --conns 1 --routes ${XS_FLAGS:-} \
-    > "$WORK/a.log" 2>&1 &
+if [ "$XS_IMPL" = c ]; then
+    # Клиенту на C нужна спека: устройство и выход он берёт оттуда. Одно соединение — чтобы
+    # сравнивать форму одного потока с формой одного потока xhttp.
+    cat > "$WORK/a.json" <<EOF
+{"schema":1,"lan_device":"lo","from_default":["10.83.0.0/24"],
+ "outputs":{"xsa":{"kind":"xsteer","conf":"$WORK/a.conf"}},
+ "channels":[]}
+EOF
+    STEER_XS_CONNS=1 ip netns exec $NSC env STEER_XS_CONNS=1 "$C_EXT" xsteer xsa \
+        --spec "$WORK/a.json" --state-dir "$WORK/state" > "$WORK/a.log" 2>&1 &
+else
+    ip netns exec $NSC "$GO" up "$WORK/a.conf" --dev xsa --conns 1 --routes ${XS_FLAGS:-} \
+        > "$WORK/a.log" 2>&1 &
+fi
 sleep 3
 ip netns exec $NSS python3 -m http.server 8081 --bind 10.83.0.1 --directory "$WORK/www" \
     > "$WORK/httpd2.log" 2>&1 &
