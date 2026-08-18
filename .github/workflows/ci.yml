@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - name: Build (linux)
+        run: go build ./...
+
+      - name: Vet (linux)
+        run: go vet ./...
+
+      # Windows и macOS собираются здесь же и намеренно.
+      #
+      # Половина кода этого проекта платформенная (устройство, маршруты, сырой сокет), и ломается
+      # она ровно тогда, когда правят другую половину. Клиент под Windows уже разъезжался с общей
+      # частью на смене сигнатуры маршрутов — поймать это на машине разработчика было нечем,
+      # потому что он собирал только свою систему.
+      - name: Build (windows)
+        run: GOOS=windows go build ./...
+
+      - name: Vet (windows)
+        run: GOOS=windows go vet ./...
+
+      - name: Build (darwin)
+        run: GOOS=darwin go build ./...
+
+      # Гонка проверяется НА КАЖДОМ прогоне, а не «иногда»: горячий путь здесь многопоточный, а
+      # самая дорогая ошибка в нём — повтор nonce, то есть полная потеря AEAD. Такая гонка не
+      # падает и не шумит, она просто тихо снимает шифрование, и заметить её без детектора
+      # нечем.
+      - name: Test (race)
+        run: go test -race ./...
+
+  gofmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Не отформатировано (gofmt -w .):"
+            echo "$unformatted"
+            exit 1
+          fi

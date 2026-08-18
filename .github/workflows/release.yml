@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Версия релиза (пусто = сегодняшняя дата, YY.M.D)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      # Wintun берётся с сайта проекта и проверяется по контрольной сумме.
+      #
+      # Класть подписанную чужую DLL в свой репозиторий — значит обещать, что она та самая, ничем
+      # это обещание не подкрепив. Скачивание с проверкой суммы даёт проверяемую цепочку: сумма
+      # написана здесь, в истории, и подмена файла на сайте ломает сборку, а не уезжает молча в
+      # релиз.
+      - name: Забрать Wintun
+        run: |
+          set -eu
+          curl -fsSL -o wintun.zip https://www.wintun.net/builds/wintun-0.14.1.zip
+          echo "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51  wintun.zip" | sha256sum -c -
+          unzip -q wintun.zip
+
+      - name: Собрать и упаковать
+        run: |
+          set -eu
+          VER="${{ inputs.version }}"
+          [ -z "$VER" ] && VER=$(date +%y.%-m.%-d)
+          echo "VER=$VER" >> "$GITHUB_ENV"
+          mkdir -p dist
+
+          # Windows: exe + wintun.dll той же разрядности. Без DLL рядом клиент не поднимет
+          # устройство вовсе, поэтому она едет в архиве, а не в инструкции «доустановите».
+          for arch in amd64 arm64; do
+            case "$arch" in
+              amd64) wt=wintun/bin/amd64/wintun.dll ;;
+              arm64) wt=wintun/bin/arm64/wintun.dll ;;
+            esac
+            GOOS=windows GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X main.Version=$VER" -o xsteer.exe ./cmd/xsteer
+            cp "$wt" wintun.dll
+            zip -j "dist/xsteer-windows-$arch.zip" xsteer.exe wintun.dll wintun/LICENSE.txt
+            rm -f xsteer.exe wintun.dll
+          done
+
+          # Linux: клиент и хаб одним файлом, как на роутере.
+          for arch in amd64 arm64; do
+            GOOS=linux GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X main.Version=$VER" -o xsteer ./cmd/xsteer
+            tar -czf "dist/xsteer-linux-$arch.tar.gz" xsteer
+            rm -f xsteer
+          done
+
+          (cd dist && sha256sum * > SHA256SUMS)
+
+      - name: Создать релиз
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$VER" dist/* \
+            --title "xsteer $VER" \
+            --notes "Релиз $VER.
+
+          Архивы для Windows содержат xsteer.exe и wintun.dll — распакуйте оба в одну папку и
+          запускайте от администратора. Суммы файлов — в SHA256SUMS."
