@@ -3,6 +3,7 @@ package conf
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 )
@@ -68,7 +69,14 @@ type Conf struct {
 	MTU        int // 0 — вывести из MTU канала
 	ListenPort int // 0 — не слушать (пир)
 	SNI        string
-	Peers      []Peer
+	// DNS — серверы имён, которые встают на устройство туннеля. Пусто — не трогать резолвер.
+	//
+	// Нужны полному туннелю: без них запросы уходят серверу физического интерфейса (обычно это
+	// адрес роутера), и провайдер видит, куда человек ходит, хотя сам трафик спрятан. Применяет
+	// их платформа — на Windows через winipcfg, на Linux отказ назван прямо, потому что там
+	// именами распоряжается dnsmasq.
+	DNS   []string
+	Peers []Peer
 }
 
 // Secrets — то, что печатать нельзя никогда.
@@ -98,7 +106,6 @@ var wipeSink int
 // скопировавший конфигурацию из wg-quick, обязан узнать, что его PostUp не выполнится, —
 // иначе он будет ждать от туннеля того, чего тот не делает.
 var refused = []struct{ key, why string }{
-	{"DNS", "DNS здесь не настраивается: направьте нужные домены правилами"},
 	{"Table", "таблицами маршрутизации распоряжается сам клиент"},
 	{"FwMark", "метку клиент выбирает сам, задать её снаружи нельзя"},
 	{"PreUp", "клиент не исполняет команды из конфигурации"},
@@ -113,7 +120,7 @@ var refused = []struct{ key, why string }{
 // Известные ключи — для подсказки при опечатке: опечатка в имени ключа не должна требовать
 // чтения документации.
 var known = []string{
-	"PrivateKey", "Address", "MTU", "ListenPort", "SNI",
+	"PrivateKey", "Address", "MTU", "ListenPort", "SNI", "DNS",
 	"PublicKey", "AllowedIPs", "Endpoint", "PersistentKeepalive",
 }
 
@@ -324,6 +331,22 @@ func Parse(text []byte, role Role) (*Conf, *Secrets, error) {
 					return nil, nil, fmt.Errorf("строка %d: SNI длиннее 127 символов", lineNo)
 				}
 				c.SNI = val
+			case ieq(key, "DNS"):
+				// Только литералы адресов: имя сервера имён пришлось бы разрешать через сервер
+				// имён, которого ещё нет. Разбираем здесь, а не при применении, потому что
+				// опечатка в адресе обязана остановить запуск, а не всплыть предупреждением
+				// уже под поднятым туннелем.
+				for _, part := range strings.Split(val, ",") {
+					part = strings.TrimSpace(part)
+					if part == "" {
+						continue
+					}
+					if _, err := netip.ParseAddr(part); err != nil {
+						return nil, nil, fmt.Errorf("строка %d: DNS %q — нужен адрес, а не имя",
+							lineNo, part)
+					}
+					c.DNS = append(c.DNS, part)
+				}
 			default:
 				if h := didYouMean(key); h != "" {
 					return nil, nil, fmt.Errorf("строка %d: неизвестный ключ %s — возможно, %s", lineNo, key, h)

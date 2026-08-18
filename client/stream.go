@@ -31,6 +31,11 @@ import (
 //     порядку, поэтому и пачка всегда полного размера;
 //   - окна, PSH, голых подтверждений и прочего изображения стека. Всё это делает настоящий стек.
 
+// streamProbeMS — как часто в режиме потока уходит проба живости. Две секунды: сторож маршрута
+// считает канал живым, пока кадры от хаба не старше пяти, так что три пропущенные подряд пробы —
+// уже не случайность.
+const streamProbeMS = 2000
+
 // streamSession поднимает соединение в режиме потока и работает до его обрыва.
 func (c *Client) streamSession(ctx context.Context, id int, dev tun.Device) error {
 	addr := net.JoinHostPort(c.opt.Conf.Peers[0].Endpoint, fmt.Sprint(c.streamPort()))
@@ -153,12 +158,30 @@ func (c *Client) streamOut(ctx context.Context, id int, st *wire.Stream, tx *noi
 	frames := make([][]byte, 0, wire.BatchFramesMax)
 	keep := int64(c.opt.Conf.Peers[0].Keepalive) * 1000
 	last := nowMS()
+	lastProbe := int64(0)
 	for ctx.Err() == nil {
 		ok, err := dev.WaitRead(200 * time.Millisecond)
 		if err != nil {
 			return err
 		}
 		if !ok {
+			// Проба живости. В потоке согласовывать MTU нечем — сегментацией распоряжается ядро,
+			// — но проба нужна не ради размера: хаб отвечает на неё эхом, и это ЕДИНСТВЕННЫЙ
+			// признак того, что канал несёт трафик в обратную сторону. Без него полный туннель
+			// не отличил бы работающий хаб от хаба, который принимает всё и не отвечает ничем, —
+			// а разница между ними для человека это разница между «VPN» и «нет интернета».
+			//
+			// Кадр крохотный (три байта) и уходит раз в две секунды: столько же стоит один
+			// keepalive, а даёт сторожу маршрута непрерывную картину.
+			if now := nowMS(); now-lastProbe >= streamProbeMS {
+				if n, ok := wire.ProbeBuild(row[wire.HdrRoom:wire.HdrRoom+wire.ProbeMin], wire.ProbeMin); ok {
+					if err := c.streamSend(st, tx, row, n); err != nil {
+						return err
+					}
+					last = now
+				}
+				lastProbe = now
+			}
 			// Keepalive: пустая запись с разбросом интервала. Настоящий TCP держит соединение
 			// своими средствами лишь через часы, а отображение NAT живёт минуты.
 			if keep > 0 && nowMS()-last >= keep {
@@ -171,7 +194,16 @@ func (c *Client) streamOut(ctx context.Context, id int, st *wire.Stream, tx *noi
 		}
 		frames = frames[:0]
 		used, total := 0, wire.BatchHdr
-		for len(frames) < wire.BatchFramesMax {
+		// --no-batch обязан действовать И в потоке. Раньше ключ здесь просто не читался: разбор
+		// его принимал, справка обещала «везу по одному кадру», а поток всё равно собирал пачки.
+		// Ключ, который молча ничего не делает, хуже отсутствующего — человек считает, что
+		// настроил совместимость с хабом, который пачек не понимает, и ищет причину где угодно,
+		// только не в нём.
+		maxFrames := wire.BatchFramesMax
+		if c.opt.NoBatch {
+			maxFrames = 1
+		}
+		for len(frames) < maxFrames {
 			if len(frames) > 0 && total+2+mtu > wire.MaxRecord {
 				break
 			}

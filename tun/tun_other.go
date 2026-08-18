@@ -41,7 +41,15 @@ func SetAddr(name, cidr string) error { return fmt.Errorf("не сделано �
 func AddRoute(name, cidr string) error {
 	return fmt.Errorf("не сделано на %s", runtime.GOOS)
 }
-func SetupRoutes(name string, cidrs, endpoints []string) error {
+func SetupRoutes(name string, cidrs, endpoints []string) (bool, error) {
+	return false, fmt.Errorf("не сделано на %s", runtime.GOOS)
+}
+func DefaultRouteUp(name string) error {
+	return fmt.Errorf("не сделано на %s", runtime.GOOS)
+}
+func DefaultRouteDown(name string)      {}
+func DefaultRouteIsUp(name string) bool { return false }
+func SetDNS(name string, servers []string) error {
 	return fmt.Errorf("не сделано на %s", runtime.GOOS)
 }
 func TeardownRoutes(name string) {}

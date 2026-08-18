@@ -4,9 +4,11 @@ package tun
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -176,14 +178,45 @@ func AddRoute(name, cidr string) error {
 // для хаба здесь не нужны: полным туннелем на роутере управляет движок steer своими таблицами
 // и правилами (fwmark), а не этот клиент. Поэтому просто раскладываем префиксы как есть; аргумент
 // endpoints не используется и оставлен ради единой сигнатуры с Windows.
-func SetupRoutes(name string, cidrs, endpoints []string) error {
+//
+// Второе возвращаемое значение — «просили полный туннель». На Windows оно означает «маршрут по
+// умолчанию отложен до подтверждения», здесь — только осведомление вызывающего: маршрут уже
+// поставлен как обычный префикс, и отдельного шага ему не требуется.
+func SetupRoutes(name string, cidrs, endpoints []string) (bool, error) {
 	_ = endpoints
+	full := false
 	for _, c := range cidrs {
 		if err := AddRoute(name, c); err != nil {
-			return err
+			return full, err
+		}
+		if p, e := netip.ParsePrefix(strings.TrimSpace(c)); e == nil && p.Bits() == 0 && p.Addr().Is4() {
+			full = true
 		}
 	}
-	return nil
+	return full, nil
+}
+
+// DefaultRouteUp на Linux уже сделан в SetupRoutes: 0.0.0.0/0 ставится обычным `ip route replace`
+// на устройство, и спорить с физическим маршрутом по метрикам здесь не приходится.
+func DefaultRouteUp(name string) error { _ = name; return nil }
+
+// DefaultRouteDown на Linux снимает маршрут по умолчанию с устройства. Ошибку глотаем: если
+// маршрута уже нет, снимать нечего, и это не повод шуметь на выходе.
+func DefaultRouteDown(name string) { _ = run("ip", "route", "del", "0.0.0.0/0", "dev", name) }
+
+// DefaultRouteIsUp на Linux не отслеживается отдельно: маршрут ставится сразу и живёт с
+// устройством.
+func DefaultRouteIsUp(name string) bool { _ = name; return true }
+
+// SetDNS на Linux не трогает /etc/resolv.conf: клиент живёт на роутере, где именами
+// распоряжается dnsmasq, и переписывать его файл из-под туннеля значило бы драться с ним за
+// один ресурс. Отказ назван прямо, чтобы «DNS = ...» не выглядел применённым.
+func SetDNS(name string, servers []string) error {
+	_ = name
+	if len(servers) == 0 {
+		return nil
+	}
+	return fmt.Errorf("DNS из конфигурации на Linux не применяется: настройте резолвер сами")
 }
 
 // TeardownRoutes на Linux снимать нечего: маршруты уходят с устройством.

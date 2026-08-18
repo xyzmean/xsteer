@@ -249,30 +249,159 @@ type bypassRoute struct {
 	gw   netip.Addr
 }
 
+// devRoutes — всё, что мы навесили на систему ради одного устройства.
+//
+// Учёт ведётся ЯВНО, а не «уйдёт вместе с адаптером». Первая версия полагалась на закрытие
+// адаптера, и живой стенд показал цену: после аварийного завершения в таблице маршрутов
+// оставался обход /32 к хабу. Маршрут на ЧУЖОМ интерфейсе переживает наш процесс, и снимать
+// его обязан тот, кто поставил.
+type devRoutes struct {
+	luid      winipcfg.LUID
+	bypass    []bypassRoute
+	tunnel    []netip.Prefix
+	defaultUp bool
+	dnsSet    bool
+}
+
 var (
-	bypassMu sync.Mutex
-	bypass   = map[string][]bypassRoute{}
+	routesMu sync.Mutex
+	routesOf = map[string]*devRoutes{}
 )
 
-// SetupRoutes ставит на устройство маршруты AllowedIPs. В обычном случае это просто набор
-// префиксов, но полный туннель (0.0.0.0/0) на Windows требует ещё двух вещей, без которых он
-// молча не работает — трафик продолжает идти мимо туннеля, ровно как «handshake прошёл, а
-// через xsteer ничего не идёт».
-//
-// Первое — ОБХОД для адресов хаба. Маршрут по умолчанию мы уводим в туннель, но собственные
-// пакеты клиента к хабу тоже подпадают под 0.0.0.0/0 и ушли бы в туннель — петля, туннель
-// рвёт сам себя. Поэтому к каждому адресу хаба ставится /32 через прежний физический шлюз, и
-// встать он обязан ПЕРВЫМ, до того как маршрут по умолчанию уедет.
-//
-// Второе — РАСЩЕПЛЕНИЕ маршрута по умолчанию на 0.0.0.0/1 и 128.0.0.0/1. Простой 0.0.0.0/0 на
-// туннеле спорит с физическим 0.0.0.0/0 по метрикам интерфейсов, и кто победит — как повезёт;
-// именно поэтому «трафик не идёт через туннель». У двух половин маска на бит длиннее, а по
-// правилу «самый длинный префикс побеждает» они бьют любой /0 независимо от метрик. Тот же
-// приём использует WireGuard для Windows.
-func SetupRoutes(name string, cidrs, endpoints []string) error {
+func routesFor(name string) (*devRoutes, error) {
 	luid, err := luidOf(name)
 	if err != nil {
+		return nil, err
+	}
+	routesMu.Lock()
+	defer routesMu.Unlock()
+	r, ok := routesOf[name]
+	if !ok {
+		r = &devRoutes{luid: luid}
+		routesOf[name] = r
+	}
+	return r, nil
+}
+
+// halves — две половины маршрута по умолчанию.
+//
+// Простой 0.0.0.0/0 на туннеле спорит с физическим 0.0.0.0/0 по метрикам интерфейсов, и кто
+// победит — как повезёт. У двух половин маска на бит длиннее, а по правилу «самый длинный
+// префикс побеждает» они бьют любой /0 независимо от метрик. Тот же приём у WireGuard для
+// Windows. Снимаются они поимённо и не трогают чужой маршрут по умолчанию — а именно это и
+// нужно, чтобы вернуть человеку сеть.
+var halves = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/1"),
+	netip.MustParsePrefix("128.0.0.0/1"),
+}
+
+// DefaultRouteUp уводит маршрут по умолчанию в туннель. Зовётся ТОЛЬКО после того, как туннель
+// подтвердил, что несёт трафик, — см. пояснение у SetupRoutes.
+func DefaultRouteUp(name string) error {
+	r, err := routesFor(name)
+	if err != nil {
 		return err
+	}
+	routesMu.Lock()
+	defer routesMu.Unlock()
+	if r.defaultUp {
+		return nil
+	}
+	for _, hp := range halves {
+		if e := r.luid.AddRoute(hp, netip.IPv4Unspecified(), 0); e != nil && e != windows.ERROR_OBJECT_ALREADY_EXISTS {
+			// Половина не встала — снимаем ту, что успела. Одна половина без второй означает
+			// «половина интернета в туннеле, половина мимо», и это хуже любого из двух исходов.
+			for _, done := range halves {
+				_ = r.luid.DeleteRoute(done, netip.IPv4Unspecified())
+			}
+			return fmt.Errorf("половина маршрута по умолчанию %s не встала: %w", hp, e)
+		}
+	}
+	r.defaultUp = true
+	return nil
+}
+
+// DefaultRouteDown возвращает маршрут по умолчанию физическому интерфейсу.
+//
+// Снимаются ровно наши две половины: физический /0 мы никогда не удаляли, поэтому он снова
+// становится лучшим маршрутом сам, без восстановления чего бы то ни было.
+func DefaultRouteDown(name string) {
+	routesMu.Lock()
+	r, ok := routesOf[name]
+	if !ok || !r.defaultUp {
+		routesMu.Unlock()
+		return
+	}
+	r.defaultUp = false
+	luid := r.luid
+	routesMu.Unlock()
+	for _, hp := range halves {
+		_ = luid.DeleteRoute(hp, netip.IPv4Unspecified())
+	}
+}
+
+// DefaultRouteIsUp — держит ли туннель маршрут по умолчанию прямо сейчас.
+func DefaultRouteIsUp(name string) bool {
+	routesMu.Lock()
+	defer routesMu.Unlock()
+	r, ok := routesOf[name]
+	return ok && r.defaultUp
+}
+
+// SetDNS задаёт серверы имён на устройстве туннеля.
+//
+// Без этого полный туннель течёт именем: запросы уходят серверу физического интерфейса — обычно
+// это адрес роутера, — и провайдер видит, куда человек ходит, хотя сам трафик спрятан. WireGuard
+// для Windows делает ровно это же и по той же причине.
+func SetDNS(name string, servers []string) error {
+	r, err := routesFor(name)
+	if err != nil {
+		return err
+	}
+	var addrs []netip.Addr
+	for _, s := range servers {
+		a, err := netip.ParseAddr(strings.TrimSpace(s))
+		if err != nil {
+			return fmt.Errorf("адрес DNS %q не разобран: %w", s, err)
+		}
+		if !a.Is4() {
+			continue // v6 внутри туннеля пока не несём
+		}
+		addrs = append(addrs, a)
+	}
+	if len(addrs) == 0 {
+		return nil
+	}
+	if err := r.luid.SetDNS(windows.AF_INET, addrs, nil); err != nil {
+		return err
+	}
+	routesMu.Lock()
+	r.dnsSet = true
+	routesMu.Unlock()
+	return nil
+}
+
+// SetupRoutes ставит на устройство маршруты AllowedIPs — КРОМЕ маршрута по умолчанию.
+//
+// Полный туннель (0.0.0.0/0) здесь только ОБЪЯВЛЯЕТСЯ: функция возвращает full=true и ставит
+// обход /32 к хабу, но самого маршрута по умолчанию не трогает. Уводить его должен
+// DefaultRouteUp — и только после того, как туннель ДОКАЗАЛ, что несёт трафик.
+//
+// Почему так, а не сразу. Маршрут по умолчанию, уведённый в канал, который ничего не несёт, —
+// это не «туннель не работает», это «интернета нет вовсе», и снаружи оно неотличимо от
+// сломанной сети. Ровно это ловилось на живом стенде: рукопожатие проходит, хаб подтверждает
+// каждый наш сегмент и не отвечает ни байтом, а машина остаётся без сети до Ctrl-C. Порядок
+// «сначала докажи, потом забирай» превращает отказ хаба в «туннель не поднялся» вместо
+// «выключился интернет».
+//
+// Обход же ставится СРАЗУ и первым. Он никому не мешает — это тот же путь, которым пакеты к
+// хабу и так идут, — а понадобиться может в ту же секунду, когда маршрут по умолчанию уедет:
+// собственные пакеты клиента к хабу тоже подпадают под 0.0.0.0/0 и без обхода ушли бы в
+// туннель, который ими же и держится.
+func SetupRoutes(name string, cidrs, endpoints []string) (bool, error) {
+	r, err := routesFor(name)
+	if err != nil {
+		return false, err
 	}
 	full := false
 	for _, c := range cidrs {
@@ -282,38 +411,31 @@ func SetupRoutes(name string, cidrs, endpoints []string) error {
 		}
 	}
 	if full {
-		if err := addEndpointBypass(name, endpoints); err != nil {
-			return err
+		if err := addEndpointBypass(r, endpoints); err != nil {
+			return full, err
 		}
 	}
 	for _, c := range cidrs {
 		p, err := netip.ParsePrefix(strings.TrimSpace(c))
 		if err != nil {
-			return fmt.Errorf("маршрут %q не разобран: %w", c, err)
+			return full, fmt.Errorf("маршрут %q не разобран: %w", c, err)
 		}
 		if p.Bits() == 0 && p.Addr().Is4() {
-			for _, half := range []string{"0.0.0.0/1", "128.0.0.0/1"} {
-				hp := netip.MustParsePrefix(half)
-				if e := luid.AddRoute(hp, netip.IPv4Unspecified(), 0); e != nil && e != windows.ERROR_OBJECT_ALREADY_EXISTS {
-					return fmt.Errorf("половина маршрута по умолчанию %s не встала: %w", half, e)
-				}
-			}
-			continue
+			continue // маршрут по умолчанию — забота DefaultRouteUp
 		}
-		if e := luid.AddRoute(p, netip.IPv4Unspecified(), 0); e != nil && e != windows.ERROR_OBJECT_ALREADY_EXISTS {
-			return fmt.Errorf("маршрут %s не встал: %w", c, e)
+		if e := r.luid.AddRoute(p, netip.IPv4Unspecified(), 0); e != nil && e != windows.ERROR_OBJECT_ALREADY_EXISTS {
+			return full, fmt.Errorf("маршрут %s не встал: %w", c, e)
 		}
+		routesMu.Lock()
+		r.tunnel = append(r.tunnel, p)
+		routesMu.Unlock()
 	}
-	return nil
+	return full, nil
 }
 
 // addEndpointBypass ставит /32 к каждому адресу хаба через ПРЕЖНИЙ маршрут по умолчанию —
 // тот, что был до туннеля, — чтобы пакеты самого туннеля продолжали ходить физическим каналом.
-func addEndpointBypass(name string, endpoints []string) error {
-	tunLUID, err := luidOf(name)
-	if err != nil {
-		return err
-	}
+func addEndpointBypass(r *devRoutes, endpoints []string) error {
 	rows, err := winipcfg.GetIPForwardTable2(windows.AF_INET)
 	if err != nil {
 		return fmt.Errorf("таблица маршрутов не прочиталась: %w", err)
@@ -322,16 +444,16 @@ func addEndpointBypass(name string, endpoints []string) error {
 	// метрика. Его шлюз и интерфейс и станут обходом для хаба.
 	var best *winipcfg.MibIPforwardRow2
 	for i := range rows {
-		r := &rows[i]
-		if r.InterfaceLUID == tunLUID {
+		row := &rows[i]
+		if row.InterfaceLUID == r.luid {
 			continue
 		}
-		dp := r.DestinationPrefix.Prefix()
+		dp := row.DestinationPrefix.Prefix()
 		if dp.Bits() != 0 || !dp.Addr().Is4() {
 			continue
 		}
-		if best == nil || r.Metric < best.Metric {
-			best = r
+		if best == nil || row.Metric < best.Metric {
+			best = row
 		}
 	}
 	if best == nil {
@@ -340,7 +462,6 @@ func addEndpointBypass(name string, endpoints []string) error {
 	gw := best.NextHop.Addr()
 	physLUID := best.InterfaceLUID
 
-	var installed []bypassRoute
 	for _, ep := range endpoints {
 		addr, err := netip.ParseAddr(strings.TrimSpace(ep))
 		if err != nil || !addr.Is4() {
@@ -350,24 +471,38 @@ func addEndpointBypass(name string, endpoints []string) error {
 		if e := physLUID.AddRoute(pfx, gw, 0); e != nil && e != windows.ERROR_OBJECT_ALREADY_EXISTS {
 			return fmt.Errorf("обход к хабу %s не встал: %w", ep, e)
 		}
-		installed = append(installed, bypassRoute{luid: physLUID, pfx: pfx, gw: gw})
+		routesMu.Lock()
+		r.bypass = append(r.bypass, bypassRoute{luid: physLUID, pfx: pfx, gw: gw})
+		routesMu.Unlock()
 	}
-	bypassMu.Lock()
-	bypass[name] = append(bypass[name], installed...)
-	bypassMu.Unlock()
 	return nil
 }
 
-// TeardownRoutes снимает обходы для хаба, поставленные SetupRoutes. Маршруты самого туннеля
-// уходят вместе с адаптером Wintun при его закрытии, а обход живёт на физическом интерфейсе и
-// без этого остался бы висеть после выхода.
+// TeardownRoutes снимает ВСЁ, что поставило устройство: маршрут по умолчанию, префиксы туннеля,
+// серверы имён и обход к хабу.
+//
+// Обход снимается поимённо: он лежит на ФИЗИЧЕСКОМ интерфейсе, и закрытие адаптера Wintun его
+// не заденет. Именно он и оставался висеть в таблице после аварийного завершения — маршрут
+// 109.120.137.190/32 через прежний шлюз пережил и процесс, и перезагрузку окна консоли.
 func TeardownRoutes(name string) {
-	bypassMu.Lock()
-	rs := bypass[name]
-	delete(bypass, name)
-	bypassMu.Unlock()
-	for _, r := range rs {
-		_ = r.luid.DeleteRoute(r.pfx, r.gw)
+	DefaultRouteDown(name)
+	routesMu.Lock()
+	r, ok := routesOf[name]
+	if ok {
+		delete(routesOf, name)
+	}
+	routesMu.Unlock()
+	if !ok {
+		return
+	}
+	if r.dnsSet {
+		_ = r.luid.FlushDNS(windows.AF_INET)
+	}
+	for _, p := range r.tunnel {
+		_ = r.luid.DeleteRoute(p, netip.IPv4Unspecified())
+	}
+	for _, b := range r.bypass {
+		_ = b.luid.DeleteRoute(b.pfx, b.gw)
 	}
 }
 

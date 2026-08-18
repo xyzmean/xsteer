@@ -207,12 +207,43 @@ func TestХаб(t *testing.T) {
 	}
 }
 
+// DNS применяется, а не отвергается: полному туннелю он нужен, иначе запросы уходят серверу
+// физического интерфейса и провайдер видит, куда человек ходит, при спрятанном трафике.
+func TestDNS(t *testing.T) {
+	head := "[Interface]\nPrivateKey=" + keyA + "\nAddress=10.0.0.2/24\n"
+	peer := "[Peer]\nPublicKey=" + keyB + "\nAllowedIPs=0.0.0.0/0\nEndpoint=1.2.3.4:443\n"
+
+	c, _, err := Parse([]byte(head+"DNS=1.1.1.1, 8.8.8.8\n"+peer), RoleSpoke)
+	if err != nil {
+		t.Fatalf("DNS не принят: %v", err)
+	}
+	if len(c.DNS) != 2 || c.DNS[0] != "1.1.1.1" || c.DNS[1] != "8.8.8.8" {
+		t.Errorf("разобрано не то: %v", c.DNS)
+	}
+
+	// Без ключа резолвер не трогаем вовсе — это разные вещи, и пустой список означает именно
+	// «не трогать», а не «поставить умолчание».
+	c, _, err = Parse([]byte(head+peer), RoleSpoke)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.DNS) != 0 {
+		t.Errorf("без ключа DNS подставлен сам: %v", c.DNS)
+	}
+
+	// Имя вместо адреса — отказ: разрешать его пришлось бы через сервер имён, которого ещё нет.
+	msg := refuses(t, "DNS именем", head+"DNS=dns.example.com\n"+peer, RoleSpoke)
+	if !strings.Contains(msg, "DNS") {
+		t.Errorf("отказ не называет ключ: %s", msg)
+	}
+}
+
 func TestОтказы(t *testing.T) {
 	head := "[Interface]\nPrivateKey=" + keyA + "\nAddress=10.0.0.2/24\n"
 	peer := "[Peer]\nPublicKey=" + keyB + "\nAllowedIPs=0.0.0.0/0\nEndpoint=1.2.3.4:443\n"
 
 	// Ключи wg, поведение которых мы не реализуем: отказ, а не молчаливый пропуск.
-	for _, k := range []string{"DNS=1.1.1.1", "Table=off", "FwMark=0x100",
+	for _, k := range []string{"Table=off", "FwMark=0x100",
 		"PostUp=iptables -A FORWARD -j ACCEPT", "PreDown=echo", "SaveConfig=true"} {
 		msg := refuses(t, "ключ "+k, head+k+"\n"+peer, RoleSpoke)
 		if msg != "" && !strings.Contains(msg, strings.SplitN(k, "=", 2)[0]) {
