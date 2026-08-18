@@ -125,11 +125,18 @@ EOF
         compat="--no-batch"
     fi
 
+    stream_hub=""; stream_cli=""
+    if [ "$cli_kind" = stream ]; then
+        stream_hub="--stream-port 8443"
+        stream_cli="--stream-port 8443"
+        cli_kind=go
+    fi
+
     if [ "$hub_kind" = c ]; then
         ip netns exec $NSH "$HUB_C" xsteer-hub --config "$WORK/hub.conf" \
             --state-dir "$WORK/state" > "$WORK/hub.log" 2>&1 &
     else
-        ip netns exec $NSH "$GO" hub "$WORK/hub.conf" $compat > "$WORK/hub.log" 2>&1 &
+        ip netns exec $NSH "$GO" hub "$WORK/hub.conf" $compat $stream_hub > "$WORK/hub.log" 2>&1 &
     fi
     sleep 0.8
 
@@ -141,9 +148,9 @@ EOF
             --state-dir "$WORK/state" > "$WORK/b.log" 2>&1 &
     else
         deva=xsa; devb=xsb
-        ip netns exec $NSA "$GO" up "$WORK/a.conf" --dev xsa --probe-ms 3000 $compat \
+        ip netns exec $NSA "$GO" up "$WORK/a.conf" --dev xsa --probe-ms 3000 $compat $stream_cli \
             > "$WORK/a.log" 2>&1 &
-        ip netns exec $NSB "$GO" up "$WORK/b.conf" --dev xsb --probe-ms 3000 $compat \
+        ip netns exec $NSB "$GO" up "$WORK/b.conf" --dev xsb --probe-ms 3000 $compat $stream_cli \
             > "$WORK/b.log" 2>&1 &
     fi
 
@@ -198,11 +205,14 @@ EOF
     fi
 }
 
+# Пятая клетка: обе половины на Go, но записи идут по НАСТОЯЩЕМУ TCP (режим потока). Она здесь
+# потому, что проверяет то же, что остальные — рукопожатие, пир↔хаб, пир↔пир через хаб,
+# согласование MTU, — но через другой транспорт, и ломаться ей есть чем самостоятельно.
 want_hub="${1:-both}"; want_cli="${2:-both}"
 for hk in c go; do
     [ "$want_hub" = both ] || [ "$want_hub" = "$hk" ] || continue
     [ "$hk" = c ] && [ "$have_c_hub" = 0 ] && { echo "== хаб c пропущен: нет $HUB_C"; continue; }
-    for ck in c go; do
+    for ck in c go stream; do
         [ "$want_cli" = both ] || [ "$want_cli" = "$ck" ] || continue
         [ "$ck" = c ] && [ "$have_c_cli" = 0 ] && { echo "== клиент c пропущен: нет $CLI_C"; continue; }
         cell "$hk" "$ck"

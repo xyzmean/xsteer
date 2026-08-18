@@ -52,12 +52,16 @@ func usage() {
     --chacha          заставить ChaCha20-Poly1305 (по умолчанию решает наличие AES в процессоре)
     --no-batch        не собирать кадры в одну запись: нужно для разговора с хабом на C,
                       пока перенос не сделан. Облик на проводе при этом хуже
+    --stream          вести записи по НАСТОЯЩЕМУ TCP вместо поддельного: без сырого сокета и
+                      без прав на него. Так пойдёт Windows; цена — TCP внутри TCP
+    --stream-port <N> порт хаба для режима потока (по умолчанию порт из Endpoint)
 
 Ключи для hub:
     --dev <имя>       имя устройства (по умолчанию %s)
     --workers <N>     воркеров (по умолчанию по числу ядер, не больше %d)
     --no-tun          не поднимать устройство: только трафик пир↔пир
     --no-batch        не собирать кадры в одну запись: для клиента на C
+    --stream-port <N> слушать НАСТОЯЩИЙ TCP на этом порту (режим потока), помимо поддельного
     --decoy <режим>   что отвечать НЕОПОЗНАННЫМ: alert (по умолчанию), silent, reset
                       или proxy — отдавать соединение настоящему серверу
     --decoy-dest <host:port>   куда отдавать в режиме proxy
@@ -187,6 +191,17 @@ func cmdUp(args []string) error {
 			forceChaCha = true
 		case "--no-batch":
 			opt.NoBatch = true
+		case "--stream":
+			opt.Stream = true
+		case "--stream-port":
+			v, ok := value()
+			if !ok {
+				return fmt.Errorf("у ключа --stream-port нет значения")
+			}
+			if _, err := fmt.Sscanf(v, "%d", &opt.StreamPort); err != nil || opt.StreamPort < 1 {
+				return fmt.Errorf("--stream-port: нужен порт, а не %q", v)
+			}
+			opt.Stream = true
 		default:
 			return fmt.Errorf("неизвестный ключ %s (подсказка: xsteer --help)", key)
 		}
@@ -252,6 +267,14 @@ func cmdHub(args []string) error {
 			opt.NoTUN = true
 		case "--no-batch":
 			opt.NoBatch = true
+		case "--stream-port":
+			v, ok := value()
+			if !ok {
+				return fmt.Errorf("у ключа --stream-port нет значения")
+			}
+			if _, err := fmt.Sscanf(v, "%d", &opt.StreamPort); err != nil || opt.StreamPort < 1 {
+				return fmt.Errorf("--stream-port: нужен порт, а не %q", v)
+			}
 		case "--decoy":
 			v, ok := value()
 			if !ok {

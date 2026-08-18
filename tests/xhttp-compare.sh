@@ -24,6 +24,9 @@ GO=${XSTEER_BIN:-./build/xsteer}
 # для одного: убедиться, что перенос формата в C дал ТУ ЖЕ форму на проводе, а не только
 # совместимость. «Собралось и соединилось» и «выглядит так же» — разные утверждения.
 XS_IMPL="${XS_IMPL:-go}"
+# XS_STREAM=1 снимает запись с режима ПОТОКА (записи по настоящему TCP). Нужно, чтобы проверить
+# утверждение «в потоке облик лучше» — а не поверить ему.
+XS_STREAM="${XS_STREAM:-}"
 C_HUB=${STEER_HUB_BIN:-../steer/build/steer-hub}
 C_EXT=${STEER_EXT_BIN:-../steer/build/steer-ext}
 XRAY=${XRAY_BIN:-}
@@ -143,14 +146,18 @@ EOF
 chmod 600 "$WORK"/*.conf
 # XS_FLAGS позволяет снять записи со старым форматом (--no-batch) и сравнить их с новым: без этого
 # «стало лучше» пришлось бы утверждать по памяти.
-ip netns exec $NSS tcpdump -i sc -n -s 0 -w "$WORK/xsteer.pcap" 'tcp port 443' >/dev/null 2>&1 &
+xs_port=443
+[ -n "$XS_STREAM" ] && xs_port=8443
+ip netns exec $NSS tcpdump -i sc -n -s 0 -w "$WORK/xsteer.pcap" "tcp port $xs_port" >/dev/null 2>&1 &
 sleep 0.5
 if [ "$XS_IMPL" = c ]; then
     mkdir -p "$WORK/state"
     ip netns exec $NSS "$C_HUB" xsteer-hub --config "$WORK/hub.conf" \
         --state-dir "$WORK/state" > "$WORK/hub.log" 2>&1 &
 else
-    ip netns exec $NSS "$GO" hub "$WORK/hub.conf" ${XS_FLAGS:-} > "$WORK/hub.log" 2>&1 &
+    xs_hub_flags="${XS_FLAGS:-}"
+    [ -n "$XS_STREAM" ] && xs_hub_flags="$xs_hub_flags --stream-port 8443"
+    ip netns exec $NSS "$GO" hub "$WORK/hub.conf" $xs_hub_flags > "$WORK/hub.log" 2>&1 &
 fi
 sleep 1
 # Одно соединение, а не по одному на ядро: сравниваем ФОРМУ одного потока с формой одного потока
@@ -166,7 +173,9 @@ EOF
     STEER_XS_CONNS=1 ip netns exec $NSC env STEER_XS_CONNS=1 "$C_EXT" xsteer xsa \
         --spec "$WORK/a.json" --state-dir "$WORK/state" > "$WORK/a.log" 2>&1 &
 else
-    ip netns exec $NSC "$GO" up "$WORK/a.conf" --dev xsa --conns 1 --routes ${XS_FLAGS:-} \
+    xs_cli_flags="${XS_FLAGS:-}"
+    [ -n "$XS_STREAM" ] && xs_cli_flags="$xs_cli_flags --stream-port 8443"
+    ip netns exec $NSC "$GO" up "$WORK/a.conf" --dev xsa --conns 1 --routes $xs_cli_flags \
         > "$WORK/a.log" 2>&1 &
 fi
 sleep 3
@@ -183,7 +192,7 @@ pkill -x tcpdump 2>/dev/null || true
 sleep 1
 
 echo
-python3 tests/wireshape.py --port 443 "$WORK/xsteer.pcap" --port 8443 "$WORK/xhttp.pcap"
+python3 tests/wireshape.py --port "$xs_port" "$WORK/xsteer.pcap" --port 8443 "$WORK/xhttp.pcap"
 if [ -n "${XC_KEEP:-}" ]; then
     cp "$WORK/xsteer.pcap" "$WORK/xhttp.pcap" /tmp/ 2>/dev/null || true
     echo "записи скопированы в /tmp"

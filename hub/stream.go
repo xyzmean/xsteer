@@ -1,0 +1,205 @@
+package hub
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"time"
+
+	"github.com/xyzmean/xsteer/conf"
+	"github.com/xyzmean/xsteer/noise"
+	"github.com/xyzmean/xsteer/wire"
+)
+
+// Режим потока на хабе: слушающий сокет ядра вместо поддельного TCP.
+//
+// ПОЧЕМУ ОТДЕЛЬНЫЙ ПОРТ, А НЕ ТОТ ЖЕ. Слушающий сокет ядра отвечает SYN-ACK всякому, кто
+// постучится, — включая пиров, которые ведут ПОДДЕЛЬНЫЙ TCP. Тогда на один их SYN приходит два
+// ответа с разными начальными номерами, и сессия рассыпается. Поэтому режимы живут на разных
+// портах; какой из них поставить на :443, решает оператор (поток выглядит настоящим TLS полнее,
+// поддельный TCP экономит повторы).
+//
+// Что даёт слушающий сокет сверх облика: защиту от потока SYN обеспечивает ядро (syncookies), а
+// проксирование неопознанных к сайту-прикрытию перестаёт зависеть от отсутствия повторных передач —
+// та единственная дырка в защите от зондирования, которую пришлось назвать неустранимой.
+
+// streamListen поднимает слушателя и обслуживает соединения до отмены контекста.
+func (h *Hub) streamListen(ctx context.Context, port int) error {
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		return fmt.Errorf("слушатель потока на :%d: %w", port, err)
+	}
+	h.logf("слушаю настоящий TCP :%d (режим потока)", port)
+	go func() {
+		<-ctx.Done()
+		ln.Close()
+	}()
+	for ctx.Err() == nil {
+		nc, err := ln.Accept()
+		if err != nil {
+			return err
+		}
+		go h.streamConn(ctx, nc)
+	}
+	return ctx.Err()
+}
+
+// streamConn обслуживает одно соединение: рукопожатие, потом данные.
+func (h *Hub) streamConn(ctx context.Context, nc net.Conn) {
+	defer nc.Close()
+	if tc, ok := nc.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+	}
+	peerAddr := nc.RemoteAddr().String()
+	st := wire.NewStream(nc)
+
+	// Рукопожатие с крышкой по времени: соединение, которое молчит после SYN, не должно занимать
+	// горутину и память бесконечно — на публичный порт стучится кто угодно.
+	_ = nc.SetDeadline(time.Now().Add(15 * time.Second))
+
+	// ClientHello приходит одной записью (тип 0x16): читаем заголовок, потом тело.
+	var hdr [wire.RecHdr]byte
+	if err := st.ReadFull(hdr[:]); err != nil {
+		return
+	}
+	n := int(hdr[3])<<8 | int(hdr[4])
+	// Не похоже на рукопожатие TLS вовсе — отвечаем как настоящий сервер и уходим. Молчание здесь
+	// отличимо не хуже, чем молчание на Hello (см. onStranger).
+	if hdr[0] != 0x16 || hdr[1] != 0x03 || n < 100 || n > 4096 {
+		h.stats.strangers.Add(1)
+		_, _ = nc.Write(noise.Alert())
+		return
+	}
+	rec := make([]byte, wire.RecHdr+n)
+	copy(rec, hdr[:])
+	if err := st.ReadFull(rec[wire.RecHdr:]); err != nil {
+		return
+	}
+
+	hs := &noise.HS{}
+	if err := hs.ServerRead(h.opt.Sec.Priv, rec, nil); err != nil {
+		h.stats.strangers.Add(1)
+		_, _ = nc.Write(noise.Alert())
+		return
+	}
+	found := -1
+	for i := range h.opt.Conf.Peers {
+		if h.opt.Conf.Peers[i].Pub == hs.PeerStatic {
+			found = i
+			break
+		}
+	}
+	if found < 0 {
+		h.stats.strangers.Add(1)
+		h.logf("поток с %s: пир %s не описан в конфигурации — отказ", peerAddr,
+			conf.KeyFP(hs.PeerStatic))
+		_, _ = nc.Write(noise.Alert())
+		return
+	}
+	// Защита от воспроизведения — та же и та же общая: пир приходит с разных портов, а метка
+	// времени одна на пира.
+	h.ctl.Lock()
+	seen := h.lastStamp[found]
+	h.ctl.Unlock()
+	if hs.Peer.Stamp != 0 && hs.Peer.Stamp < seen {
+		h.logf("поток с %s: метка времени старее прошлой — похоже на повтор", peerAddr)
+		return
+	}
+
+	own := wire.MTUDefault
+	if c := h.opt.Conf.MTU; c > 0 && c < own {
+		own = c
+	}
+	out, tx, rx, err := hs.ServerWrite(own)
+	if err != nil {
+		return
+	}
+	if err := st.WriteRaw(out); err != nil {
+		return
+	}
+	// Подтверждение пира: одна запись известной длины.
+	var chdr [wire.RecHdr]byte
+	if err := st.ReadFull(chdr[:]); err != nil {
+		return
+	}
+	cn := int(chdr[3])<<8 | int(chdr[4])
+	if chdr[0] != 0x17 || cn != noise.FinBody {
+		return
+	}
+	cbuf := make([]byte, wire.RecHdr+cn)
+	copy(cbuf, chdr[:])
+	if err := st.ReadFull(cbuf[wire.RecHdr:]); err != nil {
+		return
+	}
+	if _, err := hs.ServerConfirm(rx, cbuf); err != nil {
+		h.logf("поток с %s: подтверждение не сошлось", peerAddr)
+		return
+	}
+	connID := hs.Peer.ConnID()
+	if connID >= wire.ConnsMax {
+		connID = 0
+	}
+	stamp := hs.Peer.Stamp
+	peerMTU := int(hs.Peer.MTU)
+	hs.Wipe()
+	_ = nc.SetDeadline(time.Time{})
+
+	s := &session{
+		st: st, tx: tx, rx: rx, phase: phEst, peer: found, connID: connID,
+		batchMax: wire.BatchFramesMax, handshakeAt: time.Now(),
+	}
+	if peerMTU > 0 {
+		s.mtu = peerMTU
+	}
+	h.ctl.Lock()
+	h.lastStamp[found] = stamp
+	h.ctl.Unlock()
+	h.peerSess[found][connID].Store(s)
+	defer h.peerSess[found][connID].CompareAndSwap(s, nil)
+
+	kind := "ChaCha20-Poly1305"
+	if tx.Kind() == noise.AEADAES128 {
+		kind = "AES-128-GCM"
+	}
+	h.logf("пир %s поднялся потоком с %s, MTU %d, шифр %s",
+		conf.KeyFP(h.opt.Conf.Peers[found].Pub), peerAddr, peerMTU, kind)
+
+	// Воркер на соединение: он нужен обработке кадров как хозяин буфера пересылки и очереди
+	// устройства. Заводить его на соединение дешевле, чем протаскивать эти две вещи параметрами
+	// через весь путь данных, а память — восемь килобайт на пира.
+	w := &worker{h: h, row: make([]byte, wire.HdrRoom+wire.MaxRecord+wire.Tag),
+		scratch: make([]byte, 20+wire.Row), sess: map[skey]*session{}}
+	if len(h.dev) > 0 {
+		w.dev = h.dev[found%len(h.dev)]
+	}
+
+	go func() {
+		<-ctx.Done()
+		nc.Close()
+	}()
+	for {
+		body, rhdr, rel, err := st.ReadRecord()
+		if err != nil {
+			s.mu.Lock()
+			s.phase = phFree
+			s.mu.Unlock()
+			return
+		}
+		pt, err := rx.Open(body, rhdr, uint64(rel))
+		if err != nil {
+			// В потоке испорченная запись означает конец: границы следующей известны только из
+			// длины, которой мы уже не верим.
+			s.mu.Lock()
+			s.phase = phFree
+			s.mu.Unlock()
+			return
+		}
+		if len(pt) > 0 && pt[0] == wire.CtlBatch {
+			if !wire.BatchIter(pt, func(f []byte) { w.onFrame(s, f) }) {
+				h.stats.dropped.Add(1)
+			}
+			continue
+		}
+		w.onFrame(s, pt)
+	}
+}

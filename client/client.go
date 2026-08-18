@@ -63,6 +63,16 @@ type Options struct {
 	// Routes — направить ли AllowedIPs хаба в устройство. Ложь нужна тогда, когда маршрутами
 	// распоряжается кто-то другой.
 	Routes bool
+	// Stream — вести записи по НАСТОЯЩЕМУ соединению TCP вместо поддельного.
+	//
+	// Нужно там, где поддельный TCP недоступен (Windows без драйвера-перехватчика) — и, возможно,
+	// везде: настоящий стек бесплатно даёт всё, что мы изображаем руками. Цена — TCP внутри TCP;
+	// решает замер, см. шапку wire/stream.go.
+	Stream bool
+	// StreamPort — порт хаба для режима потока. Ноль означает порт из Endpoint. Отдельный порт
+	// нужен потому, что слушающий сокет ядра на порту поддельного TCP отвечал бы SYN-ACK и
+	// поддельным пирам тоже.
+	StreamPort int
 	// NoBatch — не собирать кадры в одну запись и не разрезать записи между сегментами.
 	//
 	// Нужно ровно для одного: разговора с хабом на C, который ни пачек, ни сборки пока не умеет.
@@ -276,7 +286,12 @@ func defaultConns() int {
 // worker — один поддельный соединение к хабу от подъёма до отмены.
 func (c *Client) worker(ctx context.Context, id int, dev tun.Device, devName string) {
 	for ctx.Err() == nil {
-		err := c.session(ctx, id, dev, devName)
+		var err error
+		if c.opt.Stream {
+			err = c.streamSession(ctx, id, dev)
+		} else {
+			err = c.session(ctx, id, dev, devName)
+		}
 		if ctx.Err() != nil {
 			return
 		}

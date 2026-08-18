@@ -559,6 +559,25 @@ func (w *worker) sendTo(d *session, row []byte, plen int) {
 	if d.phase != phEst || d.tx == nil {
 		return
 	}
+	// Сессия по НАСТОЯЩЕМУ потоку: резать запись на сегменты не нужно, это работа ядра.
+	if d.st != nil {
+		rec := row[wire.HdrRoom-wire.RecHdr : wire.HdrRoom]
+		err := d.st.WriteRecord(row, wire.RecHdr+plen+wire.Tag, func(rel uint32) error {
+			if err := wire.RecBuild(rec, plen+wire.Tag); err != nil {
+				return err
+			}
+			_, e := d.tx.Seal(row[wire.HdrRoom:wire.HdrRoom+plen+wire.Tag], plen, rec, uint64(rel))
+			return e
+		})
+		if err != nil {
+			w.h.stats.dropped.Add(1)
+			return
+		}
+		d.downPkts++
+		w.h.stats.txPkts.Add(1)
+		w.h.stats.txBytes.Add(uint64(plen))
+		return
+	}
 	if wire.RetireDue(d.conn.RelNext(), d.conn.Age()) {
 		return
 	}

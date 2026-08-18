@@ -6,6 +6,7 @@ package wire
 
 import (
 	"bytes"
+	"io"
 	"math/rand"
 	"testing"
 )
@@ -571,3 +572,94 @@ func TestСборкаРазрезаннойЗаписи(t *testing.T) {
 		t.Error("целая запись в одном сегменте не разобралась")
 	}
 }
+
+// Записи по настоящему потоку: смещения обеих сторон обязаны совпадать, иначе не расшифруется
+// первый же пакет данных. Проверяется на «трубе» без всякой сети.
+type pipe struct {
+	buf []byte
+}
+
+func (p *pipe) Write(b []byte) (int, error) { p.buf = append(p.buf, b...); return len(b), nil }
+func (p *pipe) Read(b []byte) (int, error) {
+	if len(p.buf) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(b, p.buf)
+	p.buf = p.buf[n:]
+	return n, nil
+}
+
+func TestПотокЗаписей(t *testing.T) {
+	p := &pipe{}
+	tx := NewStream(p)
+	rx := NewStream(p)
+
+	// Рукопожатие двигает смещение так же, как данные: иначе стороны разойдутся ровно на его длину.
+	hello := bytes.Repeat([]byte{0x16}, 1759)
+	if err := tx.WriteRaw(hello); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(hello))
+	if _, err := io.ReadFull(readerOf(rx), got); err != nil {
+		t.Fatal(err)
+	}
+	if tx.TxNext() != 1+uint32(len(hello)) {
+		t.Errorf("смещение отправителя после рукопожатия = %d", tx.TxNext())
+	}
+
+	// Три записи разной длины: смещение каждой обязано совпасть у обеих сторон.
+	for i, plen := range []int{Tag, Tag + 100, Tag + MaxRecord/2} {
+		row := make([]byte, HdrRoom+MaxRecord+Tag)
+		rec := row[HdrRoom-RecHdr : HdrRoom]
+		if err := RecBuild(rec, plen); err != nil {
+			t.Fatal(err)
+		}
+		for k := 0; k < plen; k++ {
+			row[HdrRoom+k] = byte(i*7 + k)
+		}
+		var sealedWith uint32
+		want := tx.TxNext()
+		err := tx.WriteRecord(row, RecHdr+plen, func(rel uint32) error {
+			sealedWith = rel
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sealedWith != want {
+			t.Errorf("запись %d зашифрована смещением %d, а ушла с %d", i, sealedWith, want)
+		}
+		body, hdr, rel, err := rx.ReadRecord()
+		if err != nil {
+			t.Fatalf("запись %d не прочиталась: %v", i, err)
+		}
+		if rel != want {
+			t.Errorf("запись %d прочитана со смещением %d, а отправлена с %d", i, rel, want)
+		}
+		if len(body) != plen || len(hdr) != RecHdr {
+			t.Errorf("запись %d: длины %d и %d", i, len(body), len(hdr))
+		}
+		if !bytes.Equal(body, row[HdrRoom:HdrRoom+plen]) {
+			t.Errorf("запись %d испортилась", i)
+		}
+	}
+
+	// Мусор в потоке — это конец соединения, а не «пропустим кадр»: в потоке нет способа найти
+	// начало следующей записи, не доверяя длине, которой мы уже не верим.
+	p.buf = append(p.buf, 0x17, 0x03, 0x04, 0x00, 0x20)
+	if _, _, _, err := rx.ReadRecord(); err == nil {
+		t.Error("запись с чужой версией принята")
+	}
+	p.buf = nil
+	p.buf = append(p.buf, 0x17, 0x03, 0x03, 0xFF, 0xFF)
+	if _, _, _, err := rx.ReadRecord(); err == nil {
+		t.Error("запись длиннее предела принята")
+	}
+}
+
+// readerOf нужен, чтобы прочитать сырые байты рукопожатия и учесть их в смещении.
+func readerOf(s *Stream) io.Reader { return readerFunc(s.ReadRaw) }
+
+type readerFunc func([]byte) (int, error)
+
+func (f readerFunc) Read(b []byte) (int, error) { return f(b) }

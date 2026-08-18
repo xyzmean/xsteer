@@ -114,6 +114,11 @@ type Options struct {
 	// разговора с клиентом на C, который этого пока не умеет; цена — облик на проводе (см. те же
 	// поля в client.Options).
 	NoBatch bool
+	// StreamPort — порт для режима потока (настоящий TCP). Ноль означает «не слушать».
+	//
+	// Отдельный порт, а не тот же: слушающий сокет ядра отвечал бы SYN-ACK и пирам поддельного
+	// TCP, и на один их SYN приходило бы два ответа с разными начальными номерами.
+	StreamPort int
 }
 
 // Hub — поднятый хаб.
@@ -182,6 +187,9 @@ type session struct {
 
 	// up — соединение к сайту-прикрытию в фазе phProxy. Nil во всех остальных.
 	up netConn
+	// st — поток, если сессия ведётся по НАСТОЯЩЕМУ TCP. Nil у сессий поддельного TCP; отправка
+	// смотрит на это поле и выбирает путь.
+	st *wire.Stream
 	// dead — «эту сессию пора убрать». Ставится ЛЮБОЙ горутиной (например, той, что переливает
 	// байты прикрытия), а убирает сессию всегда владелец: таблица сессий его личная, и править её
 	// со стороны значило бы завести гонку в самом неудачном месте.
@@ -320,6 +328,16 @@ func Run(ctx context.Context, opt Options) error {
 		opt.Conf.ListenPort, len(opt.Conf.Peers), n)
 	if opt.Decoy.Mode != "" {
 		h.logf("неопознанным: %s", opt.Decoy.describe())
+	}
+
+	if opt.StreamPort > 0 {
+		h.wg.Add(1)
+		go func() {
+			defer h.wg.Done()
+			if err := h.streamListen(ctx, opt.StreamPort); err != nil && ctx.Err() == nil {
+				h.logf("слушатель потока остановился: %v", err)
+			}
+		}()
 	}
 
 	for _, w := range workers {
