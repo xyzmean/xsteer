@@ -312,27 +312,35 @@ func Run(ctx context.Context, opt Options) error {
 	}
 	defer h.guard.Down()
 
+	// Воркеры. В обычном режиме у каждого свой сырой сокет (поддельный TCP); в режиме потока сырых
+	// сокетов нет вовсе, НО воркер с очередью устройства нужен и там: без него некому читать ОТВЕТЫ
+	// из ядра (интернет → пир) в tunLoop, и туннель нёс бы данные лишь в одну сторону. Именно этого
+	// и не хватало в --stream-only — цикл создания стоял под `opt.StreamOnly == false` и не делал ни
+	// одного воркера: поток поднимался, наружу пакеты уходили (их кладёт воркер соединения из
+	// stream.go), а обратно не возвращалось ничего — рукопожатие есть, данных ноль.
 	workers := make([]*worker, 0, n)
-	for i := 0; opt.StreamOnly == false && i < n; i++ {
-		mask := uint16(n - 1)
-		rx, err := link.OpenRawListen(uint16(opt.Conf.ListenPort), mask, uint16(i))
-		if err != nil {
-			return err
-		}
+	for i := 0; i < n; i++ {
 		w := &worker{
-			id: i, n: n, mask: mask, h: h, rx: rx,
+			id: i, n: n, mask: uint16(n - 1), h: h,
 			sess:    make(map[skey]*session),
 			row:     make([]byte, wire.HdrRoom+wire.MaxRecord+wire.Tag),
 			scratch: make([]byte, 20+wire.Row),
 			hbuf:    make([]byte, 2048),
 		}
+		if !opt.StreamOnly {
+			rx, err := link.OpenRawListen(uint16(opt.Conf.ListenPort), w.mask, uint16(i))
+			if err != nil {
+				return err
+			}
+			w.rx = rx
+			// Сокет для RST тем, чьей сессии нет. Ошибка не смертельна: без него пир узнает о
+			// перезапуске хаба по тишине, то есть через сорок пять секунд простоя.
+			if tx0, err := link.OpenRawSend([4]byte{0, 0, 0, 0}); err == nil {
+				w.tx0 = tx0
+			}
+		}
 		if len(h.dev) > 0 {
 			w.dev = h.dev[i%len(h.dev)]
-		}
-		// Сокет для RST тем, чьей сессии нет. Ошибка не смертельна: без него пир узнает о
-		// перезапуске хаба по тишине, то есть через сорок пять секунд простоя.
-		if tx0, err := link.OpenRawSend([4]byte{0, 0, 0, 0}); err == nil {
-			w.tx0 = tx0
 		}
 		workers = append(workers, w)
 	}
@@ -341,7 +349,8 @@ func Run(ctx context.Context, opt Options) error {
 		h.logf("слушаю поддельный TCP :%d, пиров %d, воркеров %d, шифр решает клиент",
 			opt.Conf.ListenPort, len(opt.Conf.Peers), n)
 	} else {
-		h.logf("поддельный TCP не поднимаю (--stream-only), пиров %d", len(opt.Conf.Peers))
+		h.logf("поддельный TCP не поднимаю (--stream-only), пиров %d, чтение устройства для обратного пути включено",
+			len(opt.Conf.Peers))
 	}
 	if opt.Decoy.Mode != "" {
 		h.logf("неопознанным: %s", opt.Decoy.describe())
@@ -361,8 +370,10 @@ func Run(ctx context.Context, opt Options) error {
 	}
 
 	for _, w := range workers {
-		h.wg.Add(1)
-		go func(w *worker) { defer h.wg.Done(); w.rxLoop(ctx) }(w)
+		if w.rx != nil {
+			h.wg.Add(1)
+			go func(w *worker) { defer h.wg.Done(); w.rxLoop(ctx) }(w)
+		}
 		if w.dev != nil {
 			h.wg.Add(1)
 			go func(w *worker) { defer h.wg.Done(); w.tunLoop(ctx) }(w)
@@ -378,7 +389,9 @@ func Run(ctx context.Context, opt Options) error {
 			d.Close()
 		}
 		for _, w := range workers {
-			w.rx.Close()
+			if w.rx != nil {
+				w.rx.Close()
+			}
 		}
 	}()
 
