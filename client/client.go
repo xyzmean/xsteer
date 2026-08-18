@@ -519,29 +519,21 @@ func (c *Client) outbound(ctx context.Context, id int, s *sess, dev tun.Device) 
 
 // sendFrame шифрует кадр открытого текста, лежащий по row[wire.HdrRoom:], и отправляет его.
 //
+// Шифрование идёт ВНУТРИ SendData, под тем же замком, что выдаёт смещение: см. объяснение там.
+// Раздельно это уже было сделано и оказалось повтором nonce при двух отправляющих горутинах.
+//
 // Служебные кадры (проба, эхо, итог) уходят тем же путём, что данные: у них нет своего канала, и
 // это нарочно — иначе появился бы второй путь на проводе, который DPI различал бы по размеру и
 // ритму.
 func (c *Client) sendFrame(s *sess, row []byte, n int) error {
-	rel := s.conn.RelNext()
 	rec := row[wire.HdrRoom-wire.RecHdr : wire.HdrRoom]
-	if err := wire.RecBuild(rec, n+wire.Tag); err != nil {
+	return s.conn.SendData(row, wire.RecHdr+n+wire.Tag, func(rel uint32) error {
+		if err := wire.RecBuild(rec, n+wire.Tag); err != nil {
+			return err
+		}
+		_, err := s.tx.Seal(row[wire.HdrRoom:wire.HdrRoom+n+wire.Tag], n, rec, uint64(rel))
 		return err
-	}
-	if _, err := s.tx.Seal(row[wire.HdrRoom:wire.HdrRoom+n+wire.Tag], n, rec, uint64(rel)); err != nil {
-		return err
-	}
-	got, err := s.conn.SendData(row, wire.RecHdr+n+wire.Tag)
-	if err != nil {
-		return err
-	}
-	if got != rel {
-		// Такого быть не может: смещение читается и тратится под одним замком. Проверка стоит
-		// одного сравнения и ловит единственную ошибку, которая иначе не видна вообще никак —
-		// разъезд номера на проводе и номера в nonce.
-		return fmt.Errorf("смещение разошлось: шифровали %d, отправили %d", rel, got)
-	}
-	return nil
+	})
 }
 
 // inbound: поддельный TCP → TUN.

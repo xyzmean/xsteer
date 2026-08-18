@@ -5,6 +5,8 @@ package link
 import (
 	"fmt"
 	"net"
+	"os/exec"
+	"strconv"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -162,4 +164,132 @@ func EgressMTU(local [4]byte) (mtu int, ifname string) {
 		}
 	}
 	return 0, ""
+}
+
+// OpenRawSend — сырой сокет ТОЛЬКО для отправки конкретному адресу.
+//
+// Фильтр ставится глухой: принимать этому сокету нечего, а без фильтра он получал бы копию каждого
+// локально доставляемого сегмента TCP и переполнял бы очередь — на хабе с тридцатью сессиями это
+// тридцать лишних копий каждого пакета.
+func OpenRawSend(daddr [4]byte) (Raw, error) {
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_TCP)
+	if err != nil {
+		return nil, fmt.Errorf("сырой сокет: %w", err)
+	}
+	r := &rawLinux{fd: fd}
+	_ = unix.SetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_MTU_DISCOVER, unix.IP_PMTUDISC_DONT)
+	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, 1<<20)
+	if err := unix.Connect(fd, &unix.SockaddrInet4{Addr: daddr}); err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("connect: %w", err)
+	}
+	if local, err := unix.Getsockname(fd); err == nil {
+		if in4, ok := local.(*unix.SockaddrInet4); ok {
+			r.local = in4.Addr
+		}
+	}
+	if err := filterNone(fd); err != nil {
+		unix.Close(fd)
+		return nil, err
+	}
+	return r, nil
+}
+
+// OpenRawListen — сырой сокет хаба: принимает сегменты, адресованные порту.
+//
+// mask и id — РАСКЛАДКА ПО ВОРКЕРАМ по младшим битам порта источника. Раскладку делает ядро
+// фильтром, а не мы очередью с замком, и это несущее решение: поддельное соединение принадлежит
+// ровно одному воркеру навсегда, поэтому окно приёма, ключи расшифровки и счётчик nonce — его
+// личная собственность.
+//
+// Раскладка ИМЕННО по порту источника, а не по адресу: за одним NAT может сидеть вся звезда, и по
+// адресу все соединения достались бы одному воркеру. Маска обязана быть степенью двойки минус один:
+// у cBPF нет деления.
+func OpenRawListen(port uint16, mask, id uint16) (Raw, error) {
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_TCP)
+	if err != nil {
+		if err == unix.EPERM {
+			return nil, fmt.Errorf("сырой сокет запрещён: нужен root или CAP_NET_RAW")
+		}
+		return nil, fmt.Errorf("сырой сокет: %w", err)
+	}
+	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, 1<<21)
+	if err := filterPortShard(fd, port, mask, id); err != nil {
+		unix.Close(fd)
+		return nil, err
+	}
+	return &rawLinux{fd: fd}, nil
+}
+
+// SendTo отправляет готовый сегмент по адресу, которому мы не подключены. Нужно ровно для одного
+// случая — RST тому, чьей сессии у нас нет: заводить под это соединение было бы дороже, чем сам
+// ответ.
+func (r *rawLinux) SendTo(seg []byte, daddr [4]byte) error {
+	return unix.Sendto(r.fd, seg, unix.MSG_NOSIGNAL, &unix.SockaddrInet4{Addr: daddr})
+}
+
+// filterNone — глухой фильтр: не принимать ничего.
+func filterNone(fd int) error {
+	prog := []unix.SockFilter{{Code: unix.BPF_RET | unix.BPF_K, K: 0}}
+	p := unix.SockFprog{Len: uint16(len(prog)), Filter: &prog[0]}
+	return unix.SetsockoptSockFprog(fd, unix.SOL_SOCKET, unix.SO_ATTACH_FILTER, &p)
+}
+
+// filterPortShard — только сегменты, адресованные port, у которых (sport & mask) == id.
+//
+// Порядок проверок не случаен: сначала порт назначения (он отбивает основную массу чужого), потом
+// раскладка. Ядро исполняет фильтр на КАЖДЫЙ локально доставляемый сегмент TCP, и лишняя
+// инструкция здесь — это работа на всём трафике машины.
+func filterPortShard(fd int, port, mask, id uint16) error {
+	var prog []unix.SockFilter
+	if mask == 0 {
+		prog = []unix.SockFilter{
+			{Code: unix.BPF_LDX | unix.BPF_B | unix.BPF_MSH, K: 0}, // X = ihl
+			{Code: unix.BPF_LD | unix.BPF_H | unix.BPF_IND, K: 2},  // tcp dport
+			{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, K: uint32(port), Jf: 1},
+			{Code: unix.BPF_RET | unix.BPF_K, K: 0xFFFFFFFF},
+			{Code: unix.BPF_RET | unix.BPF_K, K: 0},
+		}
+	} else {
+		prog = []unix.SockFilter{
+			{Code: unix.BPF_LDX | unix.BPF_B | unix.BPF_MSH, K: 0}, // X = ihl
+			{Code: unix.BPF_LD | unix.BPF_H | unix.BPF_IND, K: 2},  // tcp dport
+			{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, K: uint32(port), Jf: 4},
+			{Code: unix.BPF_LD | unix.BPF_H | unix.BPF_IND, K: 0}, // tcp sport
+			{Code: unix.BPF_ALU | unix.BPF_AND | unix.BPF_K, K: uint32(mask)},
+			{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, K: uint32(id), Jf: 1},
+			{Code: unix.BPF_RET | unix.BPF_K, K: 0xFFFFFFFF},
+			{Code: unix.BPF_RET | unix.BPF_K, K: 0},
+		}
+	}
+	p := unix.SockFprog{Len: uint16(len(prog)), Filter: &prog[0]}
+	if err := unix.SetsockoptSockFprog(fd, unix.SOL_SOCKET, unix.SO_ATTACH_FILTER, &p); err != nil {
+		return fmt.Errorf("фильтр-раскладка не встал: %w", err)
+	}
+	return nil
+}
+
+// GuardUpServer — правило против RST собственного ядра для СЛУШАЮЩЕЙ стороны: гасим RST, уходящий
+// с нашего порта кому угодно (клиентов много и заранее они неизвестны).
+//
+// Имя цепочки включает порт: два хаба на разных портах не должны снимать правила друг друга. В
+// движке на C это уже стоило упавшего туннеля — второй экземпляр при выходе снимал цепочку
+// первого, и тот оставался работать без защиты.
+func GuardUpServer(port int) (*Guard, error) {
+	if _, err := exec.LookPath("nft"); err != nil {
+		return nil, fmt.Errorf("нет nft: правило против RST собственного ядра не встанет")
+	}
+	g := &Guard{chain: fmt.Sprintf("x_srv%d", port)}
+	if err := nft("add", "table", "inet", "steer_obfs"); err != nil {
+		return nil, err
+	}
+	_ = nft("delete", "chain", "inet", "steer_obfs", g.chain)
+	if err := nft("add", "chain", "inet", "steer_obfs", g.chain,
+		"{ type filter hook output priority raw; policy accept; }"); err != nil {
+		return nil, err
+	}
+	return g, nft("add", "rule", "inet", "steer_obfs", g.chain,
+		"tcp", "sport", strconv.Itoa(port),
+		"tcp", "flags", "&", "rst", "==", "rst",
+		"tcp", "window", "0", "counter", "drop")
 }

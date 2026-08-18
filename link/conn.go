@@ -164,7 +164,11 @@ func (c *Conn) Send(flags byte, payload []byte) error {
 	return c.send(flags, payload, OptNone)
 }
 
-// RelNext — смещение, с которым уйдёт СЛЕДУЮЩИЙ пакет данных: им шифруется его же нагрузка.
+// RelNext — смещение, с которым уйдёт следующий пакет данных.
+//
+// Шифровать по нему НЕЛЬЗЯ: между чтением и отправкой номер может уйти вперёд в другой горутине.
+// Для шифрования есть SendData с обратным вызовом, где смещение выдаётся под замком. Здесь оно
+// нужно только для пределов соединения (ретайр), где ошибка на пакет-другой безразлична.
 func (c *Conn) RelNext() uint32 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -182,16 +186,34 @@ func (c *Conn) RelOf(seq uint32) uint32 {
 // буфере.
 //
 // row — строка длиной не меньше wire.HdrRoom + plen, где нагрузка (готовая запись: заголовок
-// записи, шифротекст и тег) уже лежит по смещению wire.HdrRoom - wire.RecHdr. Копий нет: сегмент
+// записи, шифротекст и тег) окажется по смещению wire.HdrRoom - wire.RecHdr. Копий нет: сегмент
 // уходит с того места, где его собрали.
 //
-// Возвращает смещение, с которым пакет ушёл: вызывающий обязан был зашифровать нагрузку ИМЕННО им,
-// поэтому получает его же обратно для проверки в отладке, а не для повторного использования.
-func (c *Conn) SendData(row []byte, plen int) (uint32, error) {
+// seal ВЫЗЫВАЕТСЯ ПОД ТЕМ ЖЕ ЗАМКОМ, что выдаёт смещение, и это несущая конструкция, а не
+// удобство вызова.
+//
+// Первая версия отдавала смещение наружу (RelNext), вызывающий шифровал им и только потом звал
+// отправку. Между этими двумя шагами в другой горутине помещалась целая отправка — и тогда два
+// пакета шифровались ОДНИМ смещением, то есть одним nonce под одним ключом. Повтор nonce означает
+// не потерянный пакет, а полную потерю стойкости AEAD на этой сессии, причём молча. Поймать это
+// тестом почти невозможно: окно гонки — сотни наносекунд, а последствие не видно вообще никак.
+//
+// Поэтому выдача смещения, шифрование им и запись заголовка стали одной неделимой операцией.
+// Ровно тот же инвариант записан в движке на C у send_to хаба — там он выражен тем, что вся
+// отправка идёт под замком сессии.
+func (c *Conn) SendData(row []byte, plen int, seal func(rel uint32) error) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.state != StateEst {
-		return 0, errors.New("link: соединение не установлено")
+		return errors.New("link: соединение не установлено")
+	}
+	rel := c.seq - c.isnTX
+	if seal != nil {
+		if err := seal(rel); err != nil {
+			// Смещение НЕ тратим: наружу ничего не ушло, а пропуск в нумерации безвреден только
+			// когда пакет действительно был отправлен.
+			return err
+		}
 	}
 	off := wire.HdrRoom - wire.RecHdr - 20
 	seg := row[off : wire.HdrRoom-wire.RecHdr+plen]
@@ -206,12 +228,11 @@ func (c *Conn) SendData(row []byte, plen int) (uint32, error) {
 	seg[13] = PSH | ACK
 	putU16(seg[14:16], Win)
 	putU16(seg[16:18], Csum(c.SAddr, c.DAddr, seg))
-	rel := c.seq - c.isnTX
 	c.seq += uint32(plen)
 	now := nowMS()
 	c.lastTX, c.lastAck = now, now
 	c.unacked = 0
-	return rel, c.raw.Send(seg)
+	return c.raw.Send(seg)
 }
 
 // OnSeg учитывает принятый сегмент: подтверждения, состояние, счётчики.
@@ -237,6 +258,13 @@ func (c *Conn) OnSeg(s *Seg) (data bool, err error) {
 		// будет повторять SYN-ACK.
 		_ = c.send(ACK, nil, OptNone)
 		return false, nil
+	}
+	// Подтверждение нашего SYN-ACK: с этой секунды соединение установлено. Без этой строки
+	// слушающая сторона остаётся в StateSynRcvd навсегда и молча отбрасывает ВСЕ данные — при
+	// полностью верном рукопожатии. Строка была потеряна при переносе с C, и снаружи это выглядело
+	// как «хаб не ответил на рукопожатие»: SYN-ACK уходит, а на Hello тишина.
+	if c.state == StateSynRcvd && s.Flags&ACK != 0 {
+		c.state = StateEst
 	}
 	if len(s.Payload) == 0 || c.state != StateEst {
 		return false, nil
@@ -311,4 +339,89 @@ func (c *Conn) WaitRead(d time.Duration) (bool, error) { return c.raw.WaitRead(d
 func putU16(b []byte, v uint16) { b[0], b[1] = byte(v>>8), byte(v) }
 func putU32(b []byte, v uint32) {
 	b[0], b[1], b[2], b[3] = byte(v>>24), byte(v>>16), byte(v>>8), byte(v)
+}
+
+// ---- сторона, которая слушает ----------------------------------------------
+
+// StateSynRcvd — увидели SYN, ответили SYN-ACK, ждём подтверждения. У клиента такого состояния
+// нет: он всегда начинает соединение сам.
+const StateSynRcvd = 3
+
+// Accept создаёт соединение по ПРИНЯТОМУ SYN и отвечает SYN-ACK.
+//
+// raw обязан быть подключён к адресу того, кто позвонил (link.OpenRawSend): тогда ядро само
+// демультиплексирует отправку, и адрес не приходится указывать на каждый пакет. Тот же приём, что
+// в движке на C.
+//
+// isn — наш начальный номер. Приходит снаружи, а не берётся здесь, ровно потому же, почему у
+// клиента: источник случайности выбирает вызывающий, а тест хочет предсказуемые номера.
+func Accept(raw Raw, seg *Seg, listenPort uint16, isn uint32) (*Conn, error) {
+	c := &Conn{
+		raw:   raw,
+		SAddr: seg.DAddr,
+		DAddr: seg.SAddr,
+		SPort: listenPort,
+		DPort: seg.SPort,
+		isnTX: isn,
+		isnRX: seg.Seq,
+	}
+	c.seq = isn
+	c.ack = seg.Seq + 1
+	now := nowMS()
+	c.born, c.lastRX, c.lastTX = now, now, now
+	c.state = StateSynRcvd
+	if err := c.SendSynAck(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// SendSynAck отвечает на SYN. Зовётся и на ПОВТОРНЫЙ SYN — тогда номер откатывается на единицу,
+// потому что первая попытка его уже потратила: это то же единственное безопасное место для откака
+// номера, что и повтор SYN у клиента (нагрузки в нём нет, nonce из него не выводится).
+func (c *Conn) SendSynAck() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.synTries > 0 {
+		c.seq--
+	}
+	c.synTries++
+	return c.send(SYN|ACK, nil, OptScale)
+}
+
+// OnSynAgain — повторный SYN по живой четвёрке: обновляем номера и отвечаем снова. Отдельным
+// методом, а не внутри OnSeg, потому что решение «это новая сессия или повтор» принимает
+// вызывающий: у него есть таблица сессий, а у соединения её нет.
+func (c *Conn) OnSynAgain(seg *Seg) error {
+	c.mu.Lock()
+	c.isnRX = seg.Seq
+	c.ack = seg.Seq + 1
+	c.state = StateSynRcvd
+	c.lastRX = nowMS()
+	if c.synTries > 0 {
+		c.seq--
+	}
+	c.synTries++
+	err := c.send(SYN|ACK, nil, OptScale)
+	c.mu.Unlock()
+	return err
+}
+
+// Idle — сколько прошло с последнего принятого сегмента. Нужно уборке сессий на хабе.
+func (c *Conn) Idle() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return nowMS() - c.lastRX
+}
+
+// NeedKeepalive — получали, но давно не отправляли.
+//
+// Хаб ОБЯЗАН присылать пустую запись в этом случае, а не «может»: пир считает путь мёртвым по
+// тишине при активной отправке, и без этого односторонний трафик (пир отправляет, отвечать нечем)
+// выглядел бы для него обрывом. Ровно это и показал живой стенд движка на C. Так же устроен
+// WireGuard: keepalive посылает ПРИНИМАЮЩАЯ сторона.
+func (c *Conn) NeedKeepalive(everyMS int64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastRX > c.lastTX && nowMS()-c.lastTX >= everyMS
 }

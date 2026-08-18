@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 
 	"github.com/xyzmean/xsteer/client"
 	"github.com/xyzmean/xsteer/conf"
+	"github.com/xyzmean/xsteer/hub"
 	"github.com/xyzmean/xsteer/wire"
 )
 
@@ -33,7 +35,8 @@ const Version = "0.1.0"
 func usage() {
 	fmt.Fprintf(os.Stderr, `xsteer %s — клиент своего VPN-протокола с обликом TLS
 
-    xsteer up <файл.conf> [ключи]   поднять туннель
+    xsteer up <файл.conf> [ключи]   поднять туннель (сторона, которая соединяется)
+    xsteer hub <файл.conf> [ключи]   поднять хаб (сторона, которая слушает)
     xsteer genkey                    приватный ключ в base64 (на диск не пишет)
     xsteer pubkey                    публичный ключ из приватного на входе
     xsteer show [файл состояния]     что происходит с туннелем
@@ -48,9 +51,20 @@ func usage() {
     --probe-ms <N>    как часто перепроверять путь (по умолчанию %d)
     --chacha          заставить ChaCha20-Poly1305 (по умолчанию решает наличие AES в процессоре)
 
-Пример:
+Ключи для hub:
+    --dev <имя>       имя устройства (по умолчанию %s)
+    --workers <N>     воркеров (по умолчанию по числу ядер, не больше %d)
+    --no-tun          не поднимать устройство: только трафик пир↔пир
+    --decoy <режим>   что отвечать НЕОПОЗНАННЫМ: alert (по умолчанию), silent, reset
+                      или proxy — отдавать соединение настоящему серверу
+    --decoy-dest <host:port>   куда отдавать в режиме proxy
+    --decoy-sni <список>       через запятую: какие имена из SNI разрешено пересылать
+                               (точка в начале разрешает поддомены: .example.com)
+
+Примеры:
     sudo xsteer up /etc/xsteer/hub.conf --routes
-`, Version, wire.ConnsMax, wire.ProbeEveryMS)
+    sudo xsteer hub /etc/xsteer/hub.conf --decoy proxy --decoy-dest www.microsoft.com:443
+`, Version, wire.ConnsMax, wire.ProbeEveryMS, hub.Device, hub.WorkersMax)
 }
 
 func main() {
@@ -62,6 +76,8 @@ func main() {
 	switch os.Args[1] {
 	case "up":
 		err = cmdUp(os.Args[2:])
+	case "hub":
+		err = cmdHub(os.Args[2:])
 	case "genkey":
 		err = cmdGenkey()
 	case "pubkey":
@@ -192,6 +208,86 @@ func cmdUp(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := client.Run(ctx, opt); err != nil && ctx.Err() == nil {
+		return err
+	}
+	return nil
+}
+
+func cmdHub(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("нужен путь к файлу конфигурации хаба (подсказка: xsteer --help)")
+	}
+	path := args[0]
+	opt := hub.Options{}
+	for i := 1; i < len(args); i++ {
+		key := args[i]
+		value := func() (string, bool) {
+			if i+1 >= len(args) {
+				return "", false
+			}
+			i++
+			return args[i], true
+		}
+		switch key {
+		case "--dev":
+			v, ok := value()
+			if !ok {
+				return fmt.Errorf("у ключа --dev нет значения")
+			}
+			opt.Device = v
+		case "--workers":
+			v, ok := value()
+			if !ok {
+				return fmt.Errorf("у ключа --workers нет значения")
+			}
+			if _, err := fmt.Sscanf(v, "%d", &opt.Workers); err != nil || opt.Workers < 1 {
+				return fmt.Errorf("--workers: нужно число не меньше 1, а не %q", v)
+			}
+		case "--no-tun":
+			opt.NoTUN = true
+		case "--decoy":
+			v, ok := value()
+			if !ok {
+				return fmt.Errorf("у ключа --decoy нет значения")
+			}
+			opt.Decoy.Mode = v
+		case "--decoy-dest":
+			v, ok := value()
+			if !ok {
+				return fmt.Errorf("у ключа --decoy-dest нет значения")
+			}
+			opt.Decoy.Dest = v
+		case "--decoy-sni":
+			v, ok := value()
+			if !ok {
+				return fmt.Errorf("у ключа --decoy-sni нет значения")
+			}
+			opt.Decoy.FollowSNI = true
+			for _, name := range strings.Split(v, ",") {
+				if name = strings.TrimSpace(name); name != "" {
+					opt.Decoy.Allow = append(opt.Decoy.Allow, name)
+				}
+			}
+		default:
+			return fmt.Errorf("неизвестный ключ %s (подсказка: xsteer --help)", key)
+		}
+	}
+	// Настройка защиты проверяется ДО подъёма: неверная, обнаруженная в бою, — это защита, которой
+	// нет, а узнать об этом пришлось бы от того, кто её обошёл.
+	if err := opt.Decoy.Validate(); err != nil {
+		return err
+	}
+	c, s, err := conf.Load(path, conf.RoleHub)
+	if err != nil {
+		return err
+	}
+	defer s.Wipe()
+	opt.Conf, opt.Sec = c, s
+
+	fmt.Fprintf(os.Stderr, "xsteer %s: хаб, %s\n", Version, cipherName())
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := hub.Run(ctx, opt); err != nil && ctx.Err() == nil {
 		return err
 	}
 	return nil

@@ -1,0 +1,351 @@
+// Пакет hub — сторона, которая слушает: центр звезды xsteer.
+//
+// ЧТО ОН ДЕЛАЕТ. Слушает один порт поддельного TCP, держит по сессии на каждое соединение пира и
+// разводит трафик между ними по AllowedIPs. Пир видит пир ЧЕРЕЗ хаб: пакет расшифровывается,
+// проверяется на право отправлять с этого адреса, и, если адресат — другой пир, зашифровывается
+// для него В ТОЙ ЖЕ СТРОКЕ БУФЕРА и уходит. Ни пересылки в ядре, ни NAT, ни поиска маршрута, ни
+// единой копии.
+//
+// ПОЧЕМУ TUN ВСЁ РАВНО ЕСТЬ. Он нужен не для трафика между пирами, а для выхода в интернет:
+// AllowedIPs со 0.0.0.0/0 означает, что пакет должен покинуть хаб наружу, а это уже ядро,
+// masquerade оператора и его же правила — ровно модель WireGuard. Цена называется вслух: без
+// net.ipv4.ip_forward=1 выход в интернет не работает, и правило masquerade оператор ставит сам.
+//
+// ЧТО ЭТО ЗНАЧИТ ДЛЯ FIREWALL. Трафик пир↔пир через firewall хаба НЕ ПРОХОДИТ: он разворачивается
+// в пользовательском пространстве. Это плата за отсутствие копий, и её надо знать заранее, а не
+// обнаружить, пытаясь отфильтровать такой трафик правилами.
+//
+// МНОГОПОТОЧНОСТЬ: ПО СОЕДИНЕНИЯМ, А НЕ ПО ПАКЕТАМ. Раскладку делает ЯДРО фильтром cBPF на сокете
+// каждого воркера — пропускаются только сегменты, у которых младшие биты порта источника равны его
+// номеру. Отсюда главное: поддельное соединение принадлежит РОВНО ОДНОМУ воркеру навсегда, и окно
+// приёма, ключи расшифровки и таблица сессий — его личная собственность без замков.
+//
+// Замок нужен ровно в одном месте — на ОТПРАВКУ в сессию. Причина: пакет пир→пир приходит одному
+// воркеру, а уходит в сессию, которой владеет другой; так же и пакет из TUN, потому что очередь
+// ядро выбирает по хешу потока, а не по нашей раскладке. Отправка выдаёт следующее смещение — оно
+// же nonce AEAD, — поэтому выдача смещения, шифрование им и запись заголовка идут одной неделимой
+// операцией (см. link.Conn.SendData).
+//
+// Порт src/ext/xshub.c. Числа и решения оттуда же; отличия — только там, где Go даёт другой
+// инструмент, и каждое названо на месте.
+package hub
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/xyzmean/xsteer/conf"
+	"github.com/xyzmean/xsteer/link"
+	"github.com/xyzmean/xsteer/noise"
+	"github.com/xyzmean/xsteer/route"
+	"github.com/xyzmean/xsteer/tun"
+	"github.com/xyzmean/xsteer/wire"
+)
+
+const (
+	// WorkersMax — предел числа воркеров, и это не «на всякий случай», а результат замера в
+	// движке на C. Цена воркера лежит в ядре: приём идёт сырым сокетом, и ядро на каждый локально
+	// доставляемый TCP-пакет КЛОНИРУЕТ буфер для КАЖДОГО такого сокета, а фильтр отбрасывает
+	// лишние уже потом. При восьми воркерах каждый наш же туннельный пакет клонируется восемь раз.
+	// Замер (два пира, сумма): 1 воркер — 0,67 Гбит/с, 2 — 1,20, 4 — 1,11, 8 — 0,97.
+	//
+	// Чтобы расти дальше, нужен приём не сырым сокетом, а AF_PACKET с PACKET_FANOUT: там ядро
+	// отдаёт пакет ровно одному сокету группы. Это отдельная работа.
+	WorkersMax = 4
+	// SessPerWorker — сколько сессий держит один воркер. Вчетверо больше, чем пиров на воркера:
+	// запас на переподключение без разрыва и на неравномерность раскладки по портам.
+	SessPerWorker = conf.PeersMax * wire.ConnsMax / WorkersMax * 2
+	// IdleMS — после какой тишины сессия убирается.
+	IdleMS = 180000
+	// KeepaliveMS — хаб присылает пустую запись, если получал данные, но сам давно не отправлял.
+	// Обязательно, а не «полезно»: см. link.Conn.NeedKeepalive.
+	KeepaliveMS = 10000
+	// Device — имя устройства. Постоянное: его же ищет диагностика и правила оператора.
+	Device = "xshub0"
+)
+
+// фазы сессии
+const (
+	phFree = iota
+	phSyn  // увидели SYN, ответили SYN-ACK
+	phHS   // разобрали Hello, ответили; ждём подтверждения
+	phEst  // несёт данные
+	// phProxy — соединение отдано настоящему серверу: это не наш пир, и байты переливаются как
+	// есть. Отдельная фаза, а не «освободить и забыть», потому что сессия ещё жива и ею владеет
+	// тот же воркер.
+	phProxy
+)
+
+// Options — что нужно хабу, чтобы подняться.
+type Options struct {
+	Conf *conf.Conf
+	Sec  *conf.Secrets
+	// Workers — сколько воркеров. Ноль означает «по числу ядер, но не больше числа возможных
+	// сессий и не больше WorkersMax», округляя ВНИЗ до степени двойки: раскладка делается маской
+	// по младшим битам порта, а у cBPF нет деления.
+	Workers int
+	// Device — имя устройства; пусто означает Device.
+	Device string
+	// NoTUN — не поднимать устройство вовсе. Нужно там, где хаб обслуживает только трафик пир↔пир
+	// (например, в тесте): на LXC и OpenVZ устройства TUN часто нет, и отказ из-за него означал бы
+	// «звезда не работает» там, где она работала бы полностью.
+	NoTUN bool
+	// Logf — куда писать журнал; nil означает stderr.
+	Logf func(format string, args ...any)
+	// Decoy — что делать с тем, кто не опознан. Пусто означает «ответить фатальным оповещением
+	// TLS», см. onStranger.
+	Decoy DecoyMode
+}
+
+// Hub — поднятый хаб.
+type Hub struct {
+	opt    Options
+	router *route.Router
+	dev    []tun.Device
+	guard  *link.Guard
+
+	// peerSess — сессии пира: по одной на каждое его соединение. Номер соединения пир называет в
+	// ПОДПИСАННОЙ части рукопожатия, поэтому место в наборе определяет он, а не порядок прихода —
+	// переподключение одного соединения не задевает остальные.
+	//
+	// atomic.Pointer, а не массив под замком: читается это на КАЖДЫЙ пакет, идущий пиру, а
+	// меняется раз на рукопожатие. Замок на таком отношении частот — чистая потеря.
+	peerSess [conf.PeersMax][wire.ConnsMax]atomic.Pointer[session]
+
+	ctl sync.Mutex
+	// lastStamp — последняя метка времени от каждого пира: защита от воспроизведения записанного
+	// msg1. Общая для всех воркеров: один и тот же пир приходит с разных портов, то есть к разным
+	// воркерам, и защита обязана быть общей. В памяти, а не на диске: перезапуск хаба и так
+	// требует нового рукопожатия.
+	lastStamp [conf.PeersMax]uint64
+	devMTU    int
+
+	stats struct {
+		rxPkts, txPkts, rxBytes, txBytes, dropped, strangers atomic.Uint64
+	}
+
+	wg sync.WaitGroup
+}
+
+type session struct {
+	// mu — замок на ОТПРАВКУ и на смену состояния. Отправлять в сессию может любой воркер, а
+	// владеет ею один; всё остальное (окно приёма, расшифровка) трогает только владелец.
+	mu   sync.Mutex
+	conn *link.Conn
+	hs   *noise.HS
+	tx   *noise.Keys
+	rx   *noise.Keys
+	win  wire.Window
+
+	phase       int
+	peer        int // индекс пира или -1, пока не опознан
+	connID      int
+	mtu         int // MTU, о котором договорились с ЭТИМ пиром; 0 — ещё нет
+	handshakeAt time.Time
+
+	upPkts, downPkts uint64
+
+	// up — соединение к сайту-прикрытию в фазе phProxy. Nil во всех остальных.
+	up netConn
+}
+
+// netConn — то немногое, что нужно от соединения с сайтом-прикрытием. Интерфейсом, а не net.Conn,
+// чтобы пакет hub не тащил зависимость от сети в тесты, которым она не нужна.
+type netConn interface {
+	Read(p []byte) (int, error)
+	Write(p []byte) (int, error)
+	Close() error
+}
+
+type skey struct {
+	addr [4]byte
+	port uint16
+}
+
+type worker struct {
+	id, n int
+	mask  uint16
+	h     *Hub
+	rx    link.Raw // свой сокет приёма с фильтром-раскладкой
+	tx0   link.Raw // сокет для RST тем, чьей сессии нет
+	dev   tun.Device
+
+	// sess — таблица СВОИХ сессий. Читает и меняет её только этот воркер (фильтр гарантирует, что
+	// чужие сегменты сюда не придут), поэтому замка у неё нет.
+	sess map[skey]*session
+
+	row  []byte // строка для пересылки: заголовки пишутся перед нагрузкой
+	hbuf []byte // отдельный буфер под ответ рукопожатия: он до ~1300 байт и в строку пакета не влезет
+
+	// Ограничители на строки, которые вызывает ЧУЖОЙ пакет: до них добирается кто угодно из
+	// интернета, и без ограничителя одна такая строка — способ залить журнал сервера. Свои у
+	// каждого воркера: общие потребовали бы замка на пути, который и так под потоком.
+	rlUnknown, rlStamp, rlProbe wire.RateLog
+}
+
+func (h *Hub) logf(f string, a ...any) {
+	if h.opt.Logf != nil {
+		h.opt.Logf(f, a...)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "hub: "+f+"\n", a...)
+}
+
+// Run поднимает хаб и работает до отмены контекста.
+func Run(ctx context.Context, opt Options) error {
+	if opt.Conf == nil || opt.Sec == nil || !opt.Sec.HasPriv {
+		return errors.New("нет конфигурации или приватного ключа")
+	}
+	if opt.Conf.ListenPort == 0 {
+		return errors.New("хабу нужен ListenPort")
+	}
+	h := &Hub{opt: opt, router: route.NewRouter(opt.Conf.Peers)}
+
+	n := workerCount(opt)
+	dev := opt.Device
+	if dev == "" {
+		dev = Device
+	}
+
+	if !opt.NoTUN {
+		devs, err := tun.OpenQueues(dev, n)
+		if err != nil {
+			return fmt.Errorf("%w — хаб не сможет отдавать трафик наружу (на LXC и OpenVZ "+
+				"устройства TUN часто нет вовсе; тогда --no-tun и только трафик пир↔пир)", err)
+		}
+		h.dev = devs
+		name := devs[0].Name()
+		mtu := opt.Conf.MTU
+		if mtu == 0 {
+			mtu = wire.MTUDefault
+		}
+		cidr := fmt.Sprintf("%s/%d", ip4str(opt.Conf.Addr), opt.Conf.AddrPlen)
+		if err := tun.SetAddr(name, cidr); err != nil {
+			return fmt.Errorf("не удалось задать адрес %s: %w", cidr, err)
+		}
+		if err := devs[0].SetMTU(mtu); err != nil {
+			return fmt.Errorf("не удалось задать MTU: %w", err)
+		}
+		h.devMTU = mtu
+		// Маршруты к сетям пиров: без них ядро не знает, что ответы им идут через это устройство, и
+		// выход в интернет работал бы только в одну сторону.
+		for i := range opt.Conf.Peers {
+			for _, a := range opt.Conf.Peers[i].Allowed {
+				if a.Plen == 0 {
+					continue // 0.0.0.0/0 — не наш маршрут
+				}
+				if err := tun.AddRoute(name, fmt.Sprintf("%s/%d", ip4str(a.Net), a.Plen)); err != nil {
+					h.logf("маршрут к сети пира %d не встал: %v", i+1, err)
+				}
+			}
+		}
+	}
+
+	// Правило против RST собственного ядра. Хабу оно нужнее, чем пиру: на его порту нет
+	// слушающего сокета, поэтому ядро отвечает RST на КАЖДОЕ рукопожатие пира.
+	if g, err := link.GuardUpServer(opt.Conf.ListenPort); err != nil {
+		h.logf("правило против RST не встало (%v): если порт %d не закрыт политикой firewall, "+
+			"ядро будет рвать сессии", err, opt.Conf.ListenPort)
+	} else {
+		h.guard = g
+	}
+	defer h.guard.Down()
+
+	workers := make([]*worker, 0, n)
+	for i := 0; i < n; i++ {
+		mask := uint16(n - 1)
+		rx, err := link.OpenRawListen(uint16(opt.Conf.ListenPort), mask, uint16(i))
+		if err != nil {
+			return err
+		}
+		w := &worker{
+			id: i, n: n, mask: mask, h: h, rx: rx,
+			sess: make(map[skey]*session),
+			row:  make([]byte, wire.Row+wire.Tag),
+			hbuf: make([]byte, 2048),
+		}
+		if len(h.dev) > 0 {
+			w.dev = h.dev[i%len(h.dev)]
+		}
+		// Сокет для RST тем, чьей сессии нет. Ошибка не смертельна: без него пир узнает о
+		// перезапуске хаба по тишине, то есть через сорок пять секунд простоя.
+		if tx0, err := link.OpenRawSend([4]byte{0, 0, 0, 0}); err == nil {
+			w.tx0 = tx0
+		}
+		workers = append(workers, w)
+	}
+
+	h.logf("слушаю поддельный TCP :%d, пиров %d, воркеров %d, шифр решает клиент",
+		opt.Conf.ListenPort, len(opt.Conf.Peers), n)
+	if opt.Decoy.Mode != "" {
+		h.logf("неопознанным: %s", opt.Decoy.describe())
+	}
+
+	for _, w := range workers {
+		h.wg.Add(1)
+		go func(w *worker) { defer h.wg.Done(); w.rxLoop(ctx) }(w)
+		if w.dev != nil {
+			h.wg.Add(1)
+			go func(w *worker) { defer h.wg.Done(); w.tunLoop(ctx) }(w)
+		}
+	}
+
+	// Отмена обязана разбудить блокирующее чтение устройства: горутина, стоящая в Read, про
+	// контекст ничего не знает. Тот же урок, что в клиенте, и та же цена ошибки — процесс, который
+	// не выходит по сигналу.
+	go func() {
+		<-ctx.Done()
+		for _, d := range h.dev {
+			d.Close()
+		}
+		for _, w := range workers {
+			w.rx.Close()
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() { h.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			h.logf("не все воркеры закрылись за 3 с — выхожу")
+		}
+	}
+	return ctx.Err()
+}
+
+// workerCount — сколько воркеров. Степень двойки обязательна: раскладка делается маской по
+// младшим битам порта источника. Верхний предел — не только ядра, но и число ВОЗМОЖНЫХ сессий:
+// лишний воркер платится клонированием буферов на всём трафике машины, а приносит пользу только
+// если ему достанется своя сессия.
+func numCPU() int { return runtime.NumCPU() }
+
+func workerCount(opt Options) int {
+	want := opt.Workers
+	if want <= 0 {
+		want = numCPU()
+		if lim := len(opt.Conf.Peers) * wire.ConnsMax; want > lim {
+			want = lim
+		}
+	}
+	if want > WorkersMax {
+		want = WorkersMax
+	}
+	if want < 1 {
+		want = 1
+	}
+	n := 1
+	for n*2 <= want {
+		n *= 2
+	}
+	return n
+}
