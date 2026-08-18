@@ -62,6 +62,7 @@ func usage() {
     --no-tun          не поднимать устройство: только трафик пир↔пир
     --no-batch        не собирать кадры в одну запись: для клиента на C
     --stream-port <N> слушать НАСТОЯЩИЙ TCP на этом порту (режим потока), помимо поддельного
+    --stream-only     не поднимать поддельный TCP вовсе: порт занимает только поток
     --decoy <режим>   что отвечать НЕОПОЗНАННЫМ: alert (по умолчанию), silent, reset
                       или proxy — отдавать соединение настоящему серверу
     --decoy-dest <host:port>   куда отдавать в режиме proxy
@@ -265,6 +266,8 @@ func cmdHub(args []string) error {
 			}
 		case "--no-tun":
 			opt.NoTUN = true
+		case "--stream-only":
+			opt.StreamOnly = true
 		case "--no-batch":
 			opt.NoBatch = true
 		case "--stream-port":

@@ -209,9 +209,11 @@ func Run(ctx context.Context, opt Options) error {
 	}
 	c.mtuNow.Store(int64(mtu))
 
-	// Правило против RST собственного ядра. Не встало — говорим и работаем: на многих системах
-	// локальный RST не мешает, а вот молча притворяться, что защита есть, нельзя.
-	if g, err := link.GuardUp(name, p.Endpoint, p.EndpointPort); err != nil {
+	// Правило против RST собственного ядра нужно только поддельному TCP: в режиме потока сессию
+	// ведёт сам стек, и гасить его же RST не надо — он их и не порождает.
+	if opt.Stream {
+		// ничего не ставим
+	} else if g, err := link.GuardUp(name, p.Endpoint, p.EndpointPort); err != nil {
 		c.logf("правило против RST не встало (%v) — сессию может оборвать собственное ядро", err)
 	} else {
 		c.guard = g

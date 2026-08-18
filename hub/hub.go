@@ -114,6 +114,13 @@ type Options struct {
 	// разговора с клиентом на C, который этого пока не умеет; цена — облик на проводе (см. те же
 	// поля в client.Options).
 	NoBatch bool
+	// StreamOnly — не поднимать половину поддельного TCP вовсе: ни сырых сокетов, ни правила против
+	// RST, ни воркеров.
+	//
+	// Нужно там, где пиры ходят только потоком (например, десктопы на Windows): тогда порт занят
+	// ровно одним слушателем, и можно поставить поток на тот же номер, который иначе занял бы
+	// поддельный TCP. Без этого пришлось бы держать два порта, и один из них — впустую.
+	StreamOnly bool
 	// StreamPort — порт для режима потока (настоящий TCP). Ноль означает «не слушать».
 	//
 	// Отдельный порт, а не тот же: слушающий сокет ядра отвечал бы SYN-ACK и пирам поддельного
@@ -250,6 +257,12 @@ func Run(ctx context.Context, opt Options) error {
 	h := &Hub{opt: opt, router: route.NewRouter(opt.Conf.Peers)}
 
 	n := workerCount(opt)
+	if opt.StreamOnly {
+		if opt.StreamPort == 0 {
+			return errors.New("--stream-only без --stream-port: слушать было бы нечем")
+		}
+		n = 1 // очередь устройства всё равно нужна одна
+	}
 	dev := opt.Device
 	if dev == "" {
 		dev = Device
@@ -300,7 +313,7 @@ func Run(ctx context.Context, opt Options) error {
 	defer h.guard.Down()
 
 	workers := make([]*worker, 0, n)
-	for i := 0; i < n; i++ {
+	for i := 0; opt.StreamOnly == false && i < n; i++ {
 		mask := uint16(n - 1)
 		rx, err := link.OpenRawListen(uint16(opt.Conf.ListenPort), mask, uint16(i))
 		if err != nil {
@@ -324,12 +337,19 @@ func Run(ctx context.Context, opt Options) error {
 		workers = append(workers, w)
 	}
 
-	h.logf("слушаю поддельный TCP :%d, пиров %d, воркеров %d, шифр решает клиент",
-		opt.Conf.ListenPort, len(opt.Conf.Peers), n)
+	if !opt.StreamOnly {
+		h.logf("слушаю поддельный TCP :%d, пиров %d, воркеров %d, шифр решает клиент",
+			opt.Conf.ListenPort, len(opt.Conf.Peers), n)
+	} else {
+		h.logf("поддельный TCP не поднимаю (--stream-only), пиров %d", len(opt.Conf.Peers))
+	}
 	if opt.Decoy.Mode != "" {
 		h.logf("неопознанным: %s", opt.Decoy.describe())
 	}
 
+	if opt.StreamOnly && len(h.dev) == 0 && !opt.NoTUN {
+		return errors.New("устройство не поднялось, а потокам оно нужно для выхода наружу")
+	}
 	if opt.StreamPort > 0 {
 		h.wg.Add(1)
 		go func() {

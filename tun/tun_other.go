@@ -1,4 +1,5 @@
-//go:build !linux
+// Прочие системы: устройства нет. Windows сюда НЕ входит — там Wintun (tun_windows.go).
+//go:build !linux && !windows
 
 package tun
 
