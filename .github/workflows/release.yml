@@ -52,8 +52,17 @@ jobs:
             GOOS=windows GOARCH=$arch go build -trimpath \
               -ldflags "-s -w -X main.Version=$VER" -o xsteer.exe ./cmd/xsteer
             cp "$wt" wintun.dll
-            zip -j "dist/xsteer-windows-$arch.zip" xsteer.exe wintun.dll wintun/LICENSE.txt
-            rm -f xsteer.exe wintun.dll
+            gui=""
+            # Графический интерфейс: только amd64. Манифест и значок вшиты ресурсом
+            # rsrc_windows_amd64.syso, который по имени берётся лишь для amd64; для arm64
+            # своего .syso нет, а без манифеста walk не поднимет окно — поэтому там только CLI.
+            if [ "$arch" = amd64 ]; then
+              GOOS=windows GOARCH=amd64 go build -trimpath \
+                -ldflags "-H=windowsgui -s -w -X main.Version=$VER" -o xsteer-gui.exe ./cmd/xsteer-gui
+              gui=xsteer-gui.exe
+            fi
+            zip -j "dist/xsteer-windows-$arch.zip" $gui xsteer.exe wintun.dll wintun/LICENSE.txt
+            rm -f xsteer.exe xsteer-gui.exe wintun.dll
           done
 
           # Linux: клиент и хаб одним файлом, как на роутере.
