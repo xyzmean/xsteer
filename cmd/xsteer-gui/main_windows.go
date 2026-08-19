@@ -118,14 +118,14 @@ func main() {
 
 	// Ширина колонки значений задана явно, и у TextLabel она же включает перенос строк: ключи и
 	// длинный список AllowedIPs обязаны переноситься, а не растягивать окно.
-	const valW = 330
+	const valW = 260
 
 	if err := (dcl.MainWindow{
 		AssignTo: &a.mw,
 		Title:    "xsteer",
 		Icon:     icon,
-		MinSize:  dcl.Size{Width: 820, Height: 600},
-		Size:     dcl.Size{Width: 900, Height: 640},
+		MinSize:  dcl.Size{Width: 600, Height: 470},
+		Size:     dcl.Size{Width: 665, Height: 520},
 		Layout:   dcl.VBox{MarginsZero: true},
 		// Строки меню нет, как и в эталоне: импорт и создание — в split-кнопке под списком,
 		// удаление и папка — кнопками там же, «Выход» — в меню трея.
@@ -140,7 +140,7 @@ func main() {
 							// ---- слева: список туннелей и действия под ним ---------------
 							dcl.Composite{
 								Layout:  dcl.VBox{MarginsZero: true, Spacing: 4},
-								MinSize: dcl.Size{Width: 230},
+								MinSize: dcl.Size{Width: 215},
 								Children: []dcl.Widget{
 									dcl.ListBox{
 										AssignTo:              &a.list,
@@ -178,77 +178,86 @@ func main() {
 								// «Редактировать» — рамки прижаты к верху, кнопка к низу.
 								Layout: dcl.VBox{MarginsZero: true, Spacing: 8},
 								Children: []dcl.Widget{
-									dcl.GroupBox{
-										AssignTo: &a.gbIface,
-										Title:    "Интерфейс",
-										// Две колонки без распорок: ширину рамке даёт растяжение по
-										// HBox (StretchFactor выше), а не третья колонка.
-										Layout: dcl.Grid{Columns: 2, Spacing: 6},
+									// ScrollView жаден по высоте: он забирает всё место над кнопкой
+									// «Редактировать», поэтому рамки прижаты к верху, а не висят по
+									// центру (VSpacer слак не забирал). Заодно длинное содержимое
+									// прокручивается — тот же приём, что у менеджера WireGuard.
+									dcl.ScrollView{
+										HorizontalFixed: true,
+										Layout:          dcl.VBox{MarginsZero: true, Spacing: 8},
 										Children: []dcl.Widget{
-											dcl.Label{Text: "Статус:", TextAlignment: dcl.AlignFar,
-												MinSize: dcl.Size{Width: 150}},
-											dcl.Composite{
-												Layout: dcl.HBox{MarginsZero: true, Spacing: 4},
+											dcl.GroupBox{
+												AssignTo: &a.gbIface,
+												Title:    "Интерфейс",
+												// Две колонки без распорок: ширину рамке даёт растяжение по
+												// HBox (StretchFactor выше), а не третья колонка.
+												Layout: dcl.Grid{Columns: 2, Spacing: 6},
 												Children: []dcl.Widget{
-													dcl.Label{AssignTo: &a.dot, Text: "●", TextColor: colorDown},
-													dcl.Label{AssignTo: &a.stState, Text: "—"},
-													dcl.HSpacer{},
+													dcl.Label{Text: "Статус:", TextAlignment: dcl.AlignFar,
+														MinSize: dcl.Size{Width: 140}},
+													dcl.Composite{
+														Layout: dcl.HBox{MarginsZero: true, Spacing: 4},
+														Children: []dcl.Widget{
+															dcl.Label{AssignTo: &a.dot, Text: "●", TextColor: colorDown},
+															dcl.Label{AssignTo: &a.stState, Text: "—"},
+															dcl.HSpacer{},
+														},
+													},
+
+													dcl.Label{Text: "Публичный ключ:", TextAlignment: dcl.AlignFar},
+													dcl.TextLabel{AssignTo: &a.stPub, Text: "—",
+														MinSize: dcl.Size{Width: valW}},
+
+													dcl.Label{Text: "MTU:", TextAlignment: dcl.AlignFar},
+													dcl.Label{AssignTo: &a.stMTU, Text: "—"},
+
+													dcl.Label{Text: "IP-адреса:", TextAlignment: dcl.AlignFar},
+													dcl.Label{AssignTo: &a.stAddrs, Text: "—"},
+
+													dcl.Label{Text: "DNS-серверы:", TextAlignment: dcl.AlignFar},
+													dcl.Label{AssignTo: &a.stDNS, Text: "—"},
+
+													// Двух строк ниже у эталона нет, а они здесь самые
+													// полезные: живое подтверждение, что канал несёт
+													// трафик, а не просто «поднят».
+													dcl.Label{Text: "Соединение поднято:", TextAlignment: dcl.AlignFar},
+													dcl.Label{AssignTo: &a.stShake, Text: "—"},
+
+													dcl.Label{Text: "Передача:", TextAlignment: dcl.AlignFar},
+													dcl.Label{AssignTo: &a.stMove, Text: "—"},
+
+													// Пустая ячейка занимает колонку подписей: кнопка встаёт
+													// ровно под значениями, как «Подключить» у эталона.
+													dcl.Label{Text: ""},
+													dcl.Composite{
+														Layout: dcl.HBox{MarginsZero: true},
+														Children: []dcl.Widget{
+															dcl.PushButton{AssignTo: &a.btnToggle, Text: "Подключить",
+																MinSize: dcl.Size{Width: 110}, OnClicked: a.onToggle},
+															dcl.HSpacer{},
+														},
+													},
 												},
 											},
-
-											dcl.Label{Text: "Публичный ключ:", TextAlignment: dcl.AlignFar},
-											dcl.TextLabel{AssignTo: &a.stPub, Text: "—",
-												MinSize: dcl.Size{Width: valW}},
-
-											dcl.Label{Text: "MTU:", TextAlignment: dcl.AlignFar},
-											dcl.Label{AssignTo: &a.stMTU, Text: "—"},
-
-											dcl.Label{Text: "IP-адреса:", TextAlignment: dcl.AlignFar},
-											dcl.Label{AssignTo: &a.stAddrs, Text: "—"},
-
-											dcl.Label{Text: "DNS-серверы:", TextAlignment: dcl.AlignFar},
-											dcl.Label{AssignTo: &a.stDNS, Text: "—"},
-
-											// Двух строк ниже у эталона нет, а они здесь самые
-											// полезные: живое подтверждение, что канал несёт
-											// трафик, а не просто «поднят».
-											dcl.Label{Text: "Соединение поднято:", TextAlignment: dcl.AlignFar},
-											dcl.Label{AssignTo: &a.stShake, Text: "—"},
-
-											dcl.Label{Text: "Передача:", TextAlignment: dcl.AlignFar},
-											dcl.Label{AssignTo: &a.stMove, Text: "—"},
-
-											// Пустая ячейка занимает колонку подписей: кнопка встаёт
-											// ровно под значениями, как «Подключить» у эталона.
-											dcl.Label{Text: ""},
-											dcl.Composite{
-												Layout: dcl.HBox{MarginsZero: true},
+											dcl.GroupBox{
+												Title:  "Пир",
+												Layout: dcl.Grid{Columns: 2, Spacing: 6},
 												Children: []dcl.Widget{
-													dcl.PushButton{AssignTo: &a.btnToggle, Text: "Подключить",
-														MinSize: dcl.Size{Width: 110}, OnClicked: a.onToggle},
-													dcl.HSpacer{},
+													dcl.Label{Text: "Публичный ключ:", TextAlignment: dcl.AlignFar,
+														MinSize: dcl.Size{Width: 140}},
+													dcl.TextLabel{AssignTo: &a.pPub, Text: "—",
+														MinSize: dcl.Size{Width: valW}},
+
+													dcl.Label{Text: "Разрешённые IP-адреса:", TextAlignment: dcl.AlignFar},
+													dcl.TextLabel{AssignTo: &a.pAllowed, Text: "—",
+														MinSize: dcl.Size{Width: valW}},
+
+													dcl.Label{Text: "IP-адрес сервера:", TextAlignment: dcl.AlignFar},
+													dcl.Label{AssignTo: &a.pServer, Text: "—"},
 												},
 											},
 										},
 									},
-									dcl.GroupBox{
-										Title:  "Пир",
-										Layout: dcl.Grid{Columns: 2, Spacing: 6},
-										Children: []dcl.Widget{
-											dcl.Label{Text: "Публичный ключ:", TextAlignment: dcl.AlignFar,
-												MinSize: dcl.Size{Width: 150}},
-											dcl.TextLabel{AssignTo: &a.pPub, Text: "—",
-												MinSize: dcl.Size{Width: valW}},
-
-											dcl.Label{Text: "Разрешённые IP-адреса:", TextAlignment: dcl.AlignFar},
-											dcl.TextLabel{AssignTo: &a.pAllowed, Text: "—",
-												MinSize: dcl.Size{Width: valW}},
-
-											dcl.Label{Text: "IP-адрес сервера:", TextAlignment: dcl.AlignFar},
-											dcl.Label{AssignTo: &a.pServer, Text: "—"},
-										},
-									},
-									dcl.VSpacer{},
 									dcl.Composite{
 										Layout: dcl.HBox{MarginsZero: true},
 										Children: []dcl.Widget{
