@@ -166,6 +166,25 @@ PersistentKeepalive = 25
    «только чтение», и проверка либо всегда молчала бы, либо всегда жаловалась. Настоящая требует
    разбора DACL — так и написано в коде.
 
+## Обвязка
+
+Движок умеет всё сам — адрес, MTU, маршруты, согласование пути, — поэтому обвязка нужна только для
+того, чего он не делает намеренно: ключей-крючков (`PostUp` и прочие разбор **отвергает**: клиент не
+исполняет команды из файла) и слежения за процессом. Подробно — в [docs/deploy.md](docs/deploy.md).
+
+```sh
+# Linux-клиент: как wg-quick, с крючками и Table = off
+sudo install -m 755 contrib/xs-quick /usr/local/sbin/xs-quick
+sudo xs-quick up home            # /etc/xsteer/home.conf
+sudo systemctl enable --now xs-quick@home
+
+# хаб на сервере: вопросы, юнит, masquerade, меню выдачи пиров
+sudo bash server/xs-install.sh
+
+# проверить конфигурацию, ничего не поднимая
+xsteer check /etc/xsteer/hub.conf
+```
+
 ## Проверки
 
 ```sh
@@ -175,6 +194,7 @@ sudo sh tests/matrix.sh    # все четыре сочетания полови
 sudo sh tests/probe.sh     # что видит прибор активного зондирования (нужен openssl)
 sudo XRAY_BIN=/путь/к/xray sh tests/xhttp-compare.sh   # форма трафика против настоящего xhttp
 sudo sh tests/interop.sh   # живая совместимость с хабом на C (нужны netns, tun, ../steer/build/steer-hub)
+sudo sh tests/quick.sh     # обвязка: xs-quick поднимает и снимает настоящий туннель
 
 # тот же стенд под детектором гонок: у клиента три горутины на соединение, и проверять их
 # согласованность рассуждением нельзя. Скорость при этом падает примерно вдвое — это накладные

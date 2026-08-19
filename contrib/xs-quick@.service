@@ -1,0 +1,32 @@
+[Unit]
+Description=xsteer — туннель %i
+# После сети: соединение к хабу выбирает маршрут при первом же пакете, а привязку к физическому
+# интерфейсу клиент читает ДО того, как встанут маршруты туннеля.
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+Documentation=https://github.com/xyzmean/xsteer
+
+[Service]
+# oneshot с RemainAfterExit — ровно как у wg-quick@.service, и по той же причине: юнит описывает
+# СОСТОЯНИЕ «туннель поднят», а не процесс. Сам клиент xs-quick заводит в фоне и помнит его номер.
+#
+# ЧЕМ ЭТО ПЛОХО, СКАЗАНО ПРЯМО: упавший клиент systemd здесь не поднимет — юнит остаётся
+# «активным», потому что ExecStart отработал успешно. Кому нужен присмотр, тому нужен юнит с
+# Type=simple и ExecStart=xsteer up (см. docs/deploy.md): он присматривает, но не исполняет
+# ключи-крючки. Выбор между этими двумя принадлежит человеку, а не скрипту.
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/xs-quick up %i
+ExecStop=/usr/local/sbin/xs-quick down %i
+# Устройство, маршруты и сырой сокет — это CAP_NET_ADMIN и CAP_NET_RAW, больше ничего не нужно.
+# Крючки при этом исполняются с теми же правами: если вашему PostUp нужно больше, он их не получит.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+DeviceAllow=/dev/net/tun rw
+ProtectSystem=strict
+ReadWritePaths=/etc/xsteer /run
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

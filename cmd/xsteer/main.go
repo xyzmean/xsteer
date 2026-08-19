@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -45,6 +46,7 @@ func usage() {
     xsteer hub <файл.conf> [ключи]   поднять хаб (сторона, которая слушает)
     xsteer genkey                    приватный ключ в base64 (на диск не пишет)
     xsteer pubkey                    публичный ключ из приватного на входе
+    xsteer check <файл.conf>         проверить конфигурацию, ничего не поднимая
     xsteer show [файл состояния]     что происходит с туннелем
     xsteer version                   версия и накладные расходы протокола
 
@@ -105,6 +107,8 @@ func main() {
 		err = cmdPubkey()
 	case "show":
 		err = cmdShow(os.Args[2:])
+	case "check":
+		err = cmdCheck(os.Args[2:])
 	case "version":
 		fmt.Printf("xsteer %s (Go %s, %s/%s)\n", Version, runtime.Version(), runtime.GOOS, runtime.GOARCH)
 		fmt.Printf("накладные расходы %d байт на пакет, MTU туннеля при канале 1500 — %d\n",
@@ -420,4 +424,103 @@ func cmdShow(args []string) error {
 	fmt.Printf("отдано %d пакетов / %d байт, принято %d / %d, потеряно %d\n",
 		st.TXPackets, st.TXBytes, st.RXPackets, st.RXBytes, st.Dropped)
 	return nil
+}
+
+// cmdCheck — разобрать конфигурацию и ничего не поднимать.
+//
+// ЗАЧЕМ ОТДЕЛЬНАЯ КОМАНДА. Обвязка (xs-quick, xs-install) правит файл, который читает РАБОТАЮЩИЙ
+// хаб или туннель, и обязана убедиться в годности файла ДО перезапуска: иначе одна опечатка в
+// добавленном пире роняет хаб вместе со всеми остальными пирами, и узнаётся это по тишине.
+// Проверять тем же кодом, что и запуск, — единственный способ не разойтись с ним: своя проверка в
+// скрипте повторяла бы разбор и однажды повторила бы его неверно.
+//
+// Роль выводится из файла, а не спрашивается ключом: ListenPort без Endpoint бывает только у хаба,
+// Endpoint — только у пира. Ошибиться тут человеку легко, а последствие — «проверено» для файла,
+// который другая роль отвергнет.
+func cmdCheck(args []string) error {
+	if len(args) == 0 {
+		return errors.New("нужен путь к файлу конфигурации")
+	}
+	path := args[0]
+	// Пробуем обе роли: подходящая скажет, что это за файл. Порядок важен только для сообщения об
+	// ошибке — её отдаём от той роли, которая по виду файла ожидалась.
+	c, sec, errSpoke := conf.Load(path, conf.RoleSpoke)
+	role := "пир"
+	if errSpoke != nil {
+		var errHub error
+		c, sec, errHub = conf.Load(path, conf.RoleHub)
+		if errHub != nil {
+			// Какую ошибку показать: если есть ListenPort и нет Endpoint — это хаб, и человеку
+			// нужна ошибка хаба, а не жалоба роли пира на отсутствие Endpoint.
+			if looksLikeHub(path) {
+				return errHub
+			}
+			return errSpoke
+		}
+		role = "хаб"
+	}
+	defer sec.Wipe()
+
+	fmt.Printf("%s: %s, разбор прошёл\n", path, role)
+	fmt.Printf("адрес в туннеле %s/%d", ip4str(c.Addr), c.AddrPlen)
+	if c.MTU > 0 {
+		fmt.Printf(", MTU задан %d", c.MTU)
+	} else {
+		fmt.Printf(", MTU выведет сам (потолок %d)", wire.MTUDefault)
+	}
+	if c.ListenPort > 0 {
+		fmt.Printf(", слушает %d", c.ListenPort)
+	}
+	fmt.Println()
+	if c.SNI != "" {
+		fmt.Printf("SNI %s\n", c.SNI)
+	}
+	if len(c.DNS) > 0 {
+		fmt.Printf("серверы имён: %s\n", strings.Join(c.DNS, ", "))
+	}
+	fmt.Printf("пиров %d:\n", len(c.Peers))
+	for i := range c.Peers {
+		p := &c.Peers[i]
+		nets := make([]string, 0, len(p.Allowed))
+		for _, a := range p.Allowed {
+			nets = append(nets, fmt.Sprintf("%s/%d", ip4str(a.Net), a.Plen))
+		}
+		fmt.Printf("  %s  %s", conf.KeyFP(p.Pub), strings.Join(nets, ", "))
+		if p.EndpointPort > 0 {
+			fmt.Printf("  через %s:%d", p.Endpoint, p.EndpointPort)
+		}
+		if p.KeepaliveSet {
+			fmt.Printf("  keepalive %d с", p.Keepalive)
+		}
+		fmt.Println()
+	}
+	return nil
+}
+
+// looksLikeHub — на что похож файл по виду: ListenPort без Endpoint бывает только у хаба. Нужно
+// лишь для выбора того сообщения об ошибке, которое человеку пригодится.
+func looksLikeHub(path string) bool {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	hasListen, hasEndpoint := false, false
+	for _, ln := range strings.Split(string(b), "\n") {
+		ln = strings.TrimSpace(ln)
+		if i := strings.IndexByte(ln, '='); i > 0 {
+			switch strings.ToLower(strings.TrimSpace(ln[:i])) {
+			case "listenport":
+				hasListen = true
+			case "endpoint":
+				hasEndpoint = true
+			}
+		}
+	}
+	return hasListen && !hasEndpoint
+}
+
+// ip4str — адрес из хостового порядка в точечную запись. Свой, потому что в client и hub он не
+// экспортирован, а тащить ради четырёх строк лишнюю связь между пакетами незачем.
+func ip4str(v uint32) string {
+	return fmt.Sprintf("%d.%d.%d.%d", byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
 }
