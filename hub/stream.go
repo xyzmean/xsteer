@@ -49,10 +49,8 @@ func (h *Hub) streamConn(ctx context.Context, nc net.Conn) {
 	defer nc.Close()
 	if tc, ok := nc.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
-		// Те же буферы, что у пира (см. client/stream.go): узкое место окна TCP не должно лежать в
-		// приёмном буфере хаба, куда сходится трафик всех пиров.
-		_ = tc.SetReadBuffer(wire.SockBuf)
-		_ = tc.SetWriteBuffer(wire.SockBuf)
+		// Буферы, как и у пира, оставлены автоподстройке — см. шапку wire/stream.go: пришпиленный
+		// setsockopt резал приёмный буфер хаба до 416 КБ, то есть до 47 Мбит/с на 72 мс задержки.
 	}
 	peerAddr := nc.RemoteAddr().String()
 	st := wire.NewStream(nc)
