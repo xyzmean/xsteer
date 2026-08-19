@@ -165,8 +165,12 @@ func main() {
 										Layout: dcl.HBox{MarginsZero: true, Spacing: 4},
 										Children: []dcl.Widget{
 											dcl.PushButton{Text: "Добавить туннель", OnClicked: a.onImport},
-											dcl.PushButton{Text: "Удалить", MaxSize: dcl.Size{Width: 84},
-												OnClicked: a.onDelete},
+											// Узкие кнопки-значки, как в эталоне: крестик — удалить,
+											// папка — открыть каталог конфигураций.
+											dcl.PushButton{Text: "✕", MaxSize: dcl.Size{Width: 34},
+												ToolTipText: "Удалить туннель", OnClicked: a.onDelete},
+											dcl.PushButton{Text: "🗀", MaxSize: dcl.Size{Width: 34},
+												ToolTipText: "Открыть папку конфигураций", OnClicked: a.onFolder},
 										},
 									},
 								},
@@ -174,18 +178,18 @@ func main() {
 							// ---- справа: разобранная конфигурация и состояние ------------
 							dcl.Composite{
 								StretchFactor: 2,
-								Layout:        dcl.VBox{MarginsZero: true},
+								Layout:        dcl.VBox{MarginsZero: true, Alignment: dcl.AlignHNearVNear},
 								Children: []dcl.Widget{
 									dcl.GroupBox{
 										AssignTo: &a.gbIface,
 										Title:    "Интерфейс",
-										Layout:   dcl.Grid{Columns: 3, Spacing: 6},
+										Layout:   dcl.Grid{Columns: 3, Spacing: 6, Alignment: dcl.AlignHNearVNear},
 										Children: []dcl.Widget{
 											// Третья колонка — распорка. Без неё сетка сжимается по
 											// содержимому, и рамка висит узкой полосой не на всю
 											// ширину: именно это было видно на первом снимке.
 											dcl.Label{Text: "Статус:", TextAlignment: dcl.AlignFar,
-												MinSize: dcl.Size{Width: 160}},
+												MinSize: dcl.Size{Width: 140}},
 											dcl.Composite{
 												Layout: dcl.HBox{MarginsZero: true, Spacing: 4},
 												Children: []dcl.Widget{
@@ -238,10 +242,10 @@ func main() {
 									},
 									dcl.GroupBox{
 										Title:  "Пир",
-										Layout: dcl.Grid{Columns: 3, Spacing: 6},
+										Layout: dcl.Grid{Columns: 3, Spacing: 6, Alignment: dcl.AlignHNearVNear},
 										Children: []dcl.Widget{
 											dcl.Label{Text: "Публичный ключ:", TextAlignment: dcl.AlignFar,
-												MinSize: dcl.Size{Width: 160}},
+												MinSize: dcl.Size{Width: 140}},
 											dcl.TextLabel{AssignTo: &a.pPub, Text: "—",
 												MinSize: dcl.Size{Width: valW}},
 											dcl.HSpacer{},

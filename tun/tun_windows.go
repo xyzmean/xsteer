@@ -421,20 +421,34 @@ func SetupRoutes(name string, cidrs, endpoints []string) (bool, error) {
 			return full, err
 		}
 	}
+	// Список префиксов раскладывается ЦЕЛИКОМ, и отказ на одном не прекращает работу над
+	// остальными. Раньше здесь стоял return на первой же ошибке, и это давало худший вид сбоя:
+	// у полного туннеля с исключениями префиксов девятнадцать, и упади одиннадцатый — маршруты
+	// с двенадцатого по девятнадцатый не ставились вовсе. Снаружи это выглядит как «туннель
+	// работает, но часть адресов ходит мимо него», причём молча: интернет-то есть.
+	var failed []string
+	okN := 0
 	for _, c := range cidrs {
 		p, err := netip.ParsePrefix(strings.TrimSpace(c))
 		if err != nil {
-			return full, fmt.Errorf("маршрут %q не разобран: %w", c, err)
+			failed = append(failed, fmt.Sprintf("%s (не разобран: %v)", c, err))
+			continue
 		}
 		if p.Bits() == 0 && p.Addr().Is4() {
 			continue // маршрут по умолчанию — забота DefaultRouteUp
 		}
 		if e := r.luid.AddRoute(p, netip.IPv4Unspecified(), 0); e != nil && e != windows.ERROR_OBJECT_ALREADY_EXISTS {
-			return full, fmt.Errorf("маршрут %s не встал: %w", c, e)
+			failed = append(failed, fmt.Sprintf("%s (%v)", c, e))
+			continue
 		}
+		okN++
 		routesMu.Lock()
 		r.tunnel = append(r.tunnel, p)
 		routesMu.Unlock()
+	}
+	if len(failed) > 0 {
+		return full, fmt.Errorf("в туннель направлено префиксов %d из %d; не встали: %s",
+			okN, len(cidrs), strings.Join(failed, "; "))
 	}
 	return full, nil
 }
