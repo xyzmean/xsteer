@@ -215,6 +215,9 @@ for hk in c go; do
     for ck in c go stream; do
         [ "$want_cli" = both ] || [ "$want_cli" = "$ck" ] || continue
         [ "$ck" = c ] && [ "$have_c_cli" = 0 ] && { echo "== клиент c пропущен: нет $CLI_C"; continue; }
+        # Режим потока — Go↔Go по построению: хаб на C настоящего TCP на отдельном порту не слушает,
+        # и клиент-поток получил бы connection refused. Клетка невозможна, а не проваленная.
+        [ "$hk" = c ] && [ "$ck" = stream ] && { echo "== хаб c ← клиент stream пропущен: хаб на C режима потока не умеет"; continue; }
         cell "$hk" "$ck"
     done
 done
