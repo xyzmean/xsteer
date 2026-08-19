@@ -39,7 +39,10 @@ const streamProbeMS = 2000
 // streamSession поднимает соединение в режиме потока и работает до его обрыва.
 func (c *Client) streamSession(ctx context.Context, id int, dev tun.Device) error {
 	addr := net.JoinHostPort(c.opt.Conf.Peers[0].Endpoint, fmt.Sprint(c.streamPort()))
-	d := net.Dialer{Timeout: 10 * time.Second}
+	// Control привязывает СВОЙ сокет к физическому интерфейсу, чтобы соединение к хабу не ушло в
+	// туннель (см. tun/pin_windows.go). Там же объяснено, почему это лучше маршрута-обхода: чужой
+	// трафик к адресу хаба — ssh на тот же сервер, например — остаётся в туннеле.
+	d := net.Dialer{Timeout: 10 * time.Second, Control: c.dialControl}
 	nc, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return err
