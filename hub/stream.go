@@ -49,6 +49,10 @@ func (h *Hub) streamConn(ctx context.Context, nc net.Conn) {
 	defer nc.Close()
 	if tc, ok := nc.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
+		// Те же буферы, что у пира (см. client/stream.go): узкое место окна TCP не должно лежать в
+		// приёмном буфере хаба, куда сходится трафик всех пиров.
+		_ = tc.SetReadBuffer(wire.SockBuf)
+		_ = tc.SetWriteBuffer(wire.SockBuf)
 	}
 	peerAddr := nc.RemoteAddr().String()
 	st := wire.NewStream(nc)
@@ -82,13 +86,7 @@ func (h *Hub) streamConn(ctx context.Context, nc net.Conn) {
 		_, _ = nc.Write(noise.Alert())
 		return
 	}
-	found := -1
-	for i := range h.opt.Conf.Peers {
-		if h.opt.Conf.Peers[i].Pub == hs.PeerStatic {
-			found = i
-			break
-		}
-	}
+	found := h.findPeer(hs.PeerStatic)
 	if found < 0 {
 		h.stats.strangers.Add(1)
 		h.logf("поток с %s: пир %s не описан в конфигурации — отказ", peerAddr,
@@ -98,10 +96,7 @@ func (h *Hub) streamConn(ctx context.Context, nc net.Conn) {
 	}
 	// Защита от воспроизведения — та же и та же общая: пир приходит с разных портов, а метка
 	// времени одна на пира.
-	h.ctl.Lock()
-	seen := h.lastStamp[found]
-	h.ctl.Unlock()
-	if hs.Peer.Stamp != 0 && hs.Peer.Stamp < seen {
+	if !h.replayFresh(found, hs.Peer.Stamp) {
 		h.logf("поток с %s: метка времени старее прошлой — похоже на повтор", peerAddr)
 		return
 	}
@@ -151,9 +146,7 @@ func (h *Hub) streamConn(ctx context.Context, nc net.Conn) {
 	if peerMTU > 0 {
 		s.mtu = peerMTU
 	}
-	h.ctl.Lock()
-	h.lastStamp[found] = stamp
-	h.ctl.Unlock()
+	h.commitStamp(found, stamp)
 	h.peerSess[found][connID].Store(s)
 	defer h.peerSess[found][connID].CompareAndSwap(s, nil)
 

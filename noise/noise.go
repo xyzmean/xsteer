@@ -425,6 +425,36 @@ func (hs *HS) ClientHello(priv, hubPub [32]byte, sni string, mtu, connID int,
 	return rec, nil
 }
 
+// ResponseComplete — пришёл ли ответ хаба ЦЕЛИКОМ, определяется по одной лишь рамке записей, без
+// криптографии и без изменения состояния.
+//
+// Нужно потому, что ClientFinish ВБИРАЕТ прочитанное в транскрипт по мере разбора и на неполном
+// ответе портит его: mixHash над ServerHello выполнится, а до подтверждения дело не дойдёт, и
+// повторный вызов на дособранном ответе уже не сойдётся тегом. Поэтому обе стороны транспорта
+// (поддельный TCP и поток) копят байты до этой границы и зовут ClientFinish РОВНО ОДИН раз.
+//
+// Граница — запись-подтверждение: тип 0x17 и длина ровно finBody. «Сертификат» тоже 0x17, но его
+// длина заведомо больше (сама нагрузка плюс сотни байт набивки), так что спутать нельзя; ServerHello
+// (0x16) обязан встретиться раньше.
+func ResponseComplete(in []byte) bool {
+	i, sawSH := 0, false
+	for i+wire.RecHdr <= len(in) {
+		typ := in[i]
+		n := int(in[i+3])<<8 | int(in[i+4])
+		if i+wire.RecHdr+n > len(in) {
+			return false // запись заявлена, но приехала не вся
+		}
+		if typ == 0x16 {
+			sawSH = true
+		}
+		if typ == 0x17 && n == finBody && sawSH {
+			return true
+		}
+		i += wire.RecHdr + n
+	}
+	return false
+}
+
 // ClientFinish разбирает ответ хаба (ServerHello + ChangeCipherSpec + две записи) и отдаёт
 // транспортные ключи. consumed — сколько байт потока израсходовано; остаток принадлежит уже
 // данным.

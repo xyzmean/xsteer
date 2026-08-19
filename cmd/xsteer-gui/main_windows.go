@@ -127,34 +127,19 @@ func main() {
 		MinSize:  dcl.Size{Width: 820, Height: 600},
 		Size:     dcl.Size{Width: 900, Height: 640},
 		Layout:   dcl.VBox{MarginsZero: true},
-		MenuItems: []dcl.MenuItem{
-			dcl.Menu{
-				Text: "&Туннель",
-				Items: []dcl.MenuItem{
-					dcl.Action{Text: "&Добавить из файла…", OnTriggered: a.onImport},
-					dcl.Action{Text: "&Новый пустой…", OnTriggered: a.onNew},
-					dcl.Separator{},
-					dcl.Action{Text: "&Редактировать…", OnTriggered: a.onEdit},
-					dcl.Action{Text: "&Удалить", OnTriggered: a.onDelete},
-					dcl.Separator{},
-					dcl.Action{Text: "Открыть &папку конфигураций", OnTriggered: a.onFolder},
-					dcl.Separator{},
-					dcl.Action{Text: "&Свернуть в трей", OnTriggered: func() { a.mw.Hide() }},
-					dcl.Action{Text: "В&ыход", OnTriggered: a.quit},
-				},
-			},
-		},
+		// Строки меню нет, как и в эталоне: импорт и создание — в split-кнопке под списком,
+		// удаление и папка — кнопками там же, «Выход» — в меню трея.
 		Children: []dcl.Widget{
 			dcl.TabWidget{
 				AssignTo: &a.tabs,
 				Pages: []dcl.TabPage{
 					{
 						Title:  "Туннели",
-						Layout: dcl.HBox{},
+						Layout: dcl.HBox{Spacing: 8},
 						Children: []dcl.Widget{
 							// ---- слева: список туннелей и действия под ним ---------------
 							dcl.Composite{
-								Layout:  dcl.VBox{MarginsZero: true},
+								Layout:  dcl.VBox{MarginsZero: true, Spacing: 4},
 								MinSize: dcl.Size{Width: 230},
 								Children: []dcl.Widget{
 									dcl.ListBox{
@@ -164,13 +149,23 @@ func main() {
 									dcl.Composite{
 										Layout: dcl.HBox{MarginsZero: true, Spacing: 4},
 										Children: []dcl.Widget{
-											dcl.PushButton{Text: "Добавить туннель", OnClicked: a.onImport},
+											// Split-кнопка, как в эталоне: клик — импорт из файла,
+											// стрелка — выбор «из файла» или «новый пустой».
+											dcl.SplitButton{
+												Text:      "Добавить туннель",
+												OnClicked: a.onImport,
+												MenuItems: []dcl.MenuItem{
+													dcl.Action{Text: "Добавить из &файла…", OnTriggered: a.onImport},
+													dcl.Action{Text: "&Новый пустой…", OnTriggered: a.onNew},
+												},
+											},
 											// Узкие кнопки-значки, как в эталоне: крестик — удалить,
 											// папка — открыть каталог конфигураций.
 											dcl.PushButton{Text: "✕", MaxSize: dcl.Size{Width: 34},
 												ToolTipText: "Удалить туннель", OnClicked: a.onDelete},
 											dcl.PushButton{Text: "🗀", MaxSize: dcl.Size{Width: 34},
 												ToolTipText: "Открыть папку конфигураций", OnClicked: a.onFolder},
+											dcl.HSpacer{},
 										},
 									},
 								},
@@ -178,18 +173,20 @@ func main() {
 							// ---- справа: разобранная конфигурация и состояние ------------
 							dcl.Composite{
 								StretchFactor: 2,
-								Layout:        dcl.VBox{MarginsZero: true, Alignment: dcl.AlignHNearVNear},
+								// Без Alignment: с ним весь столбец повисал по центру с пустотой
+								// сверху. Пустоту забирает единственный VSpacer перед кнопкой
+								// «Редактировать» — рамки прижаты к верху, кнопка к низу.
+								Layout: dcl.VBox{MarginsZero: true, Spacing: 8},
 								Children: []dcl.Widget{
 									dcl.GroupBox{
 										AssignTo: &a.gbIface,
 										Title:    "Интерфейс",
-										Layout:   dcl.Grid{Columns: 3, Spacing: 6, Alignment: dcl.AlignHNearVNear},
+										// Две колонки без распорок: ширину рамке даёт растяжение по
+										// HBox (StretchFactor выше), а не третья колонка.
+										Layout: dcl.Grid{Columns: 2, Spacing: 6},
 										Children: []dcl.Widget{
-											// Третья колонка — распорка. Без неё сетка сжимается по
-											// содержимому, и рамка висит узкой полосой не на всю
-											// ширину: именно это было видно на первом снимке.
 											dcl.Label{Text: "Статус:", TextAlignment: dcl.AlignFar,
-												MinSize: dcl.Size{Width: 140}},
+												MinSize: dcl.Size{Width: 150}},
 											dcl.Composite{
 												Layout: dcl.HBox{MarginsZero: true, Spacing: 4},
 												Children: []dcl.Widget{
@@ -198,66 +195,57 @@ func main() {
 													dcl.HSpacer{},
 												},
 											},
-											dcl.HSpacer{},
 
 											dcl.Label{Text: "Публичный ключ:", TextAlignment: dcl.AlignFar},
 											dcl.TextLabel{AssignTo: &a.stPub, Text: "—",
 												MinSize: dcl.Size{Width: valW}},
-											dcl.HSpacer{},
 
 											dcl.Label{Text: "MTU:", TextAlignment: dcl.AlignFar},
 											dcl.Label{AssignTo: &a.stMTU, Text: "—"},
-											dcl.HSpacer{},
 
 											dcl.Label{Text: "IP-адреса:", TextAlignment: dcl.AlignFar},
 											dcl.Label{AssignTo: &a.stAddrs, Text: "—"},
-											dcl.HSpacer{},
 
 											dcl.Label{Text: "DNS-серверы:", TextAlignment: dcl.AlignFar},
 											dcl.Label{AssignTo: &a.stDNS, Text: "—"},
-											dcl.HSpacer{},
 
 											// Двух строк ниже у эталона нет, а они здесь самые
 											// полезные: живое подтверждение, что канал несёт
 											// трафик, а не просто «поднят».
 											dcl.Label{Text: "Соединение поднято:", TextAlignment: dcl.AlignFar},
 											dcl.Label{AssignTo: &a.stShake, Text: "—"},
-											dcl.HSpacer{},
 
 											dcl.Label{Text: "Передача:", TextAlignment: dcl.AlignFar},
 											dcl.Label{AssignTo: &a.stMove, Text: "—"},
-											dcl.HSpacer{},
 
-											dcl.HSpacer{},
+											// Пустая ячейка занимает колонку подписей: кнопка встаёт
+											// ровно под значениями, как «Подключить» у эталона.
+											dcl.Label{Text: ""},
 											dcl.Composite{
 												Layout: dcl.HBox{MarginsZero: true},
 												Children: []dcl.Widget{
 													dcl.PushButton{AssignTo: &a.btnToggle, Text: "Подключить",
-														MinSize: dcl.Size{Width: 140}, OnClicked: a.onToggle},
+														MinSize: dcl.Size{Width: 110}, OnClicked: a.onToggle},
 													dcl.HSpacer{},
 												},
 											},
-											dcl.HSpacer{},
 										},
 									},
 									dcl.GroupBox{
 										Title:  "Пир",
-										Layout: dcl.Grid{Columns: 3, Spacing: 6, Alignment: dcl.AlignHNearVNear},
+										Layout: dcl.Grid{Columns: 2, Spacing: 6},
 										Children: []dcl.Widget{
 											dcl.Label{Text: "Публичный ключ:", TextAlignment: dcl.AlignFar,
-												MinSize: dcl.Size{Width: 140}},
+												MinSize: dcl.Size{Width: 150}},
 											dcl.TextLabel{AssignTo: &a.pPub, Text: "—",
 												MinSize: dcl.Size{Width: valW}},
-											dcl.HSpacer{},
 
 											dcl.Label{Text: "Разрешённые IP-адреса:", TextAlignment: dcl.AlignFar},
 											dcl.TextLabel{AssignTo: &a.pAllowed, Text: "—",
 												MinSize: dcl.Size{Width: valW}},
-											dcl.HSpacer{},
 
 											dcl.Label{Text: "IP-адрес сервера:", TextAlignment: dcl.AlignFar},
 											dcl.Label{AssignTo: &a.pServer, Text: "—"},
-											dcl.HSpacer{},
 										},
 									},
 									dcl.VSpacer{},
