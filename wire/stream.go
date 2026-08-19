@@ -1,9 +1,28 @@
 package wire
 
 import (
+	"bufio"
 	"errors"
 	"io"
 )
+
+// streamReadBuf — размер буфера чтения потока. Шестьдесят четыре килобайта: без него ReadRecord
+// делает ДВА системных вызова чтения на запись (заголовок, потом тело), то есть при мелких записях
+// обратного направления — по два вызова на каждый внутренний пакет. С буфером одно чтение ядра
+// наполняет его целиком, и десятки записей разбираются из памяти без единого лишнего вызова. Это
+// главный выигрыш скорости в режиме потока, где горячий путь упирается не в AEAD, а в вызовы.
+// Восемь записей MaxRecord влезают с запасом, а память — 64 КиБ на соединение.
+const streamReadBuf = 1 << 16
+
+// SockBuf — сколько просить у ядра под приёмный и отправной буферы TCP-сокета режима потока.
+//
+// Нужно тем каналам, у которых произведение полосы на задержку велико: с буфером по умолчанию
+// (десятки килобайт на многих системах) окно TCP упирается в него раньше, чем в сам канал, и на
+// межконтинентальном пути поток отдаёт малую долю полосы. Два мегабайта покрывают гигабит при
+// задержке около 16 мс; больше просить незачем — дальше выигрыш упирается в само окно, а не в
+// буфер. Значение — пожелание: ядро вправе его урезать (autotuning на Windows и net.core.rmem_max
+// на Linux), поэтому ошибка установки не смертельна и лишь означает «осталось как было».
+const SockBuf = 2 << 20
 
 // ---- записи по НАСТОЯЩЕМУ потоку TCP ---------------------------------------
 //
@@ -38,6 +57,11 @@ var ErrStreamRecord = errors.New("wire: в потоке не запись xsteer
 // принадлежит одной.
 type Stream struct {
 	rw io.ReadWriter
+	// r — буферизованное чтение поверх rw. ВСЕ чтения (рукопожатие и данные) идут через него, и
+	// это обязательно: наполняя буфер, ядро может отдать сверх запрошенного заранее байты фазы
+	// данных, приехавшие вплотную за рукопожатием, — и потерять их, читая мимо буфера, значило бы
+	// не расшифровать первую же запись. Запись идёт мимо буфера, прямо в rw.
+	r io.Reader
 
 	// Смещения ШЕСТИДЕСЯТИЧЕТЫРЁХБИТНЫЕ, и это условие стойкости, а не запас на будущее.
 	//
@@ -64,7 +88,12 @@ type Stream struct {
 // NewStream заводит поток. Счётчики начинаются с единицы: нулевое смещение занято подтверждением
 // рукопожатия, и это тот же инвариант, что в поддельном TCP, где ноль забирал SYN.
 func NewStream(rw io.ReadWriter) *Stream {
-	return &Stream{rw: rw, txOff: 1, rxOff: 1, rbuf: make([]byte, RecHdr+MaxRecord+Tag)}
+	return &Stream{
+		rw:    rw,
+		r:     bufio.NewReaderSize(rw, streamReadBuf),
+		txOff: 1, rxOff: 1,
+		rbuf: make([]byte, RecHdr+MaxRecord+Tag),
+	}
 }
 
 // WriteRaw отправляет байты как есть и учитывает их в смещении. Нужно рукопожатию: его записи
@@ -82,7 +111,7 @@ func (s *Stream) TxNext() uint64 { return s.txOff }
 // ReadRaw читает столько, сколько попросили, и учитывает это в смещении. Нужно рукопожатию,
 // которому байты приходят до того, как известны границы записей.
 func (s *Stream) ReadRaw(b []byte) (int, error) {
-	n, err := s.rw.Read(b)
+	n, err := s.r.Read(b)
 	s.rxOff += uint64(n)
 	return n, err
 }
@@ -91,7 +120,7 @@ func (s *Stream) ReadRaw(b []byte) (int, error) {
 // приходит несколькими записями разных типов, и собрать их надо ЦЕЛИКОМ до разбора — разбор
 // вбирает прочитанное в транскрипт, и повторный вызов на неполном ответе посчитал бы его дважды.
 func (s *Stream) ReadFull(b []byte) error {
-	n, err := io.ReadFull(s.rw, b)
+	n, err := io.ReadFull(s.r, b)
 	s.rxOff += uint64(n)
 	return err
 }
@@ -102,7 +131,7 @@ func (s *Stream) ReadFull(b []byte) error {
 // следующий вызов затрёт отданное.
 func (s *Stream) ReadRecord() (body, hdr []byte, rel uint64, err error) {
 	rel = s.rxOff
-	if _, err = io.ReadFull(s.rw, s.rbuf[:RecHdr]); err != nil {
+	if _, err = io.ReadFull(s.r, s.rbuf[:RecHdr]); err != nil {
 		return nil, nil, 0, err
 	}
 	s.rxOff += RecHdr
@@ -113,7 +142,7 @@ func (s *Stream) ReadRecord() (body, hdr []byte, rel uint64, err error) {
 	if n < Tag || n > MaxRecord {
 		return nil, nil, 0, ErrStreamRecord
 	}
-	if _, err = io.ReadFull(s.rw, s.rbuf[RecHdr:RecHdr+n]); err != nil {
+	if _, err = io.ReadFull(s.r, s.rbuf[RecHdr:RecHdr+n]); err != nil {
 		return nil, nil, 0, err
 	}
 	s.rxOff += uint64(n)
