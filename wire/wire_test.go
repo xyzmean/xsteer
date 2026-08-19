@@ -603,7 +603,7 @@ func TestПотокЗаписей(t *testing.T) {
 	if _, err := io.ReadFull(readerOf(rx), got); err != nil {
 		t.Fatal(err)
 	}
-	if tx.TxNext() != 1+uint32(len(hello)) {
+	if tx.TxNext() != 1+uint64(len(hello)) {
 		t.Errorf("смещение отправителя после рукопожатия = %d", tx.TxNext())
 	}
 
@@ -617,9 +617,9 @@ func TestПотокЗаписей(t *testing.T) {
 		for k := 0; k < plen; k++ {
 			row[HdrRoom+k] = byte(i*7 + k)
 		}
-		var sealedWith uint32
+		var sealedWith uint64
 		want := tx.TxNext()
-		err := tx.WriteRecord(row, RecHdr+plen, func(rel uint32) error {
+		err := tx.WriteRecord(row, RecHdr+plen, func(rel uint64) error {
 			sealedWith = rel
 			return nil
 		})

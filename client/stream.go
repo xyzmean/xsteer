@@ -246,12 +246,14 @@ func (c *Client) streamOut(ctx context.Context, id int, st *wire.Stream, tx *noi
 		for _, f := range frames {
 			c.stats.txBytes.Add(uint64(len(f)))
 		}
-		// Ретайр по объёму остаётся: смещение в потоке — те же 32 бита, и заворот означал бы
-		// повтор nonce.
-		if st.TxNext() >= wire.RelRetire {
-			c.logf("соединение %d: смена ключей — поднимаю поток заново", id)
-			return nil
-		}
+		// Ретайра по объёму здесь БОЛЬШЕ НЕТ, и это осознанно. Он существовал ровно для того,
+		// чтобы 32-битное смещение не завернулось и не повторило nonce; теперь смещение
+		// 64-битное (см. шапку wire.Stream), заворот недостижим, а ронять живое соединение
+		// каждый гигабайт — ощутимая беда: внутренние TCP-сессии рвутся на ровном месте.
+		//
+		// Периодическая смена ключей ради прямой секретности — отдельная задача, и делать её
+		// надо тоже без разрыва: эпохами, как в veil (epoch.Advance ратчетит корень, номер
+		// эпохи входит в контекст KDF, рукопожатие не повторяется).
 	}
 	return ctx.Err()
 }
@@ -259,11 +261,11 @@ func (c *Client) streamOut(ctx context.Context, id int, st *wire.Stream, tx *noi
 // streamSend шифрует и отправляет одну запись.
 func (c *Client) streamSend(st *wire.Stream, tx *noise.Keys, row []byte, n int) error {
 	rec := row[wire.HdrRoom-wire.RecHdr : wire.HdrRoom]
-	return st.WriteRecord(row, wire.RecHdr+n+wire.Tag, func(rel uint32) error {
+	return st.WriteRecord(row, wire.RecHdr+n+wire.Tag, func(rel uint64) error {
 		if err := wire.RecBuild(rec, n+wire.Tag); err != nil {
 			return err
 		}
-		_, err := tx.Seal(row[wire.HdrRoom:wire.HdrRoom+n+wire.Tag], n, rec, uint64(rel))
+		_, err := tx.Seal(row[wire.HdrRoom:wire.HdrRoom+n+wire.Tag], n, rec, rel)
 		return err
 	})
 }
@@ -277,7 +279,7 @@ func (c *Client) streamIn(ctx context.Context, id int, st *wire.Stream, rx *nois
 		if err != nil {
 			return err
 		}
-		pt, err := rx.Open(body, hdr, uint64(rel))
+		pt, err := rx.Open(body, hdr, rel)
 		if err != nil {
 			// В потоке испорченная запись означает, что дальше читать нечего: границы следующей
 			// известны только из длины, которой мы уже не верим.

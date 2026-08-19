@@ -145,7 +145,7 @@ func (h *Hub) streamConn(ctx context.Context, nc net.Conn) {
 	_ = nc.SetDeadline(time.Time{})
 
 	s := &session{
-		st: st, tx: tx, rx: rx, phase: phEst, peer: found, connID: connID,
+		st: st, nc: nc, tx: tx, rx: rx, phase: phEst, peer: found, connID: connID,
 		batchMax: wire.BatchFramesMax, handshakeAt: time.Now(),
 	}
 	if peerMTU > 0 {
@@ -185,7 +185,7 @@ func (h *Hub) streamConn(ctx context.Context, nc net.Conn) {
 			s.mu.Unlock()
 			return
 		}
-		pt, err := rx.Open(body, rhdr, uint64(rel))
+		pt, err := rx.Open(body, rhdr, rel)
 		if err != nil {
 			// В потоке испорченная запись означает конец: границы следующей известны только из
 			// длины, которой мы уже не верим.

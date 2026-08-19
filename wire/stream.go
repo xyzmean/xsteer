@@ -39,8 +39,24 @@ var ErrStreamRecord = errors.New("wire: в потоке не запись xsteer
 type Stream struct {
 	rw io.ReadWriter
 
-	txOff uint32 // смещение следующего байта, который мы отправим
-	rxOff uint32 // смещение следующего байта, который мы прочитаем
+	// Смещения ШЕСТИДЕСЯТИЧЕТЫРЁХБИТНЫЕ, и это условие стойкости, а не запас на будущее.
+	//
+	// Смещение — это nonce. Тридцати двух бит хватает на четыре гигабайта, после чего счётчик
+	// заворачивается и тот же nonce уходит с тем же ключом; для AES-GCM и ChaCha20-Poly1305 повтор
+	// nonce означает не ослабление, а полную потерю стойкости — вскрывается и подделка, и
+	// содержимое. Четыре гигабайта в одном соединении — это один фильм, то есть достижимо.
+	//
+	// Раньше от заворота спасал ретайр по объёму: соединение закрывалось на гигабайте, и туннель
+	// на миг падал. Так делать не нужно — шире счётчик и всё. На проводе НИЧЕГО не меняется:
+	// смещение не передаётся, обе стороны считают байты сами, а Seal и Open принимают nonce как
+	// uint64 с самого начала. Для первых четырёх гигабайт значения те же, что и были, — совместимость
+	// с уже работающими сборками сохраняется; дальше счётчик просто продолжает расти.
+	//
+	// Так же поступает veil: у него порядковый номер восьмибайтный (record/v1: SeqSize = 8), и
+	// вопроса заворота там не возникает вовсе. Ротация ключей у него отдельно, эпохами, и её
+	// назначение — прямая секретность, а не спасение от повтора nonce.
+	txOff uint64 // смещение следующего байта, который мы отправим
+	rxOff uint64 // смещение следующего байта, который мы прочитаем
 
 	rbuf []byte // буфер под одну запись целиком
 }
@@ -56,18 +72,18 @@ func NewStream(rw io.ReadWriter) *Stream {
 // рукопожатия, и первый же пакет данных не расшифруется.
 func (s *Stream) WriteRaw(b []byte) error {
 	n, err := s.rw.Write(b)
-	s.txOff += uint32(n)
+	s.txOff += uint64(n)
 	return err
 }
 
 // TxNext — смещение, с которым уйдёт следующая запись: им её и надо шифровать.
-func (s *Stream) TxNext() uint32 { return s.txOff }
+func (s *Stream) TxNext() uint64 { return s.txOff }
 
 // ReadRaw читает столько, сколько попросили, и учитывает это в смещении. Нужно рукопожатию,
 // которому байты приходят до того, как известны границы записей.
 func (s *Stream) ReadRaw(b []byte) (int, error) {
 	n, err := s.rw.Read(b)
-	s.rxOff += uint32(n)
+	s.rxOff += uint64(n)
 	return n, err
 }
 
@@ -76,7 +92,7 @@ func (s *Stream) ReadRaw(b []byte) (int, error) {
 // вбирает прочитанное в транскрипт, и повторный вызов на неполном ответе посчитал бы его дважды.
 func (s *Stream) ReadFull(b []byte) error {
 	n, err := io.ReadFull(s.rw, b)
-	s.rxOff += uint32(n)
+	s.rxOff += uint64(n)
 	return err
 }
 
@@ -84,7 +100,7 @@ func (s *Stream) ReadFull(b []byte) error {
 //
 // Возвращает шифротекст с тегом, заголовок (он же AAD) и смещение для nonce. Буфер переиспользуется:
 // следующий вызов затрёт отданное.
-func (s *Stream) ReadRecord() (body, hdr []byte, rel uint32, err error) {
+func (s *Stream) ReadRecord() (body, hdr []byte, rel uint64, err error) {
 	rel = s.rxOff
 	if _, err = io.ReadFull(s.rw, s.rbuf[:RecHdr]); err != nil {
 		return nil, nil, 0, err
@@ -100,7 +116,7 @@ func (s *Stream) ReadRecord() (body, hdr []byte, rel uint32, err error) {
 	if _, err = io.ReadFull(s.rw, s.rbuf[RecHdr:RecHdr+n]); err != nil {
 		return nil, nil, 0, err
 	}
-	s.rxOff += uint32(n)
+	s.rxOff += uint64(n)
 	return s.rbuf[RecHdr : RecHdr+n], s.rbuf[:RecHdr], rel, nil
 }
 
@@ -110,7 +126,7 @@ func (s *Stream) ReadRecord() (body, hdr []byte, rel uint32, err error) {
 // seal вызывается ДО записи в поток и получает смещение — то же неделимое правило, что в поддельном
 // TCP: выдать смещение, зашифровать им и отправить нужно как одно действие, иначе два пакета
 // уедут под одним nonce.
-func (s *Stream) WriteRecord(row []byte, plen int, seal func(rel uint32) error) error {
+func (s *Stream) WriteRecord(row []byte, plen int, seal func(rel uint64) error) error {
 	if seal != nil {
 		if err := seal(s.txOff); err != nil {
 			return err
@@ -118,6 +134,6 @@ func (s *Stream) WriteRecord(row []byte, plen int, seal func(rel uint32) error) 
 	}
 	rec := row[HdrRoom-RecHdr : HdrRoom-RecHdr+plen]
 	n, err := s.rw.Write(rec)
-	s.txOff += uint32(n)
+	s.txOff += uint64(n)
 	return err
 }

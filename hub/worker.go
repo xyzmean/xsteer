@@ -561,12 +561,16 @@ func (w *worker) sendTo(d *session, row []byte, plen int) {
 	}
 	// Сессия по НАСТОЯЩЕМУ потоку: резать запись на сегменты не нужно, это работа ядра.
 	if d.st != nil {
+		// Заворота nonce здесь больше не может быть: смещение в потоке 64-битное (см. шапку
+		// wire.Stream), поэтому ни закрывать поток, ни менять ключи по объёму не нужно. Ветка
+		// поддельного TCP ниже ретайрится по-прежнему, и там это неизбежно: nonce берётся из
+		// относительного номера последовательности TCP, а он 32-битный по своей природе.
 		rec := row[wire.HdrRoom-wire.RecHdr : wire.HdrRoom]
-		err := d.st.WriteRecord(row, wire.RecHdr+plen+wire.Tag, func(rel uint32) error {
+		err := d.st.WriteRecord(row, wire.RecHdr+plen+wire.Tag, func(rel uint64) error {
 			if err := wire.RecBuild(rec, plen+wire.Tag); err != nil {
 				return err
 			}
-			_, e := d.tx.Seal(row[wire.HdrRoom:wire.HdrRoom+plen+wire.Tag], plen, rec, uint64(rel))
+			_, e := d.tx.Seal(row[wire.HdrRoom:wire.HdrRoom+plen+wire.Tag], plen, rec, rel)
 			return e
 		})
 		if err != nil {
