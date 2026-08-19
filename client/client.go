@@ -667,78 +667,23 @@ func (c *Client) session(ctx context.Context, id int, dev tun.Device, devName st
 		mtuSay = int(c.mtuNow.Load())
 	}
 	// Постквантовый ключ в Hello — то, что делает его браузерного размера (1759 байт против 537).
-	// В режиме совместимости его нет: хаб на C собирать Hello из двух сегментов не умеет.
-	hello, err := hs.ClientHello(c.opt.Sec.Priv, c.hub.pub, c.opt.Conf.SNI, mtuSay, id,
-		c.opt.AESPreferred, !c.opt.NoBatch, nil)
-	if err != nil {
-		return fmt.Errorf("рукопожатие не собралось: %w", err)
-	}
-	// Hello уезжает ПО СЕГМЕНТАМ, как у браузера: он больше одного сегмента по построению.
-	// Отправлять его одним куском нельзя — такой пакет либо не дойдёт, либо приедет
-	// фрагментированным, и то и другое видно на проводе сразу.
-	maxSeg := wire.MTUDefault + wire.Overhead - 40
-	for off := 0; off < len(hello); off += maxSeg {
-		end := off + maxSeg
-		if end > len(hello) {
-			end = len(hello)
-		}
-		if err := conn.Send(link.PSH|link.ACK, hello[off:end]); err != nil {
-			return err
-		}
-	}
-
-	// Ответ хаба приходит одним сегментом: он собран так, чтобы влезть. Но склеить два мы всё
-	// равно умеем — дешевле, чем однажды не понять, почему рукопожатие не проходит на канале с
-	// меньшим MSS.
-	var acc []byte
-	hsDeadline := time.Now().Add(5 * time.Second)
-	for {
-		if time.Now().After(hsDeadline) || ctx.Err() != nil {
-			return fmt.Errorf("хаб %s не ответил на рукопожатие", c.hub.str)
-		}
-		ok, err := conn.WaitRead(200 * time.Millisecond)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			continue
-		}
-		seg, mine, err := conn.Recv(buf)
-		if err != nil {
-			return err
-		}
-		if !mine {
-			continue
-		}
-		data, err := conn.OnSeg(&seg)
-		if err != nil {
-			return err
-		}
-		if !data {
-			continue
-		}
-		acc = append(acc, seg.Payload...)
-		s.tx, s.rx, _, err = hs.ClientFinish(acc)
-		if errors.Is(err, noise.ErrFormat) && len(acc) < 2*wire.Row {
-			continue // ждём остаток
-		}
-		if err != nil {
-			return fmt.Errorf("хаб не признал нас или ответил не тем: %w", err)
-		}
-		break
-	}
-	confirm, err := hs.ClientConfirm(s.tx)
+	// В режиме совместимости его нет: хаб на C собирать Hello из двух сегментов не умеет. Само
+	// рукопожатие — общее с режимом потока: см. doClientHandshake. Здесь только рамка поддельного
+	// TCP: Hello режется на сегменты (сегмент — MTU туннеля плюс накладные минус заголовки IP/TCP),
+	// а ответ собирается из принятых сегментов.
+	t := &fakeHello{conn: conn, buf: buf, ctx: ctx,
+		deadline: time.Now().Add(5 * time.Second),
+		maxSeg:   wire.MTUDefault + wire.Overhead - 40}
+	hres, err := c.doClientHandshake(hs, t, mtuSay, id, !c.opt.NoBatch)
 	if err != nil {
 		return err
 	}
-	if err := conn.Send(link.PSH|link.ACK, confirm); err != nil {
-		return err
-	}
+	s.tx, s.rx = hres.tx, hres.rx
 
 	// СОГЛАСОВАНИЕ MTU, ступень первая: минимум из пределов сторон — «максимальное для обоих
 	// устройств». Ступень вторая (проверка самого пути пробами) начинается ниже, потому что канал
 	// у обоих может быть шире, чем путь между ними.
-	peerMTU := int(hs.Peer.MTU)
+	peerMTU := int(hres.peer.MTU)
 	s.mtuAgreed = wire.MTUDefault
 	if s.mtuLimit > 0 {
 		s.mtuAgreed = s.mtuLimit

@@ -242,6 +242,39 @@ type worker struct {
 	rlUnknown, rlStamp, rlProbe wire.RateLog
 }
 
+// Опознание пира и защита от воспроизведения — общие для обеих половин хаба (поддельный TCP и
+// поток). Логика одна; различаются лишь журнал (у воркера с ограничителем частоты, у потока
+// простой) и что делать при отказе (освободить сессию или закрыть соединение), поэтому вынесены
+// именно эти три шага, а решения оставлены на месте вызова.
+
+// findPeer — индекс пира по его статическому ключу, или -1. Линейный обход: раз на рукопожатие.
+func (h *Hub) findPeer(pub [32]byte) int {
+	for i := range h.opt.Conf.Peers {
+		if h.opt.Conf.Peers[i].Pub == pub {
+			return i
+		}
+	}
+	return -1
+}
+
+// replayFresh — метка времени msg1 новее прошлой от этого пира (или прошлой ещё не было). Ложь
+// означает воспроизведение записанного msg1: сессию оно не даёт (подтверждение не подделать), но
+// стоит хабу трёх зря потраченных X25519, поэтому обрывается заранее.
+func (h *Hub) replayFresh(peer int, stamp uint64) bool {
+	h.ctl.Lock()
+	seen := h.lastStamp[peer]
+	h.ctl.Unlock()
+	return stamp == 0 || stamp >= seen
+}
+
+// commitStamp запоминает метку времени пира. Общая для всех воркеров: один пир приходит с разных
+// портов, то есть к разным воркерам, и защита обязана быть общей.
+func (h *Hub) commitStamp(peer int, stamp uint64) {
+	h.ctl.Lock()
+	h.lastStamp[peer] = stamp
+	h.ctl.Unlock()
+}
+
 func (h *Hub) logf(f string, a ...any) {
 	if h.opt.Logf != nil {
 		h.opt.Logf(f, a...)

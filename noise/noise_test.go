@@ -83,6 +83,50 @@ func runHandshake(t *testing.T, aes bool, mtuC, mtuH, connID int) (
 	return
 }
 
+// ResponseComplete обязан узнавать конец ответа по одной рамке записей и НЕ раньше времени: на
+// этом держится право звать ClientFinish ровно один раз. Проверяем на настоящем ответе хаба, что на
+// каждом неполном префиксе он молчит, а на полном ответе (и с лишними данными за ним) говорит «да».
+func TestResponseComplete(t *testing.T) {
+	cPriv, _ := keypair(t, 1)
+	hPriv, hPub := keypair(t, 2)
+	cli, hub := &HS{}, &HS{}
+	hello, err := cli.ClientHello(cPriv, hPub, "www.microsoft.com", 1439, 0, true, true,
+		seeded{rand.New(rand.NewSource(11))})
+	if err != nil {
+		t.Fatalf("ClientHello: %v", err)
+	}
+	if err := hub.ServerRead(hPriv, hello, seeded{rand.New(rand.NewSource(22))}); err != nil {
+		t.Fatalf("ServerRead: %v", err)
+	}
+	resp, _, _, err := hub.ServerWrite(1439)
+	if err != nil {
+		t.Fatalf("ServerWrite: %v", err)
+	}
+
+	// Каждый префикс короче полного — незакончен.
+	for i := 0; i < len(resp); i++ {
+		if ResponseComplete(resp[:i]) {
+			t.Fatalf("ResponseComplete сказал «готово» на %d из %d байт", i, len(resp))
+		}
+	}
+	// Полный ответ — готов.
+	if !ResponseComplete(resp) {
+		t.Fatal("ResponseComplete не узнал полный ответ")
+	}
+	// С данными вплотную за подтверждением — тоже готов (граница определяется рамкой записи-fin, а
+	// не концом буфера): именно так ответ и приходит по потоку, где следом уже едут записи данных.
+	withData := append(append([]byte{}, resp...), 0x17, 0x03, 0x03, 0x00, 0x30)
+	if !ResponseComplete(withData) {
+		t.Fatal("ResponseComplete не узнал ответ, за которым уже идут данные")
+	}
+
+	// И самое главное: разбор один раз на полном ответе сходится (тот же путь, что в обоих
+	// транспортах после ResponseComplete).
+	if _, _, _, err := cli.ClientFinish(resp); err != nil {
+		t.Fatalf("ClientFinish на полном ответе: %v", err)
+	}
+}
+
 func TestРукопожатиеЦеликом(t *testing.T) {
 	for _, aes := range []bool{true, false} {
 		name := "ChaCha20-Poly1305"

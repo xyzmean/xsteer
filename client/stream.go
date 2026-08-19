@@ -52,6 +52,10 @@ func (c *Client) streamSession(ctx context.Context, id int, dev tun.Device) erro
 		// Без задержки Нейгла: мелкий кадр (внутреннее подтверждение, проба, keepalive) не должен
 		// ждать, пока наберётся сегмент. Задержка здесь стоила бы кругов внутреннему TCP.
 		_ = tc.SetNoDelay(true)
+		// Буферы сокета побольше: на канале с большим произведением полосы на задержку окно TCP
+		// упирается в буфер по умолчанию раньше, чем в сам канал. Пожелание — ядро вправе урезать.
+		_ = tc.SetReadBuffer(wire.SockBuf)
+		_ = tc.SetWriteBuffer(wire.SockBuf)
 	}
 	c.logf("соединение %d: поток к %s открыт", id, addr)
 
@@ -63,59 +67,22 @@ func (c *Client) streamSession(ctx context.Context, id int, dev tun.Device) erro
 	if c.opt.Conf.MTU > 0 && c.opt.Conf.MTU < mtuSay {
 		mtuSay = c.opt.Conf.MTU
 	}
-	hello, err := hs.ClientHello(c.opt.Sec.Priv, c.hub.pub, c.opt.Conf.SNI, mtuSay, id,
-		c.opt.AESPreferred, true, nil)
-	if err != nil {
-		return fmt.Errorf("рукопожатие не собралось: %w", err)
-	}
-	// Hello уходит одним вызовом: резать его на сегменты — дело ядра, и оно делает это так же, как
-	// у браузера, у которого Hello тоже не влезает в один сегмент.
+	// Само рукопожатие — общее с поддельным TCP (см. doClientHandshake). Здесь только рамка потока:
+	// Hello уходит одним вызовом (резать его на сегменты — дело ядра), ответ собирается запись за
+	// записью. Крышка по времени на всё рукопожатие: чтения потока блокирующие и про контекст не
+	// знают.
 	_ = nc.SetDeadline(time.Now().Add(15 * time.Second))
-	if err := st.WriteRaw(hello); err != nil {
-		return err
-	}
-
-	// Ответ хаба собирается ЗАПИСЬ ЗА ЗАПИСЬЮ до конца: разбор вбирает прочитанное в транскрипт, и
-	// вызвать его на неполном ответе значило бы посчитать часть дважды. Конец узнаём по последней
-	// записи — подтверждению: у неё известная длина.
-	acc := make([]byte, 0, 4096)
-	for i := 0; i < 8; i++ {
-		var hdr [wire.RecHdr]byte
-		if err := st.ReadFull(hdr[:]); err != nil {
-			return fmt.Errorf("хаб не ответил на рукопожатие: %w", err)
-		}
-		n := int(hdr[3])<<8 | int(hdr[4])
-		if n < 1 || n > wire.MaxRecord {
-			return fmt.Errorf("хаб ответил не тем: запись длиной %d", n)
-		}
-		body := make([]byte, n)
-		if err := st.ReadFull(body); err != nil {
-			return err
-		}
-		acc = append(acc, hdr[:]...)
-		acc = append(acc, body...)
-		// Подтверждение — запись данных ровно этой длины; она в ответе последняя.
-		if hdr[0] == 0x17 && n == noise.FinBody {
-			break
-		}
-	}
-	tx, rx, _, err := hs.ClientFinish(acc)
+	hres, err := c.doClientHandshake(hs, &streamHello{st: st}, mtuSay, id, true)
 	if err != nil {
-		return fmt.Errorf("хаб не признал нас или ответил не тем: %w", err)
-	}
-	confirm, err := hs.ClientConfirm(tx)
-	if err != nil {
-		return err
-	}
-	if err := st.WriteRaw(confirm); err != nil {
 		return err
 	}
 	_ = nc.SetDeadline(time.Time{})
+	tx, rx := hres.tx, hres.rx
 
 	// Согласование MTU: первая ступень та же — минимум пределов сторон. Второй (проб пути) в
 	// потоке нет: сегментацией распоряжается ядро.
 	mtu := mtuSay
-	if p := int(hs.Peer.MTU); p > 0 && p < mtu {
+	if p := int(hres.peer.MTU); p > 0 && p < mtu {
 		mtu = p
 	}
 	// Ратчет эпох включается ДО первой записи данных и на обоих направлениях: номер эпохи
