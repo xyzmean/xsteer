@@ -161,8 +161,11 @@ func (h *Hub) streamConn(ctx context.Context, nc net.Conn) {
 	if tx.Kind() == noise.AEADAES128 {
 		kind = "AES-128-GCM"
 	}
-	h.logf("пир %s поднялся потоком с %s, MTU %d, шифр %s",
-		conf.KeyFP(h.opt.Conf.Peers[found].Pub), peerAddr, peerMTU, kind)
+	// Ратчет эпох — на обоих направлениях и до первой записи данных, как и у пира.
+	tx.EnableEpochs()
+	rx.EnableEpochs()
+	h.logf("пир %s поднялся потоком с %s, MTU %d, шифр %s, ключи меняются каждые %d МиБ",
+		conf.KeyFP(h.opt.Conf.Peers[found].Pub), peerAddr, peerMTU, kind, noise.EpochBytes>>20)
 
 	// Воркер на соединение: он нужен обработке кадров как хозяин буфера пересылки и очереди
 	// устройства. Заводить его на соединение дешевле, чем протаскивать эти две вещи параметрами

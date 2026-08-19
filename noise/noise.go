@@ -216,7 +216,14 @@ func (hs *HS) decryptAndHash(ct []byte) ([]byte, error) {
 // направление. Направления названы от инициатора: i2r и r2i.
 func (hs *HS) split() (i2r, r2i *Keys, err error) {
 	prk := hkdf.Extract(sha256.New, nil, hs.ck[:])
-	var out [88]byte
+	// Сто пятьдесят два байта вместо восьмидесяти восьми: за ключами и iv двух направлений идут
+	// корни эпох, по одному на направление (см. noise/epoch.go).
+	//
+	// Первые 88 байт при этом ТЕ ЖЕ САМЫЕ: HKDF-Expand — поток (T1||T2||…), и запрос большего
+	// числа байт не меняет уже выданные. Поэтому поддельный TCP и реализация на C, которые про
+	// эпохи ничего не знают, продолжают считать в точности прежние ключи — совместимость на
+	// проводе не тронута.
+	var out [152]byte
 	if _, err := io.ReadFull(hkdf.Expand(sha256.New, prk, []byte("xsteer split")), out[:]); err != nil {
 		return nil, nil, ErrCrypto
 	}
@@ -226,6 +233,8 @@ func (hs *HS) split() (i2r, r2i *Keys, err error) {
 	if r2i, err = newKeys(hs.aead, out[44:76], out[76:88]); err != nil {
 		return nil, nil, err
 	}
+	copy(i2r.root[:], out[88:120])
+	copy(r2i.root[:], out[120:152])
 	// Ключ шага больше не нужен: Split — его последнее применение.
 	hs.k = nil
 	return i2r, r2i, nil

@@ -118,7 +118,13 @@ func (c *Client) streamSession(ctx context.Context, id int, dev tun.Device) erro
 	if p := int(hs.Peer.MTU); p > 0 && p < mtu {
 		mtu = p
 	}
-	c.logf("соединение %d: рукопожатие прошло, шифр %s, MTU %d (поток)", id, tx.Kind(), mtu)
+	// Ратчет эпох включается ДО первой записи данных и на обоих направлениях: номер эпохи
+	// считается из смещения, и сторона, включившая его позже, разошлась бы с другой (см.
+	// noise/epoch.go). На проводе от этого не меняется ни один байт.
+	tx.EnableEpochs()
+	rx.EnableEpochs()
+	c.logf("соединение %d: рукопожатие прошло, шифр %s, MTU %d (поток), ключи меняются каждые %d МиБ",
+		id, tx.Kind(), mtu, noise.EpochBytes>>20)
 	if id == 0 {
 		c.applyMTU(dev, dev.Name(), mtu, "согласовано в рукопожатии (поток)")
 	}

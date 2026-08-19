@@ -88,6 +88,17 @@ type Keys struct {
 	aead cipher.AEAD
 	iv   [12]byte
 	kind AEAD
+
+	// ---- эпохи: периодическая смена ключей без единого байта на проводе (см. epoch.go) ----
+	//
+	// Пока epochsOn ложно, всё поведение ровно прежнее: те же ключи на всё соединение. Включает
+	// его только режим потока, и только после рукопожатия.
+	epochsOn bool
+	root     [32]byte // корень текущей эпохи; ратчетится вперёд и стирается за собой
+	epoch    uint64
+	prevAEAD cipher.AEAD // одна ступень назад: запись на границе эпох не должна стоить обрыва
+	prevIV   [12]byte
+	prevOK   bool
 }
 
 var errCrypto = errors.New("noise: сбой примитива")
@@ -119,8 +130,11 @@ func (k *Keys) Kind() AEAD { return k.kind }
 
 // nonce = iv XOR seq, ровно как в TLS 1.3 (RFC 8446 §5.3). Совпадение с wire.Nonce обязательно —
 // там тот же вывод для 32-битного смещения, и тест сверяет их между собой.
-func (k *Keys) nonce(seq uint64) [12]byte {
-	n := k.iv
+func (k *Keys) nonce(seq uint64) [12]byte { return k.nonceWith(k.iv, seq) }
+
+// nonceWith — тот же вывод, но на названном iv: нужен прошлой эпохе, у которой свой iv.
+func (k *Keys) nonceWith(iv [12]byte, seq uint64) [12]byte {
+	n := iv
 	for i := 0; i < 8; i++ {
 		n[11-i] ^= byte(seq >> (8 * i))
 	}
@@ -138,6 +152,13 @@ func (k *Keys) Seal(buf []byte, n int, aad []byte, seq uint64) ([]byte, error) {
 	if cap(buf) < n+k.aead.Overhead() {
 		return nil, fmt.Errorf("noise: буфер без места под тег")
 	}
+	// Эпоха записи определяется её смещением, и получатель посчитает ту же самую: номер эпохи
+	// нигде не передаётся.
+	if k.epochsOn {
+		if err := k.toEpoch(epochOf(seq)); err != nil {
+			return nil, err
+		}
+	}
 	nc := k.nonce(seq)
 	return k.aead.Seal(buf[:0], nc[:], buf[:n], aad), nil
 }
@@ -148,6 +169,28 @@ func (k *Keys) Seal(buf []byte, n int, aad []byte, seq uint64) ([]byte, error) {
 // подделанный пакет, его отбрасывают счётчиком и соединение НЕ рвут. Спутать это с «сломался
 // шифр» значило бы рвать туннель от одного случайного пакета с публичного порта.
 func (k *Keys) Open(buf []byte, aad []byte, seq uint64) ([]byte, error) {
+	if k.epochsOn {
+		e := epochOf(seq)
+		switch {
+		case e == k.epoch:
+			// обычный случай — текущая эпоха
+		case k.prevOK && e+1 == k.epoch:
+			// Запись прошлой эпохи: расшифровываем прошлым ключом и НЕ откатываем состояние.
+			nc := k.nonceWith(k.prevIV, seq)
+			out, err := k.prevAEAD.Open(buf[:0], nc[:], buf, aad)
+			if err != nil {
+				return nil, ErrAuth
+			}
+			return out, nil
+		case e > k.epoch:
+			if err := k.toEpoch(e); err != nil {
+				return nil, err
+			}
+		default:
+			// Слишком старая эпоха: её ключи стёрты — в этом и смысл ратчета.
+			return nil, ErrAuth
+		}
+	}
 	nc := k.nonce(seq)
 	out, err := k.aead.Open(buf[:0], nc[:], buf, aad)
 	if err != nil {
