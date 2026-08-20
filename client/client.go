@@ -145,6 +145,44 @@ const (
 	reasmGrowMS = 3000
 )
 
+// ---- потолок MTU и буфер продолжения разрезанной записи ----------------------
+//
+// Числа выведены одно из другого и стоят рядом — то же правило, что у размеров в шапке wire.go и у
+// того же потолка в хабе (hub.mtuCeil): иначе одно поправят, а второе останется, и расхождение
+// проявится как «мелкие пакеты ходят, крупные молча пропадают», худший класс отказов в диагностике.
+const (
+	// mtuCeil — потолок РАБОЧЕГО MTU туннеля. Больше в кадр Ethernet вместе с нашими накладными не
+	// влезает, поэтому это же число зажимает всё, что приходит извне: MTU чужого устройства
+	// (devMTU), число из конфигурации и результат пробоя пути (applyMTU).
+	mtuCeil = wire.MTUDefault
+	// maxSegCeil — самый большой сегмент, какой может получиться при разрезании записи: то же
+	// выражение, что считает sendFrames, но при предельном MTU. 1460 байт — ровно кадр 1500 минус
+	// заголовки IP и TCP, дальше некуда.
+	maxSegCeil = mtuCeil + wire.Overhead - 40
+	// contLen — размер буфера продолжения разрезанной записи (см. outbound и link.SendRecord):
+	// заголовок TCP плюс предельный сегмент.
+	//
+	// Считается ОТ ПОТОЛКА, а не от строки пакета на проводе, и это не косметика. Пока он был
+	// 20+Row = 1520, он держал рабочий MTU только до 1479 — а сверху MTU не проверялся вовсе:
+	// значение чужого устройства бралось как есть, с одним предупреждением в журнал. При MTU
+	// устройства 1480 и выше КАЖДАЯ разрезаемая запись отваливалась в «мал буфер под продолжение
+	// записи» и уходила в счётчик отброшенных молча. Теперь оба числа выведены из mtuCeil и
+	// разойтись не могут (I-089 в хабе — то же самое).
+	contLen = 20 + maxSegCeil
+)
+
+// clampMTU — зажать рабочий MTU потолком. Ноль и отрицательное значат «не выяснено» и дают потолок:
+// именно с него начинает согласование, а пробой пути опустит его, если путь уже.
+//
+// ОДНА ФУНКЦИЯ НА ВСЕ ВХОДЫ, и это главное в ней. Предупреждать о числе больше предела клиент умел и
+// раньше — не хватало ровно того, чтобы предупреждение чем-то заканчивалось.
+func clampMTU(mtu int) int {
+	if mtu <= 0 || mtu > mtuCeil {
+		return mtuCeil
+	}
+	return mtu
+}
+
 func nowMS() int64 { return time.Now().UnixNano() / int64(time.Millisecond) }
 
 func (c *Client) logf(f string, a ...any) {
@@ -202,10 +240,15 @@ func Run(ctx context.Context, opt Options) error {
 		conns = len(devs)
 	}
 
-	// MTU: начинаем с того, что задано (или с потолка), а согласование пути поправит.
-	mtu := opt.Conf.MTU
-	if mtu == 0 {
-		mtu = wire.MTUDefault
+	// MTU: начинаем с того, что задано (или с потолка), а согласование пути поправит. Число из
+	// конфигурации зажимается тем же потолком, что и всё остальное: конфигурация принимает MTU до
+	// 1500 (conf.go, «576..1500»), то есть человек может написать туда MTU КАНАЛА вместо MTU
+	// туннеля — оба ведь называются «MTU», — и без потолка это давало отвал каждой разрезаемой
+	// записи.
+	mtu := clampMTU(opt.Conf.MTU)
+	if opt.Conf.MTU > mtuCeil {
+		c.logf("MTU %d из настроек больше предела %d для канала 1500 — работаю на %d",
+			opt.Conf.MTU, mtuCeil, mtu)
 	}
 	if !opt.Managed {
 		cidr := fmt.Sprintf("%s/%d", ip4str(opt.Conf.Addr), opt.Conf.AddrPlen)
@@ -271,12 +314,7 @@ func Run(ctx context.Context, opt Options) error {
 		}
 	} else {
 		if got := tun.DevMTU(name); got > 0 {
-			mtu = got
-			c.logf("%s: устройством владеет кто-то другой, MTU %d (накладные %d)", name, mtu, wire.Overhead)
-			if got > wire.MTUDefault {
-				c.logf("ВНИМАНИЕ: MTU %d больше предела %d для канала 1500 — большие пакеты будут "+
-					"пропадать; поставьте %d", got, wire.MTUDefault, wire.MTUDefault)
-			}
+			mtu = c.devMTU(name, got)
 		}
 	}
 	c.mtuNow.Store(int64(mtu))
@@ -673,7 +711,7 @@ func (c *Client) session(ctx context.Context, id int, dev tun.Device, devName st
 	// а ответ собирается из принятых сегментов.
 	t := &fakeHello{conn: conn, buf: buf, ctx: ctx,
 		deadline: time.Now().Add(5 * time.Second),
-		maxSeg:   wire.MTUDefault + wire.Overhead - 40}
+		maxSeg:   maxSegCeil}
 	hres, err := c.doClientHandshake(hs, t, mtuSay, id, !c.opt.NoBatch)
 	if err != nil {
 		return err
@@ -740,7 +778,7 @@ func (c *Client) session(ctx context.Context, id int, dev tun.Device, devName st
 // замерено, 255 Мбит/с против 1582 на том же коде и том же железе.
 func (c *Client) outbound(ctx context.Context, id int, s *sess, dev tun.Device) {
 	row := make([]byte, wire.HdrRoom+wire.MaxRecord+wire.Tag)
-	scratch := make([]byte, 20+wire.Row)
+	scratch := make([]byte, contLen)
 	// Кадры пачки лежат в одной плоской памяти: она копируется в запись при сборке, поэтому
 	// отдельные буферы нужны только до этого момента.
 	slab := make([]byte, wire.BatchFramesMax*wire.MTUDefault)
@@ -826,7 +864,8 @@ func (c *Client) sendFrames(s *sess, row, scratch []byte, frames [][]byte, mtu i
 		}
 	}
 	// Сегмент не больше того, что несёт путь: MTU туннеля плюс наши же накладные минус заголовки
-	// IP и TCP. Ровно это число согласовано пробами, и превышать его нельзя.
+	// IP и TCP. Ровно это число согласовано пробами, и превышать его нельзя. Не больше maxSegCeil:
+	// mtu зажат потолком на всех входах (clampMTU), из того же потолка выведен и буфер продолжения.
 	maxSeg := mtu + wire.Overhead - 40
 	rec := row[wire.HdrRoom-wire.RecHdr : wire.HdrRoom]
 	return s.conn.SendRecord(row, wire.RecHdr+n+wire.Tag, maxSeg, scratch, func(rel uint32) error {
@@ -1154,9 +1193,33 @@ func (c *Client) probeDone(s *sess, id int, dev tun.Device, devName string) {
 	}
 }
 
+// devMTU — рабочий MTU по устройству, которым владеет КТО-ТО ДРУГОЙ (служба системы, графический
+// клиент). Своего мы там не ставим: адрес, MTU и маршруты заданы не нами.
+//
+// Значение ЗАЖИМАЕТСЯ потолком, а не просто сопровождается предупреждением. Предупреждение здесь
+// было и раньше, и оно честное: пакеты действительно пропадают. Но пропадали они не потому, что
+// устройство отдаёт слишком крупные кадры (их режет сам путь), а потому, что по этому числу
+// считался предельный сегмент, под который не хватало буфера продолжения записи, — то есть КАЖДАЯ
+// разрезаемая запись отваливалась у нас же, не дойдя до провода. Настройку чужого устройства мы
+// поправить не вправе, а собственный предел обязаны соблюдать сами.
+func (c *Client) devMTU(name string, got int) int {
+	mtu := clampMTU(got)
+	c.logf("%s: устройством владеет кто-то другой, MTU %d (накладные %d)", name, got, wire.Overhead)
+	if mtu != got {
+		c.logf("ВНИМАНИЕ: MTU %d больше предела %d для канала 1500 — большие пакеты будут "+
+			"пропадать; работаю на %d, поставьте столько же в настройках устройства",
+			got, mtuCeil, mtu)
+	}
+	return mtu
+}
+
 // applyMTU ставит устройству новый MTU. Значение, заданное человеком в конфигурации, никогда не
 // превышается: если он написал 1380, мы не поставим 1431, даже если путь его несёт.
 func (c *Client) applyMTU(dev tun.Device, devName string, mtu int, why string) {
+	// Потолок и здесь: applyMTU — единственная дверь, через которую значение попадает и на
+	// устройство, и в mtuNow, откуда его берёт отправка. Согласование выше него не поднимается по
+	// построению, но проверка стоит там, где значение применяется, а не там, где считается.
+	mtu = clampMTU(mtu)
 	if cap := c.opt.Conf.MTU; cap > 0 && mtu > cap {
 		mtu = cap
 	}
