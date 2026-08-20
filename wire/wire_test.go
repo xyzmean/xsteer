@@ -491,14 +491,70 @@ func TestПачкаКадров(t *testing.T) {
 	if BatchBuild(dst, frames[:1]) != 0 {
 		t.Error("один кадр упакован в контейнер")
 	}
-	// Битый контейнер обязан отвергаться целиком, а не разбираться до половины.
+	// Битый контейнер обязан отвергаться ЦЕЛИКОМ: обработчик не должен увидеть НИ ОДНОГО
+	// кадра. Портится длина ПОСЛЕДНЕГО кадра, а не первого: перед первым кадром префикса не
+	// бывает по построению, поэтому порча первой длины одинаково выглядит и при разборе в два
+	// прохода, и при разборе с доставкой по мере чтения — она это свойство не проверяет вовсе
+	// (I-063). И обработчик здесь СЧИТАЕТ, а не пустой.
 	bad := append([]byte(nil), dst[:n]...)
-	bad[1] = 0xFF
-	if BatchIter(bad, func([]byte) {}) {
-		t.Error("контейнер с завышенной длиной кадра принят")
+	lastLenAt := BatchHdr + 2 + len(frames[0]) + 2 + len(frames[1])
+	bad[lastLenAt] = 0xFF
+	delivered, bytesOut := 0, 0
+	count := func(f []byte) { delivered++; bytesOut += len(f) }
+	if BatchIter(bad, count) {
+		t.Error("контейнер с завышенной длиной последнего кадра принят")
 	}
-	if BatchIter(dst[:2], func([]byte) {}) {
+	if delivered != 0 || bytesOut != 0 {
+		t.Errorf("из битого контейнера доставлено %d кадров и %d байт, а обязан ноль",
+			delivered, bytesOut)
+	}
+
+	bad = append(bad[:0], dst[:n]...)
+	bad[1] = 0xFF // та же порча, но на длине ПЕРВОГО кадра
+	delivered, bytesOut = 0, 0
+	if BatchIter(bad, count) {
+		t.Error("контейнер с завышенной длиной первого кадра принят")
+	}
+	if delivered != 0 {
+		t.Errorf("из битого контейнера доставлено %d кадров, а обязан ноль", delivered)
+	}
+
+	delivered = 0
+	if BatchIter(dst[:2], count) {
 		t.Error("обрезок контейнера принят")
+	}
+	if delivered != 0 {
+		t.Errorf("из обрезка контейнера доставлено %d кадров, а обязан ноль", delivered)
+	}
+
+	// Предел на число кадров обязан действовать и на ПРИЁМЕ, а не только на сборке: контейнер
+	// на 8191 байт из однобайтовых кадров дал бы 2730 вызовов обработчика, тогда как законная
+	// пачка не бывает длиннее BatchFramesMax кадров ни в одной из реализаций.
+	over := make([][]byte, BatchFramesMax+1)
+	for i := range over {
+		over[i] = []byte{byte(0x50 + i)}
+	}
+	nlim := BatchBuild(dst, over[:BatchFramesMax])
+	if nlim == 0 {
+		t.Fatal("пачка предельного размера не собралась")
+	}
+	delivered = 0
+	if !BatchIter(dst[:nlim], count) {
+		t.Error("пачка предельного размера отвергнута")
+	}
+	if delivered != BatchFramesMax {
+		t.Errorf("из предельной пачки доставлено %d кадров, а клали %d", delivered, BatchFramesMax)
+	}
+	nover := BatchBuild(dst, over)
+	if nover == 0 {
+		t.Fatal("контейнер с лишним кадром не собрался")
+	}
+	delivered = 0
+	if BatchIter(dst[:nover], count) {
+		t.Errorf("контейнер из %d кадров принят при пределе %d", len(over), BatchFramesMax)
+	}
+	if delivered != 0 {
+		t.Errorf("из переполненного контейнера доставлено %d кадров, а обязан ноль", delivered)
 	}
 }
 
@@ -570,6 +626,23 @@ func TestСборкаРазрезаннойЗаписи(t *testing.T) {
 	_ = RecBuild(one, Tag+10)
 	if _, _, _, ok := r.Feed(5, 0, one); !ok {
 		t.Error("целая запись в одном сегменте не разобралась")
+	}
+
+	// Заявленная длина проверяется по пределу ФОРМАТА (MaxRecord), а не по пределу ПОЛЯ
+	// (0xFFFF). Иначе первый же сегмент с завышенной длиной заставляет держать буфер сборки
+	// до 64 КиБ на сессию, хотя записи длиннее MaxRecord мы не отправляем никогда, а тег
+	// такую подделку всё равно не пропустит — только позже. В Stream.ReadRecord и в реализации
+	// на C предел ровно такой.
+	r = Reasm{}
+	huge := make([]byte, RecMin+64)
+	huge[0], huge[1], huge[2] = recType, recV0, recV1
+	huge[3], huge[4] = byte((MaxRecord+1)>>8), byte((MaxRecord+1)&0xFF)
+	if _, _, _, ok := r.Feed(9, 0, huge); ok {
+		t.Error("запись с заявленной длиной больше MaxRecord принята")
+	}
+	if r.active {
+		t.Errorf("сборка начата по заявленной длине %d, хотя предел формата %d",
+			MaxRecord+1, MaxRecord)
 	}
 }
 
