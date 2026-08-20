@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 	"io"
 	"math/rand"
+	"sync"
 	"testing"
 	"time"
 
@@ -150,10 +151,9 @@ func newStand(t *testing.T) *stand {
 	st := &stand{t: t, h: h, dev: &fakeDev{}, raw: &fakeRaw{local: [4]byte{198, 51, 100, 1}}}
 	st.w = &worker{
 		id: 0, n: 1, h: h, dev: st.dev,
-		sess:    make(map[skey]*session),
-		row:     make([]byte, wire.HdrRoom+wire.MaxRecord+wire.Tag),
-		scratch: make([]byte, 20+wire.Row),
-		hbuf:    make([]byte, 2048),
+		sess: make(map[skey]*session),
+		row:  make([]byte, wire.HdrRoom+wire.MaxRecord+wire.Tag),
+		hbuf: make([]byte, 2048),
 	}
 
 	// SYN пира. Сессию заводим через link.Accept, а не через w.accept: тот открыл бы настоящий
@@ -242,16 +242,22 @@ func standHandshake(t *testing.T) (cliTX, cliRX, hubTX, hubRX *noise.Keys) {
 	return
 }
 
-// mkSeg собирает пакет так, как он приходит из сырого сокета: заголовок IP плюс сегмент.
+// mkSeg собирает пакет от ПЕРВОГО пира стенда.
 func (s *stand) mkSeg(seq uint32, flags byte, payload []byte) []byte {
-	src := [4]byte{203, 0, 113, 9}
+	return segPkt([4]byte{203, 0, 113, 9}, standSPort, seq, flags, payload)
+}
+
+// segPkt собирает пакет так, как он приходит из сырого сокета: заголовок IP плюс сегмент. Источник
+// задаётся параметрами: стенду нужны сегменты не только от первого пира — вторая сессия
+// поддельного TCP на том же воркере приходит с другого адреса и порта.
+func segPkt(src [4]byte, sport uint16, seq uint32, flags byte, payload []byte) []byte {
 	dst := [4]byte{198, 51, 100, 1}
 	tcp := make([]byte, 60+len(payload))
 	opts := link.OptNone
 	if flags&link.SYN != 0 {
 		opts = link.OptScale
 	}
-	n := link.BuildSeg(tcp, src, dst, standSPort, standListen, seq, 1, flags, opts, payload)
+	n := link.BuildSeg(tcp, src, dst, sport, standListen, seq, 1, flags, opts, payload)
 	pkt := make([]byte, 20+n)
 	pkt[0] = 0x45
 	binary.BigEndian.PutUint16(pkt[2:4], uint16(len(pkt)))
@@ -509,5 +515,136 @@ func TestКадрIPv6Отброшен(t *testing.T) {
 	}
 	if got := st.h.stats.dropped.Load(); got == dropped {
 		t.Errorf("кадр IPv6 отброшен без счётчика: dropped остался %d", got)
+	}
+}
+
+// ---- находка 6: общий буфер продолжения разрезанной записи --------------------
+
+// standTCPPeer — ещё одна сессия ПОДДЕЛЬНОГО TCP на том же воркере: свой сырой сокет, своё
+// соединение в StateEst, свои ключи.
+//
+// Нужна там, где проверяется общее МЕЖДУ сессиями (буферы воркера), а не содержимое записей:
+// разбирать отправленное здесь никто не будет, поэтому и рукопожатие берётся готовой парой ключей.
+// Сессия второго пира из newStand для этого не годится — она ведётся потоком, а поток не режет
+// записи на сегменты и буфера продолжения не касается.
+func standTCPPeer(t *testing.T, sport uint16, mtu int) (*session, *fakeRaw) {
+	t.Helper()
+	src := [4]byte{203, 0, 113, 10}
+	raw := &fakeRaw{local: [4]byte{198, 51, 100, 1}}
+	syn, ok := link.ParseSeg(segPkt(src, sport, standISN, link.SYN, nil))
+	if !ok {
+		t.Fatal("SYN второй сессии не разобрался")
+	}
+	conn, err := link.Accept(raw, &syn, standListen, 0x30000000)
+	if err != nil {
+		t.Fatalf("link.Accept: %v", err)
+	}
+	ack, ok := link.ParseSeg(segPkt(src, sport, standISN+1, link.ACK, nil))
+	if !ok {
+		t.Fatal("ACK второй сессии не разобрался")
+	}
+	if _, err := conn.OnSeg(&ack); err != nil {
+		t.Fatalf("OnSeg(ACK): %v", err)
+	}
+	if conn.State() != link.StateEst {
+		t.Fatalf("вторая сессия не поднялась: состояние %d", conn.State())
+	}
+	_, _, hubTX, _ := standHandshake(t)
+	return &session{conn: conn, tx: hubTX, phase: phEst, peer: 1, connID: 1,
+		mtu: mtu, batchMax: 1}, raw
+}
+
+// TestОтправкаВДвеСессииНеДелитБуфер: два одновременных sendTo ОДНОГО воркера в РАЗНЫЕ сессии.
+//
+// Буфер продолжения разрезанной записи принадлежал воркеру, а защищён был замком сессии-получателя.
+// У двух получателей это два разных замка, поэтому один и тот же буфер писали одновременно: хвост
+// записи уезжал пиру с чужими байтами, у него не сходился тег AEAD, и запись пропадала молча.
+// Достижимо штатно и без всякой злой воли — кадр предельного размера пиру с меньшим согласованным
+// MTU режется на сегменты, а цикл TUN в это же время везёт пачку другому пиру.
+//
+// Рядом в коде замысел уже был записан: row в tunLoop заведён локально в горутине именно затем,
+// чтобы не делить его с горутиной приёма. Буфер продолжения из этого замысла просто выпал.
+//
+// Тест смотрит детектором гонок, поэтому строки буфера у горутин РАЗНЫЕ — иначе детектор поймал бы
+// row и до буфера продолжения не дошёл бы.
+func TestОтправкаВДвеСессииНеДелитБуфер(t *testing.T) {
+	st := newStand(t)
+	// Пир с меньшим MTU: у него запись режется на большее число сегментов, то есть в буфер
+	// продолжения пишется чаще.
+	d2, raw2 := standTCPPeer(t, standSPort+1, wire.MTUFloor)
+
+	// Запись, которая гарантированно режется у обоих: 4000 + 21 больше и 1460 (MTUDefault),
+	// и 1221 (MTUFloor).
+	const plen = 4000
+	send := func(d *session, fill byte) {
+		row := make([]byte, wire.HdrRoom+wire.MaxRecord+wire.Tag)
+		for i := range row {
+			row[i] = fill
+		}
+		for i := 0; i < 100; i++ {
+			st.w.sendTo(d, row, plen)
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); send(st.s, 0xA5) }()
+	go func() { defer wg.Done(); send(d2, 0x5A) }()
+	wg.Wait()
+
+	// Контроль: обе сессии действительно отправляли, то есть гонка была на живом пути, а не на
+	// ветке отказа.
+	if got := st.h.stats.txPkts.Load(); got != 200 {
+		t.Errorf("отправлено записей %d, ждали 200 — путь до буфера продолжения не пройден", got)
+	}
+	if got := st.h.stats.dropped.Load(); got != 0 {
+		t.Errorf("отброшено %d записей — отправка не дошла до разрезания", got)
+	}
+	// И главное для этого теста: записи ДЕЙСТВИТЕЛЬНО резались. Без разрезания буфер продолжения
+	// не трогается вовсе, и проверка стала бы пустой, ничего об этом не сказав.
+	if got := len(raw2.sent) - 1; got < 200 { // минус SYN-ACK
+		t.Errorf("пир с MTU %d получил %d сегментов на 100 записей — разрезания не было",
+			wire.MTUFloor, got)
+	}
+}
+
+// ---- находка 7: потолок согласованного MTU -----------------------------------
+
+// TestMTUИзПроводаЗажатПотолком: тот же служебный кадр, но с числом СВЕРХУ.
+//
+// Нижнюю границу проверяли (находка 4), верхней не было: значение из провода зажималось только
+// числом из конфигурации, а конфигурация принимает MTU до 1500. При хабе с MTU 1480..1500 и пире,
+// назвавшем столько же, maxSeg выходил больше предельного сегмента канала, и КАЖДАЯ разрезаемая
+// запись отваливалась в «мал буфер под продолжение записи» — то есть туннель нёс мелкие пакеты и
+// молча терял крупные, худший класс отказов в диагностике.
+//
+// Потолок один и тот же и для числа из провода, и для числа из конфигурации: MTUDefault — это
+// 1500 минус наши накладные, больше физически не влезает в кадр Ethernet.
+func TestMTUИзПроводаЗажатПотолком(t *testing.T) {
+	st := newStand(t)
+	st.h.opt.Conf.MTU = wire.LinkMax // хаб настроен по MTU КАНАЛА, а не туннеля
+	s := st.s
+
+	pt := make([]byte, 3)
+	for _, mv := range []int{wire.MTUDefault + 1, 1480, wire.LinkMax, 9000} {
+		wire.MTUBuild(pt, mv)
+		st.w.onCtl(s, pt)
+		if s.mtu != wire.MTUDefault {
+			t.Errorf("MTU %d из провода принят как есть: mtu = %d, ждали потолок %d",
+				mv, s.mtu, wire.MTUDefault)
+		}
+	}
+
+	// И главное: с таким MTU разрезаемая запись обязана уехать, а не попасть в счётчик отброшенных.
+	row := make([]byte, wire.HdrRoom+wire.MaxRecord+wire.Tag)
+	dropped := st.h.stats.dropped.Load()
+	before := len(st.raw.sent)
+	st.w.sendTo(s, row, 4000)
+	if got := st.h.stats.dropped.Load(); got != dropped {
+		t.Errorf("разрезаемая запись отброшена при согласованном MTU %d: dropped %d → %d",
+			s.mtu, dropped, got)
+	}
+	if n := len(st.raw.sent) - before; n < 2 {
+		t.Errorf("запись 4000 байт уехала %d сегментами — разрезания не было", n)
 	}
 }

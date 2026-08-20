@@ -142,6 +142,11 @@ func (h *Hub) streamConn(ctx context.Context, nc net.Conn) {
 		batchMax: wire.BatchFramesMax, handshakeAt: time.Now(),
 	}
 	if peerMTU > 0 {
+		// Своим пределом зажимается и здесь: число приехало из провода, а по s.mtu считается
+		// подрезка MSS для трафика пир↔пир. Тот же потолок, что в worker.onCtl.
+		if peerMTU > own {
+			peerMTU = own
+		}
 		s.mtu = peerMTU
 	}
 	h.commitStamp(found, stamp)
@@ -162,7 +167,7 @@ func (h *Hub) streamConn(ctx context.Context, nc net.Conn) {
 	// устройства. Заводить его на соединение дешевле, чем протаскивать эти две вещи параметрами
 	// через весь путь данных, а память — восемь килобайт на пира.
 	w := &worker{h: h, row: make([]byte, wire.HdrRoom+wire.MaxRecord+wire.Tag),
-		scratch: make([]byte, 20+wire.Row), sess: map[skey]*session{}, sessMax: sessPerWorker(1)}
+		sess: map[skey]*session{}, sessMax: sessPerWorker(1)}
 	if len(h.dev) > 0 {
 		w.dev = h.dev[found%len(h.dev)]
 	}

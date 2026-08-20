@@ -432,9 +432,16 @@ func (w *worker) onCtl(s *session, pt []byte) {
 	// Итог согласования: пир проверил путь и называет рабочий размер. Берём минимум со своим
 	// пределом — больше него мы всё равно не отправим.
 	if mv := wire.MTUValue(pt); mv > 0 {
+		// ПОТОЛОК ОДИН И ТОТ ЖЕ для числа из провода и для числа из конфигурации, и пропускать
+		// его нельзя. Раньше конфигурация зажимала пира, а сама не зажималась ничем: MTU=1500 в
+		// файле (то есть MTU КАНАЛА вместо MTU туннеля — обычная описка, конфигурация такое
+		// принимает) плюс пир, назвавший столько же, давали maxSeg больше предельного сегмента, и
+		// каждая разрезаемая запись отваливалась в «мал буфер под продолжение записи» — молча, в
+		// счётчик отброшенных. Тот же класс, что нижняя граница ниже: число из провода проверяется
+		// против СВОИХ пределов, а не только против другого числа из настроек.
 		own := w.h.opt.Conf.MTU
-		if own == 0 {
-			own = wire.MTUDefault
+		if own <= 0 || own > mtuCeil {
+			own = mtuCeil
 		}
 		was := s.mtu
 		// НИЖНЯЯ ГРАНИЦА ОБЯЗАТЕЛЬНА, и она не про разумность значения. По этому числу запись
@@ -665,10 +672,16 @@ func (w *worker) sendTo(d *session, row []byte, plen int) {
 	rec := row[wire.HdrRoom-wire.RecHdr : wire.HdrRoom]
 	mtu := d.mtu
 	if mtu <= 0 {
-		mtu = wire.MTUDefault
+		mtu = mtuCeil
 	}
 	maxSeg := mtu + wire.Overhead - 40
-	err := d.conn.SendRecord(row, wire.RecHdr+plen+wire.Tag, maxSeg, w.scratch, func(rel uint32) error {
+	// Буфер продолжения — СЕССИИ, а не воркера: он защищён этим самым замком, и держать его у
+	// воркера значило бы отдать один буфер под два разных замка. Почему лениво и почему это
+	// единственное верное место — в шапке поля session.cont.
+	if d.cont == nil {
+		d.cont = make([]byte, contLen)
+	}
+	err := d.conn.SendRecord(row, wire.RecHdr+plen+wire.Tag, maxSeg, d.cont, func(rel uint32) error {
 		if err := wire.RecBuild(rec, plen+wire.Tag); err != nil {
 			return err
 		}
