@@ -9,10 +9,12 @@ package hub
 // длиннее строки буфера, поддельный SYN в живую сессию, MTU из провода).
 
 import (
+	"context"
 	"encoding/binary"
 	"io"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +24,7 @@ import (
 	"github.com/xyzmean/xsteer/link"
 	"github.com/xyzmean/xsteer/noise"
 	"github.com/xyzmean/xsteer/route"
+	"github.com/xyzmean/xsteer/tun"
 	"github.com/xyzmean/xsteer/wire"
 )
 
@@ -168,7 +171,8 @@ func newStand(t *testing.T) *stand {
 		t.Fatalf("link.Accept: %v", err)
 	}
 	st.k = skey{addr: [4]byte{203, 0, 113, 9}, port: standSPort}
-	st.s = &session{conn: conn, phase: phSyn, peer: -1, connID: -1, batchMax: 2}
+	st.s = &session{conn: conn, phase: phSyn, peer: -1, connID: -1}
+	st.s.batchMax.Store(2)
 	st.w.sess[st.k] = st.s
 	st.seq = standISN + 1 // SYN занял один номер
 
@@ -211,8 +215,9 @@ func newStand(t *testing.T) *stand {
 	_, _, dstTX, _ := standHandshake(t)
 	st.dst = &session{
 		st: wire.NewStream(st.dsnk), tx: dstTX, phase: phEst, peer: 1, connID: 0,
-		mtu: wire.MTUDefault, batchMax: 1,
 	}
+	st.dst.mtu.Store(wire.MTUDefault)
+	st.dst.batchMax.Store(1)
 	h.peerSess[1][0].Store(st.dst)
 	return st
 }
@@ -459,24 +464,24 @@ func TestMTUИзПроводаПроверяетсяНаНиз(t *testing.T) {
 	pt := make([]byte, 3)
 	wire.MTUBuild(pt, 1300)
 	st.w.onCtl(s, pt)
-	if s.mtu != 1300 {
-		t.Fatalf("законный MTU 1300 не применился: mtu = %d", s.mtu)
+	if got := s.mtu.Load(); got != 1300 {
+		t.Fatalf("законный MTU 1300 не применился: mtu = %d", got)
 	}
 
 	for _, mv := range []int{1, 100, wire.MTUFloor - 1} {
 		wire.MTUBuild(pt, mv)
 		st.w.onCtl(s, pt)
-		if s.mtu != 1300 {
-			t.Errorf("MTU %d из провода принят: mtu стал %d, ждали прежний 1300", mv, s.mtu)
-			s.mtu = 1300
+		if got := s.mtu.Load(); got != 1300 {
+			t.Errorf("MTU %d из провода принят: mtu стал %d, ждали прежний 1300", mv, got)
+			s.mtu.Store(1300)
 		}
 	}
 
 	// Ровно на границе — принимается: это законный узкий путь, а не мусор.
 	wire.MTUBuild(pt, wire.MTUFloor)
 	st.w.onCtl(s, pt)
-	if s.mtu != wire.MTUFloor {
-		t.Errorf("MTU ровно %d отвергнут: mtu = %d", wire.MTUFloor, s.mtu)
+	if got := s.mtu.Load(); got != wire.MTUFloor {
+		t.Errorf("MTU ровно %d отвергнут: mtu = %d", wire.MTUFloor, got)
 	}
 }
 
@@ -550,8 +555,10 @@ func standTCPPeer(t *testing.T, sport uint16, mtu int) (*session, *fakeRaw) {
 		t.Fatalf("вторая сессия не поднялась: состояние %d", conn.State())
 	}
 	_, _, hubTX, _ := standHandshake(t)
-	return &session{conn: conn, tx: hubTX, phase: phEst, peer: 1, connID: 1,
-		mtu: mtu, batchMax: 1}, raw
+	d := &session{conn: conn, tx: hubTX, phase: phEst, peer: 1, connID: 1}
+	d.mtu.Store(int32(mtu))
+	d.batchMax.Store(1)
+	return d, raw
 }
 
 // TestОтправкаВДвеСессииНеДелитБуфер: два одновременных sendTo ОДНОГО воркера в РАЗНЫЕ сессии.
@@ -629,9 +636,9 @@ func TestMTUИзПроводаЗажатПотолком(t *testing.T) {
 	for _, mv := range []int{wire.MTUDefault + 1, 1480, wire.LinkMax, 9000} {
 		wire.MTUBuild(pt, mv)
 		st.w.onCtl(s, pt)
-		if s.mtu != wire.MTUDefault {
+		if got := s.mtu.Load(); got != wire.MTUDefault {
 			t.Errorf("MTU %d из провода принят как есть: mtu = %d, ждали потолок %d",
-				mv, s.mtu, wire.MTUDefault)
+				mv, got, wire.MTUDefault)
 		}
 	}
 
@@ -642,9 +649,97 @@ func TestMTUИзПроводаЗажатПотолком(t *testing.T) {
 	st.w.sendTo(s, row, 4000)
 	if got := st.h.stats.dropped.Load(); got != dropped {
 		t.Errorf("разрезаемая запись отброшена при согласованном MTU %d: dropped %d → %d",
-			s.mtu, dropped, got)
+			s.mtu.Load(), dropped, got)
 	}
 	if n := len(st.raw.sent) - before; n < 2 {
 		t.Errorf("запись 4000 байт уехала %d сегментами — разрезания не было", n)
+	}
+}
+
+// ---- находка 8: поля сессии против замка сессии -------------------------------
+
+// feedDev — устройство TUN, которое отдаёт один и тот же пакет столько раз, сколько попросят.
+//
+// fakeDev для этого не годится: он возвращает io.EOF, то есть цикл TUN у него не делает ни одного
+// круга, а проверять надо ровно круги — чтение поля получателя стоит внутри набора пачки.
+type feedDev struct {
+	pkt   []byte
+	reads atomic.Int64
+}
+
+func (d *feedDev) Read(p []byte) (int, error) {
+	d.reads.Add(1)
+	return copy(p, d.pkt), nil
+}
+func (d *feedDev) WaitRead(time.Duration) (bool, error) { return true, nil }
+func (d *feedDev) Write(p []byte) (int, error)          { return len(p), nil }
+func (d *feedDev) Name() string                         { return "xsfeed0" }
+func (d *feedDev) SetMTU(int) error                     { return nil }
+func (d *feedDev) Close() error                         { return nil }
+
+// udpPkt — кадр из устройства: пакет IPv4 к внутреннему адресу второго пира. Протокол UDP взят
+// намеренно — подрезка MSS его не касается, и в проверке остаётся только то, что проверяется.
+func udpPkt(dst uint32, n int) []byte {
+	pkt := make([]byte, n)
+	pkt[0] = 0x45
+	binary.BigEndian.PutUint16(pkt[2:4], uint16(n))
+	pkt[8] = 64
+	pkt[9] = 17
+	binary.BigEndian.PutUint32(pkt[12:16], ip4(10, 0, 0, 2))
+	binary.BigEndian.PutUint32(pkt[16:20], dst)
+	return pkt
+}
+
+// TestПоляСессииЧитаютсяСоСвоимЗамком: цикл TUN одного воркера против onCtl владельца сессии.
+//
+// mtu и batchMax — поля СЕССИИ, и правит их владелец: onCtl по служебному кадру пира, обслуживание
+// по обратной связи о сборке. А читает их ОТПРАВКА, то есть любой воркер: цикл TUN смотрит на
+// batchMax получателя, набирая пачку, и на его mtu, подрезая MSS; маршрутизация пир↔пир смотрит на
+// mtu обоих концов. Замок у сессии для этого есть — тот самый, под которым идёт вся отправка, — но
+// ни чтение, ни запись его не брали. Это тот же разрыв «поле сессии против замка сессии», что и у
+// буфера продолжения записи, только на словах машинного размера: порчи значения на amd64 и arm64
+// не будет, но «новый MTU применился к половине пакетов пачки» возможно, и детектор гонок это
+// пометит, как только оба пути окажутся в одном тесте.
+//
+// Тест и есть этот тест. Смотреть его надо под -race: без детектора он зелёный всегда.
+func TestПоляСессииЧитаютсяСоСвоимЗамком(t *testing.T) {
+	st := newStand(t)
+	// Устройство, отдающее пакеты второму пиру: их получателем будет st.dst, а его поля правит
+	// вторая горутина. Своё устройство и у хаба — по нему обслуживание MTU трогает настройку.
+	dev := &feedDev{pkt: udpPkt(ip4(10, 0, 0, 3), 100)}
+	st.w.dev = dev
+	st.h.dev = []tun.Device{dev}
+
+	// Владелец сессии второго пира — ДРУГОЙ воркер: у хаба это так и есть, сессия лежит в таблице
+	// того, кому её отдал фильтр раскладки.
+	w2 := &worker{id: 1, n: 2, h: st.h, sess: make(map[skey]*session),
+		row: make([]byte, wire.HdrRoom+wire.MaxRecord+wire.Tag)}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); st.w.tunLoop(ctx) }()
+	go func() {
+		defer wg.Done()
+		defer cancel()
+		mtuFrame := make([]byte, 3)
+		lossFrame := make([]byte, 8)
+		ln := wire.LossBuild(lossFrame, 3)
+		for i := 0; i < 300; i++ {
+			// Пир перепробовал путь и называет новый размер — сюда же приходит и обратная связь
+			// «записи не собираются», схлопывающая пачку.
+			wire.MTUBuild(mtuFrame, wire.MTUFloor+i%200)
+			w2.onCtl(st.dst, mtuFrame)
+			w2.onCtl(st.dst, lossFrame[:ln])
+		}
+	}()
+	wg.Wait()
+
+	// Контроль: цикл TUN действительно делал круги, то есть чтение полей получателя произошло.
+	if got := dev.reads.Load(); got < 100 {
+		t.Errorf("цикл TUN прочитал устройство %d раз — путь до полей сессии не пройден", got)
+	}
+	if got := st.h.stats.txPkts.Load(); got == 0 {
+		t.Error("во вторую сессию не ушло ни одной записи — отправка не состоялась")
 	}
 }

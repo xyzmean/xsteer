@@ -139,15 +139,16 @@ func (h *Hub) streamConn(ctx context.Context, nc net.Conn) {
 
 	s := &session{
 		st: st, nc: nc, tx: tx, rx: rx, phase: phEst, peer: found, connID: connID,
-		batchMax: wire.BatchFramesMax, handshakeAt: time.Now(),
+		handshakeAt: time.Now(),
 	}
+	s.batchMax.Store(wire.BatchFramesMax)
 	if peerMTU > 0 {
 		// Своим пределом зажимается и здесь: число приехало из провода, а по s.mtu считается
 		// подрезка MSS для трафика пир↔пир. Тот же потолок, что в worker.onCtl.
 		if peerMTU > own {
 			peerMTU = own
 		}
-		s.mtu = peerMTU
+		s.mtu.Store(int32(peerMTU))
 	}
 	h.commitStamp(found, stamp)
 	h.peerSess[found][connID].Store(s)

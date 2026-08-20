@@ -150,7 +150,9 @@ func (w *worker) accept(k skey, seg *link.Seg) {
 	if w.h.opt.NoBatch {
 		bm = 1
 	}
-	w.sess[k] = &session{conn: conn, phase: phSyn, peer: -1, connID: -1, batchMax: bm}
+	ns := &session{conn: conn, phase: phSyn, peer: -1, connID: -1}
+	ns.batchMax.Store(int32(bm))
+	w.sess[k] = ns
 }
 
 // evict освобождает место: сперва самую давнюю НЕподтверждённую, и только если таких нет — самую
@@ -422,7 +424,7 @@ func (w *worker) onCtl(s *session, pt []byte) {
 	// Пир не собирает наши записи: путь рвёт сегменты. Схлопываем пачку немедленно — на рваном
 	// пути она делает хуже, а не лучше.
 	if n := wire.LossValue(pt); n > 0 {
-		s.batchMax = 1
+		s.batchMax.Store(1)
 		s.coolUntil = nowMS() + reasmCooldownMS
 		if ok, held := w.rlProbe.Allow(nowMS(), wire.LogEveryMS); ok {
 			w.h.logf("пир не собрал %d записей — везу по одному кадру%s", n, wire.HeldSuffix(held))
@@ -443,7 +445,7 @@ func (w *worker) onCtl(s *session, pt []byte) {
 		if own <= 0 || own > mtuCeil {
 			own = mtuCeil
 		}
-		was := s.mtu
+		was := int(s.mtu.Load())
 		// НИЖНЯЯ ГРАНИЦА ОБЯЗАТЕЛЬНА, и она не про разумность значения. По этому числу запись
 		// режется на сегменты (sendTo → SendRecord), поэтому пир, назвавший MTU 1, заставляет хаб
 		// резать каждую предельную запись на 374 сегмента — шестидесятикратное умножение
@@ -461,15 +463,16 @@ func (w *worker) onCtl(s *session, pt []byte) {
 			}
 			return
 		}
-		s.mtu = mv
+		agreed := mv
 		if own < mv {
-			s.mtu = own
+			agreed = own
 		}
+		s.mtu.Store(int32(agreed))
 		// Печатаем только ИЗМЕНЕНИЕ: кадр приходит после каждого пробоя пира, то есть раз в две
 		// минуты на каждого, и строка «согласован тот же MTU» через год работы звезды из тридцати
 		// пиров — это четверть миллиона строк ни о чём.
-		if s.mtu != was && s.peer >= 0 {
-			w.h.logf("пир %s: согласован MTU %d", conf.KeyFP(w.h.opt.Conf.Peers[s.peer].Pub), s.mtu)
+		if agreed != was && s.peer >= 0 {
+			w.h.logf("пир %s: согласован MTU %d", conf.KeyFP(w.h.opt.Conf.Peers[s.peer].Pub), agreed)
 		}
 		w.h.retuneMTU()
 	}
@@ -506,7 +509,7 @@ func (w *worker) route(from *session, pt []byte) {
 			// пакеты молча пропадают». Кроме хаба этот минимум посчитать некому: пиры друг о друге
 			// ничего не знают. Когда узкое место сам хаб (как при хабе 1300 против пиров 1420 и
 			// 1380), согласование и так опускает обе сессии до 1300, и минимум даёт то же число.
-			if clamp := minMTU(from.mtu, d.mtu); clamp > 0 {
+			if clamp := minMTU(int(from.mtu.Load()), int(d.mtu.Load())); clamp > 0 {
 				route.MSSClamp(pt, clamp)
 			}
 			w.sendTo(d, w.row, len(pt))
@@ -545,7 +548,7 @@ func (w *worker) tunLoop(ctx context.Context) {
 		used, total := 0, wire.BatchHdr
 		var dst *session
 		for {
-			if len(frames) > 0 && (len(frames) >= dst.batchMax ||
+			if len(frames) > 0 && (len(frames) >= int(dst.batchMax.Load()) ||
 				total+2+wire.MTUDefault > wire.MaxRecord) {
 				break
 			}
@@ -562,8 +565,10 @@ func (w *worker) tunLoop(ctx context.Context) {
 			if d == nil {
 				continue // нет живого соединения к этому пиру — отбросить, память не тратим
 			}
-			if d.mtu > 0 {
-				route.MSSClamp(pkt, d.mtu)
+			// Подрезка по значению, действующему НА ЭТОТ КАДР: согласование могло сдвинуть его
+			// прямо сейчас, и каждый кадр обязан быть подрезан тем, что в силе в его миг.
+			if mtu := int(d.mtu.Load()); mtu > 0 {
+				route.MSSClamp(pkt, mtu)
 			}
 			// Пачка собирается только для ОДНОГО получателя: у каждой сессии свои ключи и свой
 			// номер последовательности, и «одна запись двум пирам» бессмысленна. Пакет другому
@@ -670,7 +675,7 @@ func (w *worker) sendTo(d *session, row []byte, plen int) {
 		return
 	}
 	rec := row[wire.HdrRoom-wire.RecHdr : wire.HdrRoom]
-	mtu := d.mtu
+	mtu := int(d.mtu.Load())
 	if mtu <= 0 {
 		mtu = mtuCeil
 	}
@@ -732,13 +737,15 @@ func (w *worker) maintain() {
 					s.lastReport = now
 				}
 			}
-			if !w.h.opt.NoBatch && now >= s.coolUntil && now-s.lastGrow >= reasmGrowMS &&
-				s.batchMax < wire.BatchFramesMax {
-				s.batchMax *= 2
-				if s.batchMax > wire.BatchFramesMax {
-					s.batchMax = wire.BatchFramesMax
+			if !w.h.opt.NoBatch && now >= s.coolUntil && now-s.lastGrow >= reasmGrowMS {
+				if bm := int(s.batchMax.Load()); bm < wire.BatchFramesMax {
+					bm *= 2
+					if bm > wire.BatchFramesMax {
+						bm = wire.BatchFramesMax
+					}
+					s.batchMax.Store(int32(bm))
+					s.lastGrow = now
 				}
-				s.lastGrow = now
 			}
 		}
 		// Пустая запись и есть keepalive: длина нагрузки ноль, тип кадра пир опознаёт по пустоте.
@@ -792,11 +799,15 @@ func (h *Hub) retuneMTU() {
 	for p := 0; p < conf.PeersMax; p++ {
 		for c := 0; c < wire.ConnsMax; c++ {
 			s := h.peerSess[p][c].Load()
-			if s == nil || s.mtu <= 0 {
+			if s == nil {
 				continue
 			}
-			if best == 0 || s.mtu < best {
-				best = s.mtu
+			mtu := int(s.mtu.Load())
+			if mtu <= 0 {
+				continue
+			}
+			if best == 0 || mtu < best {
+				best = mtu
 			}
 		}
 	}
