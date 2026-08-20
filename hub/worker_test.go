@@ -743,3 +743,148 @@ func TestПоляСессииЧитаютсяСоСвоимЗамком(t *testi
 		t.Error("во вторую сессию не ушло ни одной записи — отправка не состоялась")
 	}
 }
+
+// ---- стенд вытеснения -------------------------------------------------------
+//
+// Здесь не нужны ни ключи, ни записи: проверяется одно решение — кого accept забирает при полной
+// таблице. Поэтому сессии заводятся голыми, с настоящим link.Conn на памяти и нужной фазой.
+
+// standEvictSess — сессия поддельного TCP без рукопожатия: только фаза и время последнего приёма.
+func standEvictSess(t *testing.T, sport uint16, phase int) *session {
+	t.Helper()
+	raw := &fakeRaw{local: [4]byte{198, 51, 100, 1}}
+	syn, ok := link.ParseSeg(segPkt([4]byte{203, 0, 113, 20}, sport, standISN, link.SYN, nil))
+	if !ok {
+		t.Fatal("SYN стенда вытеснения не разобрался")
+	}
+	conn, err := link.Accept(raw, &syn, standListen, 0x40000000)
+	if err != nil {
+		t.Fatalf("link.Accept: %v", err)
+	}
+	s := &session{conn: conn, phase: phase, peer: -1, connID: -1}
+	s.batchMax.Store(1)
+	return s
+}
+
+// standEvictWorker — воркер с таблицей ровно на n сессий и без единого сокета.
+func standEvictWorker(t *testing.T, n int) *worker {
+	t.Helper()
+	h := &Hub{opt: Options{
+		Conf: &conf.Conf{Addr: ip4(10, 0, 0, 1), AddrPlen: 24, ListenPort: standListen},
+		Logf: func(f string, a ...any) { t.Logf("hub: "+f, a...) },
+	}}
+	return &worker{
+		id: 0, n: 1, h: h, dev: &fakeDev{},
+		sess:    make(map[skey]*session),
+		row:     make([]byte, wire.HdrRoom+wire.MaxRecord+wire.Tag),
+		hbuf:    make([]byte, 2048),
+		sessMax: n,
+	}
+}
+
+// fillEst забивает таблицу воркера подтверждёнными сессиями и возвращает их ключи.
+func fillEst(t *testing.T, w *worker, n int) []skey {
+	t.Helper()
+	keys := make([]skey, n)
+	for i := 0; i < n; i++ {
+		port := standSPort + uint16(100+i)
+		keys[i] = skey{addr: [4]byte{203, 0, 113, 20}, port: port}
+		w.sess[keys[i]] = standEvictSess(t, port, phEst)
+	}
+	return keys
+}
+
+// TestПолнаяТаблицаЖивыхСессийНеПускаетНовогоПира: посторонний SYN не сносит работающий туннель.
+//
+// Сессия заводится на первом же поддельном SYN, без всякой проверки. Правило вытеснения брало
+// сперва самую давнюю НЕподтверждённую — и это защищало от потока SYN, — но при таблице из одних
+// подтверждённых сессий вторая ветка забирала «самую давнюю вообще», то есть живой туннель,
+// которому могло быть полчаса от роду и который молчал доли секунды. Один SYN с постороннего
+// хоста в момент, когда таблица полна, стоил пиру разрыва и нового рукопожатия.
+//
+// Теперь подтверждённую можно забрать, только если она молчит дольше evictIdleMS. Молодая и живая
+// не забирается — новому пиру отказывают.
+func TestПолнаяТаблицаЖивыхСессийНеПускаетНовогоПира(t *testing.T) {
+	w := standEvictWorker(t, 3)
+	keys := fillEst(t, w, 3)
+
+	nk := skey{addr: [4]byte{203, 0, 113, 21}, port: standSPort + 200}
+	syn, ok := link.ParseSeg(segPkt(nk.addr, nk.port, standISN, link.SYN, nil))
+	if !ok {
+		t.Fatal("SYN нового пира не разобрался")
+	}
+	w.accept(nk, &syn)
+
+	if _, ok := w.sess[nk]; ok {
+		t.Error("новая сессия принята при полной таблице живых — кого-то из живых для неё выселили")
+	}
+	if len(w.sess) != 3 {
+		t.Errorf("в таблице %d сессий, было 3 — состав изменился", len(w.sess))
+	}
+	for i, k := range keys {
+		s, ok := w.sess[k]
+		if !ok {
+			t.Errorf("живая сессия %d исчезла из таблицы", i)
+			continue
+		}
+		if s.phase != phEst {
+			t.Errorf("живая сессия %d в фазе %d — её освободили", i, s.phase)
+		}
+	}
+}
+
+// TestПочтиМёртваяСессияВытесняется: правило отказа не превращается в вечный запрет.
+//
+// Обратный край того же решения. Сессия, молчащая дольше срока, живой уже не считается: её место
+// новому пиру отдают, иначе одна брошенная сессия навсегда закрывала бы вход. Порог здесь взят
+// маленький — минуту тест ждать не может, — а проверяется само правило «дольше срока — забираем,
+// и забираем именно самую давнюю».
+func TestПочтиМёртваяСессияВытесняется(t *testing.T) {
+	w := standEvictWorker(t, 3)
+
+	// Молчащая: заводится первой и после паузы оказывается самой давней в таблице.
+	oldKey := skey{addr: [4]byte{203, 0, 113, 20}, port: standSPort + 300}
+	w.sess[oldKey] = standEvictSess(t, oldKey.port, phEst)
+	const quiet = 30 * time.Millisecond
+	time.Sleep(quiet)
+	fresh := fillEst(t, w, 2)
+
+	if !w.evict(quiet.Milliseconds() / 2) {
+		t.Fatal("сессия, молчащая дольше срока, не вытеснена — место не освободилось")
+	}
+	if _, ok := w.sess[oldKey]; ok {
+		t.Error("вытеснили не давно молчавшую сессию")
+	}
+	for i, k := range fresh {
+		if _, ok := w.sess[k]; !ok {
+			t.Errorf("вытеснена свежая сессия %d вместо давно молчавшей", i)
+		}
+	}
+}
+
+// TestНеподтверждённаяВытесняетсяПервой: срок молчания не отменяет приоритета.
+//
+// Срок относится только к подтверждённым. Неподтверждённая уходит первой и без всякого срока —
+// иначе поток SYN с меняющихся портов забивал бы таблицу молодыми сессиями, которые по новому
+// правилу трогать нельзя, и хаб перестал бы принимать кого бы то ни было. То есть проверка ровно
+// на то, что лечение одного отказа в обслуживании не завело другой.
+func TestНеподтверждённаяВытесняетсяПервой(t *testing.T) {
+	w := standEvictWorker(t, 3)
+	est := fillEst(t, w, 2)
+	// Неподтверждённая — САМАЯ СВЕЖАЯ в таблице: по времени молчания она последняя в очереди на
+	// вытеснение, и забрать её можно только по фазе.
+	rawKey := skey{addr: [4]byte{203, 0, 113, 20}, port: standSPort + 400}
+	w.sess[rawKey] = standEvictSess(t, rawKey.port, phSyn)
+
+	if !w.evict(evictIdleMS) {
+		t.Fatal("неподтверждённая сессия не вытеснена — новый пир не принят из-за чужого SYN")
+	}
+	if _, ok := w.sess[rawKey]; ok {
+		t.Error("неподтверждённая осталась в таблице — вытеснили не её")
+	}
+	for i, k := range est {
+		if _, ok := w.sess[k]; !ok {
+			t.Errorf("подтверждённая сессия %d вытеснена вперёд неподтверждённой", i)
+		}
+	}
+}
