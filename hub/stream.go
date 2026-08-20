@@ -162,7 +162,7 @@ func (h *Hub) streamConn(ctx context.Context, nc net.Conn) {
 	// устройства. Заводить его на соединение дешевле, чем протаскивать эти две вещи параметрами
 	// через весь путь данных, а память — восемь килобайт на пира.
 	w := &worker{h: h, row: make([]byte, wire.HdrRoom+wire.MaxRecord+wire.Tag),
-		scratch: make([]byte, 20+wire.Row), sess: map[skey]*session{}}
+		scratch: make([]byte, 20+wire.Row), sess: map[skey]*session{}, sessMax: sessPerWorker(1)}
 	if len(h.dev) > 0 {
 		w.dev = h.dev[found%len(h.dev)]
 	}
