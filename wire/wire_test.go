@@ -736,3 +736,86 @@ func readerOf(s *Stream) io.Reader { return readerFunc(s.ReadRaw) }
 type readerFunc func([]byte) (int, error)
 
 func (f readerFunc) Read(b []byte) (int, error) { return f(b) }
+
+// Предел пачки и предел записи обязаны считаться ОДНИМ числом.
+//
+// Ограничитель на сборке мерит ОТКРЫТЫЙ текст, а приёмник (Reasm.Feed, Stream.ReadRecord и
+// xs_reasm_feed в реализации на C) проверяет длину ТЕЛА, то есть открытого текста ВМЕСТЕ с тегом.
+// Разница в Tag байт — не запас: пачка, которую ограничитель пропустил вплотную к пределу, уезжает
+// записью длиннее предела, и собственный приёмник её отвергает. В поддельном TCP это молчаливая
+// потеря пакета, а в потоке — ОБРЫВ СОЕДИНЕНИЯ: границы следующей записи известны только из длины,
+// которой мы уже не верим. Наружу это выглядит как «на скорости туннель отваливается», потому что
+// вплотную к пределу пачка набивается только под нагрузкой.
+func TestПределПачкиИПределЗаписи(t *testing.T) {
+	mtu := MTUDefault
+
+	// Ровно тот ограничитель, что стоит в client.streamOut, client.txLoop и hub.batchFull.
+	frames := make([][]byte, 0, BatchFramesMax)
+	total := BatchHdr
+	add := func(n int) bool {
+		if len(frames) >= BatchFramesMax {
+			return false
+		}
+		if len(frames) > 0 && total+2+mtu > MaxPlain {
+			return false
+		}
+		f := make([]byte, n)
+		for i := range f {
+			f[i] = byte(len(frames)*31 + i)
+		}
+		frames = append(frames, f)
+		total += 2 + n
+		return true
+	}
+	// Худший случай достижим на живом трафике: семь пакетов среднего размера и один полный. При
+	// пределе на MaxRecord это давало открытый текст 8190 и тело записи 8206 против предела 8192.
+	for i := 0; i < BatchFramesMax-1; i++ {
+		if !add(962) {
+			break
+		}
+	}
+	add(mtu)
+
+	pt := make([]byte, MaxRecord+Tag)
+	n := BatchBuild(pt, frames)
+	if n == 0 {
+		t.Fatalf("BatchBuild отказался собрать пачку из %d кадров, которую пропустил ограничитель", len(frames))
+	}
+	if body := n + Tag; body > MaxRecord {
+		t.Fatalf("тело записи %d длиннее предела %d: пачка из %d кадров собрана вплотную к MaxRecord, "+
+			"а не к MaxPlain", body, MaxRecord, len(frames))
+	}
+
+	// Та же запись обязана пройти через поток целиком: это и есть проверка, что предел один.
+	p := &pipe{}
+	tx, rx := NewStream(p), NewStream(p)
+	row := make([]byte, HdrRoom+MaxRecord+Tag)
+	copy(row[HdrRoom:], pt[:n])
+	rec := row[HdrRoom-RecHdr : HdrRoom]
+	if err := RecBuild(rec, n+Tag); err != nil {
+		t.Fatalf("RecBuild отверг тело %d: %v", n+Tag, err)
+	}
+	if err := tx.WriteRecord(row, RecHdr+n+Tag, nil); err != nil {
+		t.Fatal(err)
+	}
+	body, _, _, err := rx.ReadRecord()
+	if err != nil {
+		t.Fatalf("собственный приёмник отверг нашу же запись: %v", err)
+	}
+	if len(body) != n+Tag {
+		t.Fatalf("прочитано тело %d, отправлено %d", len(body), n+Tag)
+	}
+
+	// И сам сборщик обязан отказывать по пределу открытого текста, а не по пределу записи: иначе
+	// ограничитель у вызывающего остаётся единственной защитой.
+	big := [][]byte{make([]byte, MaxPlain-BatchHdr-2), make([]byte, 1)}
+	if BatchBuild(make([]byte, MaxRecord+Tag), big) != 0 {
+		t.Error("BatchBuild собрал пачку длиннее MaxPlain")
+	}
+
+	// RecBuild — последний рубеж: он обязан мерить предел ФОРМАТА, а не предел ПОЛЯ. Пока он
+	// пускал всё до 0xFFFF, переполнение доезжало до провода и обрывало соединение у получателя.
+	if err := RecBuild(make([]byte, RecHdr), MaxRecord+1); err == nil {
+		t.Error("RecBuild принял тело длиннее MaxRecord")
+	}
+}

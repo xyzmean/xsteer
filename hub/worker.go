@@ -576,7 +576,7 @@ func (w *worker) tunLoop(ctx context.Context) {
 		var dst *session
 		for {
 			if len(frames) > 0 && (len(frames) >= int(dst.batchMax.Load()) ||
-				total+2+wire.MTUDefault > wire.MaxRecord) {
+				total+2+wire.MTUDefault > wire.MaxPlain) {
 				break
 			}
 			n, err := w.dev.Read(slab[used : used+wire.MTUDefault])
@@ -624,7 +624,7 @@ func batchFull(frames [][]byte, next int) bool {
 	for _, f := range frames {
 		total += 2 + len(f)
 	}
-	return total+2+next > wire.MaxRecord
+	return total+2+next > wire.MaxPlain
 }
 
 // sendFrames увозит кадры одной записью: один кадр — как есть, несколько — в контейнере.

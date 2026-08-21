@@ -178,7 +178,7 @@ func (c *Client) streamOut(ctx context.Context, id int, st *wire.Stream, tx *noi
 			maxFrames = 1
 		}
 		for len(frames) < maxFrames {
-			if len(frames) > 0 && total+2+mtu > wire.MaxRecord {
+			if len(frames) > 0 && total+2+mtu > wire.MaxPlain {
 				break
 			}
 			n, err := dev.Read(slab[used : used+wire.MTUDefault])

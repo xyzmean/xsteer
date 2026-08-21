@@ -289,9 +289,23 @@ func (s *stand) feed(flags byte, payload []byte) {
 // nonce — относительный номер первого байта записи, ровно как считает пир.
 func (s *stand) feedRecord(frame []byte, segMax int) {
 	s.t.Helper()
+	s.feedRecordAs(frame, segMax, false)
+}
+
+// feedRecordAs — то же, но с выбором, кто пишет заголовок. raw означает «руками, без предела
+// формата в RecBuild»: запись длиннее MaxRecord наш сборщик больше не соберёт, и это правильно, —
+// но проверить, что её отвергает ПРИЁМНИК, всё равно надо. Иначе находка считалась бы закрытой не
+// тем слоем: у отправителя стоит наш собственный ограничитель, а на публичный порт приезжает то,
+// что прислал кто угодно.
+func (s *stand) feedRecordAs(frame []byte, segMax int, raw bool) {
+	s.t.Helper()
 	rec := make([]byte, wire.RecHdr+len(frame)+wire.Tag)
-	if err := wire.RecBuild(rec[:wire.RecHdr], len(frame)+wire.Tag); err != nil {
-		s.t.Fatalf("RecBuild(%d): %v", len(frame)+wire.Tag, err)
+	body := len(frame) + wire.Tag
+	if raw {
+		rec[0], rec[1], rec[2] = 0x17, 0x03, 0x03
+		rec[3], rec[4] = byte(body>>8), byte(body)
+	} else if err := wire.RecBuild(rec[:wire.RecHdr], body); err != nil {
+		s.t.Fatalf("RecBuild(%d): %v", body, err)
 	}
 	copy(rec[wire.RecHdr:], frame)
 	rel := wire.Rel(s.seq, standISN)
@@ -390,9 +404,10 @@ func TestКадрДлиннееПределаОтброшен(t *testing.T) {
 		t.Errorf("оба кадра пачки обязаны попасть в счётчик: было %d, стало %d", dropped, got)
 	}
 
-	// И кадр длиннее записи: до хаба он не доходит вовсе (его отвергает сборка), но проверить, что
-	// он никуда не уехал, всё равно надо — иначе находка считалась бы закрытой не тем слоем.
-	st.feedRecord(ip4Frame(ip4(10, 0, 0, 2), ip4(10, 0, 0, 3), 9000), 1400)
+	// И кадр длиннее записи. СВОЙ сборщик такую запись больше не соберёт — RecBuild мерит предел
+	// формата, — поэтому заголовок здесь пишется руками: ровно так её пришлёт чужой или сломанный
+	// отправитель, и отвергнуть её обязан приёмник, а не наша же проверка на выходе.
+	st.feedRecordAs(ip4Frame(ip4(10, 0, 0, 2), ip4(10, 0, 0, 3), 9000), 1400, true)
 	if len(st.dsnk.recs) != 1 || len(st.dev.wrote) != 0 {
 		t.Errorf("кадр 9000 байт куда-то уехал: записей %d, записей в устройство %d",
 			len(st.dsnk.recs), len(st.dev.wrote))

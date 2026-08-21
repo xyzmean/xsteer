@@ -804,7 +804,7 @@ func (c *Client) outbound(ctx context.Context, id int, s *sess, dev tun.Device) 
 		for len(frames) < max {
 			// Проверка ДО чтения: прочитанный пакет девать некуда, если он не влезет в запись, а
 			// откладывать его до следующего круга значило бы менять порядок пакетов в потоке.
-			if len(frames) > 0 && total+2+mtu > wire.MaxRecord {
+			if len(frames) > 0 && total+2+mtu > wire.MaxPlain {
 				break
 			}
 			n, err := dev.Read(slab[used : used+wire.MTUDefault])
