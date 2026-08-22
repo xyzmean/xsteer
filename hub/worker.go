@@ -518,7 +518,7 @@ func (w *worker) route(from *session, pt []byte) {
 		w.h.stats.dropped.Add(1)
 		return
 	}
-	to := w.h.router.Lookup(dst, nil)
+	to := w.h.router.Lookup(dst, &w.rcache)
 	if to >= 0 && to != from.peer {
 		if d := w.h.pick(to, pt); d != nil {
 			// Пир↔пир: уменьшаем TTL (иначе петля в звезде живёт вечно) и шифруем В ТОЙ ЖЕ строке.
@@ -563,6 +563,8 @@ func (w *worker) tunLoop(ctx context.Context) {
 	row := make([]byte, wire.HdrRoom+wire.MaxRecord+wire.Tag)
 	slab := make([]byte, wire.BatchFramesMax*wire.MTUDefault)
 	frames := make([][]byte, 0, wire.BatchFramesMax)
+	// Свой кэш маршрута: эта горутина не имеет права трогать w.rcache, он принадлежит приёму.
+	var rc route.Cache
 	for ctx.Err() == nil {
 		ok, err := w.dev.WaitRead(200 * time.Millisecond)
 		if err != nil {
@@ -584,7 +586,7 @@ func (w *worker) tunLoop(ctx context.Context) {
 				break
 			}
 			pkt := slab[used : used+n]
-			to := w.h.router.Lookup(binary.BigEndian.Uint32(pkt[16:20]), nil)
+			to := w.h.router.Lookup(binary.BigEndian.Uint32(pkt[16:20]), &rc)
 			var d *session
 			if to >= 0 {
 				d = w.h.pick(to, pkt)
