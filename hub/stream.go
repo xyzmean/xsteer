@@ -39,7 +39,12 @@ func (h *Hub) streamListen(ctx context.Context, port int) error {
 		if err != nil {
 			return err
 		}
-		go h.streamConn(ctx, nc)
+		// Соединение потока учитывается в общем счётчике горутин, а не живёт само по себе: его
+		// обработчик пишет пакеты В УСТРОЙСТВО (onFrame), и завершение обязано дождаться его
+		// прежде, чем закрыть дескриптор устройства (I-109). Add здесь безопасен: сама
+		// streamListen тоже в счётчике и держит его больше нуля, пока принимает соединения.
+		h.wg.Add(1)
+		go func() { defer h.wg.Done(); h.streamConn(ctx, nc) }()
 	}
 	return ctx.Err()
 }
