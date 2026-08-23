@@ -258,6 +258,13 @@ func Run(ctx context.Context, opt Options) error {
 		if err := devs[0].SetMTU(mtu); err != nil {
 			return fmt.Errorf("не удалось задать MTU: %w", err)
 		}
+		// Очередь устройства — третья команда подъёма, и звать её можно только здесь, внутри
+		// !Managed: при --managed адрес, MTU и очередь задал владелец устройства, и спорить с ним
+		// значило бы затирать его настройку своей.
+		if err := tun.SetTxQueueLen(name, tun.TxQueueLen); err != nil {
+			c.logf("%s: очередь передачи осталась ядерной (%v) — просили %d пакетов; ждать чтения "+
+				"их сможет меньше, остальные ядро на пиках отбросит", name, err, tun.TxQueueLen)
+		}
 		c.logf("%s: адрес %s, MTU %d (накладные %d)", name, cidr, mtu, wire.Overhead)
 		if len(opt.Conf.DNS) > 0 {
 			if err := tun.SetDNS(name, opt.Conf.DNS); err != nil {

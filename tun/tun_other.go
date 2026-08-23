@@ -38,6 +38,9 @@ func (notImplemented) SetMTU(int) error                     { return ErrNoDevice
 func (notImplemented) Close() error                         { return nil }
 
 func SetAddr(name, cidr string) error { return fmt.Errorf("не сделано на %s", runtime.GOOS) }
+func SetTxQueueLen(name string, n int) error {
+	return fmt.Errorf("не сделано на %s", runtime.GOOS)
+}
 func AddRoute(name, cidr string) error {
 	return fmt.Errorf("не сделано на %s", runtime.GOOS)
 }
