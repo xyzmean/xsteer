@@ -11,11 +11,14 @@ package hub
 
 import (
 	"encoding/binary"
+	"math/rand"
 	"net"
 	"testing"
 	"time"
 
 	"github.com/xyzmean/xsteer/link"
+	"github.com/xyzmean/xsteer/noise"
+	"github.com/xyzmean/xsteer/wire"
 )
 
 // ---- посторонний на том же воркере -------------------------------------------
@@ -163,5 +166,55 @@ func TestПрикрытиеПолучаетОдносегментныйHello(t *
 	}
 	if seen := <-got; string(seen) != string(hello) {
 		t.Errorf("прикрытие получило %d байт из %d", len(seen), len(hello))
+	}
+}
+
+// ---- находка: повтор msg1 отвечал молчанием при любой настройке ---------------
+
+// TestПовторMsg1ОтвечаетТемЖе: на воспроизведённый msg1 хаб отвечает так же, как любому другому
+// неопознанному.
+//
+// Ветка защиты от повтора закрывала сессию молча, то есть отвечала «silent» независимо от
+// настройки Decoy. Разный ответ на два разных «не наш» — это ровно то, что ищет активное
+// зондирование: молчание вместо оповещения сообщает прибору, что записанный им Hello подобран
+// ПРАВИЛЬНО и принадлежит описанному пиру. Реализация на C эту ветку уже проводит через общую
+// дорожку (xshub.c, «прежде эта ветка молча закрывала сессию»).
+func TestПовторMsg1ОтвечаетТемЖе(t *testing.T) {
+	st := newStand(t)
+	// Настройка по умолчанию — фатальное оповещение. Проверять её удобнее прочих: RST уходит
+	// отдельным отправителем (worker.tx0), которого в стенде нет, а оповещение идёт тем же
+	// поддельным соединением, что и всё остальное.
+	st.h.opt.Decoy = DecoyMode{}
+
+	// Ответ на постороннего: эталон, с которым сравнивается ответ на повтор.
+	base := len(st.raw.sent)
+	garbage := newProbe(t, st, 3)
+	garbage.feed(link.PSH|link.ACK, tlsRecord(120))
+	want := st.raw.payloadsSince(base)
+	if len(want) == 0 {
+		t.Fatal("посторонний не получил ответа — сравнивать нечего")
+	}
+
+	// Повтор: настоящий msg1 настоящего пира, но метка времени старее уже виденной.
+	cPriv, _ := standKeypair(t, 1)
+	_, hPub := standKeypair(t, 2)
+	st.h.commitStamp(0, uint64(time.Now().Unix())+3600)
+	cli := &noise.HS{}
+	hello, err := cli.ClientHello(cPriv, hPub, "www.microsoft.com", wire.MTUDefault, 0, false, true,
+		rand.New(rand.NewSource(77)))
+	if err != nil {
+		t.Fatalf("ClientHello: %v", err)
+	}
+
+	base = len(st.raw.sent)
+	replay := newProbe(t, st, 4)
+	replay.feed(link.PSH|link.ACK, hello)
+	got := st.raw.payloadsSince(base)
+	if len(got) == 0 {
+		t.Fatal("на повтор msg1 хаб не ответил ничем: молчание отличимо от ответа прочим " +
+			"неопознанным и говорит прибору, что Hello подобран правильно")
+	}
+	if string(got) != string(want) {
+		t.Errorf("на повтор ответ %x, на постороннего %x — ответы обязаны совпадать", got, want)
 	}
 }
