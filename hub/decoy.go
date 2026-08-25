@@ -134,7 +134,6 @@ func (w *worker) onStranger(k skey, s *session, seg *link.Seg, hsErr error) {
 // Возвращает true, если перелив начался: тогда сессию освобождает сама дорожка, а не вызывающий.
 func (w *worker) startProxy(k skey, s *session, seg *link.Seg) bool {
 	d := w.h.opt.Decoy
-	dest := d.Dest
 	// Предел на число одновременно проксируемых, и он обязателен: каждое такое соединение — это
 	// настоящий сокет к сайту-прикрытию и горутина. Без предела поток зондирования превращался бы в
 	// нашу же атаку на прикрытие и на собственные дескрипторы.
@@ -146,15 +145,7 @@ func (w *worker) startProxy(k skey, s *session, seg *link.Seg) bool {
 		}
 		return false
 	}
-	// Имя из SNI — то, ради чего прибор и пришёл. Отдав ему сертификат другого сайта, мы сообщим
-	// ровно то, что пытались скрыть.
-	if d.FollowSNI {
-		if ref, err := chello.Parse(seg.Payload); err == nil && ref.SNI != "" {
-			if host := allowedHost(ref.SNI, d.Allow); host != "" {
-				dest = net.JoinHostPort(host, "443")
-			}
-		}
-	}
+	dest := w.decoyDest(s, seg)
 	if dest == "" {
 		return false
 	}
@@ -263,6 +254,35 @@ func (w *worker) proxyUp(k skey, s *session, seg *link.Seg) {
 //
 // Список нужен не из осторожности: без него порт хаба становится открытой пересылкой на :443 к
 // любому узлу, то есть чужим инструментом. Пустой список означает «только постоянное назначение».
+// decoyDest — КОМУ звонить: имя, названное самим прибором, если оно разрешено, иначе постоянный
+// Dest. Отдельной функцией по той же причине, по которой в реализации на C отдельной функцией
+// сделан decoy_dest_for: разбор идёт по недоверенным байтам с публичного порта, до всякой
+// аутентификации, и проверять его надо самим по себе, а не через сокеты вокруг.
+func (w *worker) decoyDest(s *session, seg *link.Seg) string {
+	d := w.h.opt.Decoy
+	dest := d.Dest
+	if !d.FollowSNI {
+		return dest
+	}
+	// Разбирается ВСЁ накопленное, а не последний сегмент, и это здесь важнее, чем при переливе
+	// байтов: SNI лежит в НАЧАЛЕ ClientHello, а браузерный Hello в один сегмент не влезает — то
+	// есть по последнему сегменту имя не разобралось бы никогда, и звонок молча уходил бы в
+	// постоянный Dest. Накопленного нет только у Hello, влезшего в один сегмент; тогда он и есть
+	// всё присланное.
+	hello := s.hsBuf
+	if len(hello) == 0 {
+		hello = seg.Payload
+	}
+	// Имя из SNI — то, ради чего прибор и пришёл. Отдав ему сертификат другого сайта, мы сообщим
+	// ровно то, что пытались скрыть.
+	if ref, err := chello.Parse(hello); err == nil && ref.SNI != "" {
+		if host := allowedHost(ref.SNI, d.Allow); host != "" {
+			dest = net.JoinHostPort(host, "443")
+		}
+	}
+	return dest
+}
+
 func allowedHost(sni string, allow []string) string {
 	sni = strings.ToLower(strings.TrimSuffix(sni, "."))
 	if sni == "" || strings.ContainsAny(sni, "/\\ ") {

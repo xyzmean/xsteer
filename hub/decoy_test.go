@@ -218,3 +218,56 @@ func TestПовторMsg1ОтвечаетТемЖе(t *testing.T) {
 		t.Errorf("на повтор ответ %x, на постороннего %x — ответы обязаны совпадать", got, want)
 	}
 }
+
+// ---- находка: имя прикрытия разбиралось из последнего сегмента, а не из всего Hello ----
+
+// TestИмяПрикрытияБерётсяИзВсегоHello: в режиме --decoy-sni хаб звонит по имени, названному
+// прибором, и берёт это имя из ВСЕГО накопленного Hello.
+//
+// Правка, отдавшая прикрытию всё накопленное, починила только половину дорожки — ту, где байты
+// ПЕРЕЛИВАЮТСЯ. Вторая половина, выбор адреса, продолжала разбирать последний пришедший сегмент:
+// SNI лежит в начале ClientHello, а браузерный Hello в один сегмент не влезает, — то есть на
+// настоящем приборе имя не разбиралось никогда, и звонок молча уходил в постоянный Dest. Снаружи
+// это ровно тот признак, ради устранения которого ключ и заведён: прибор просит одно имя, а
+// сертификат получает от другого сайта. В реализации на C выбор идёт по накопленному буферу
+// (decoy_dest_for(s->hs_buf, s->hs_len)).
+func TestИмяПрикрытияБерётсяИзВсегоHello(t *testing.T) {
+	st := newStand(t)
+	st.h.opt.Decoy = DecoyMode{Mode: "proxy", Dest: "203.0.113.9:443", FollowSNI: true,
+		Allow: []string{"cover.example.org"}, Timeout: time.Second}
+
+	cPriv, _ := standKeypair(t, 1)
+	_, hPub := standKeypair(t, 2)
+	cli := &noise.HS{}
+	hello, err := cli.ClientHello(cPriv, hPub, "cover.example.org", wire.MTUDefault, 0, false, true,
+		rand.New(rand.NewSource(91)))
+	if err != nil {
+		t.Fatalf("ClientHello: %v", err)
+	}
+	// Смысл проверки держится на том, что Hello НЕ влезает в сегмент: иначе последний сегмент и
+	// есть всё присланное, и разница между двумя источниками пропадает.
+	if len(hello) < 1200 {
+		t.Fatalf("Hello %d байт — влезает в сегмент, проверка теряет смысл", len(hello))
+	}
+	half := len(hello) / 2
+
+	s := &session{hsBuf: append([]byte(nil), hello...), peer: -1, connID: -1}
+	seg := &link.Seg{Payload: hello[half:]}
+	if got := st.w.decoyDest(s, seg); got != "cover.example.org:443" {
+		t.Errorf("позвонили в %q вместо cover.example.org:443 — имя разобрано не из всего Hello",
+			got)
+	}
+
+	// Контроль: Hello, влезший в один сегмент, накопленного не имеет вовсе — выбор обязан идти по
+	// сегменту, и он работал и до правки.
+	one := &session{peer: -1, connID: -1}
+	if got := st.w.decoyDest(one, &link.Seg{Payload: hello}); got != "cover.example.org:443" {
+		t.Errorf("односегментный Hello: позвонили в %q вместо cover.example.org:443", got)
+	}
+
+	// Имя, которого нет в Allow, ведёт к постоянному прикрытию, а не в произвольный узел.
+	st.h.opt.Decoy.Allow = []string{"other.example.net"}
+	if got := st.w.decoyDest(s, seg); got != "203.0.113.9:443" {
+		t.Errorf("неразрешённое имя: позвонили в %q вместо постоянного 203.0.113.9:443", got)
+	}
+}
