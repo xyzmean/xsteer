@@ -104,14 +104,27 @@ func TestПотокОтвечаетНеопознанному(t *testing.T) {
 
 // ---- находка I-133: побудка чтения ждала отмены ХАБА, а не соединения ----------
 
-// streamUpDown проводит полное рукопожатие пира по паре net.Pipe, затем закрывает свою половину и
-// дожидается возврата streamConn. То есть проходит ровно тот путь, на котором соединение доживает
-// до конца рукопожатия — единственный, где заводится горутина побудки чтения.
-func streamUpDown(t *testing.T, h *Hub, ctx context.Context, seed int64) {
+// streamPeer — половина ПИРА на паре net.Pipe: поднятое соединение потока и всё, чем по нему можно
+// посылать записи. Записи шифруются смещением потока, поэтому рукопожатие обязано идти через тот же
+// объект wire.Stream (WriteRaw), а не напрямую в сокет: иначе смещения сторон разъедутся на длину
+// рукопожатия и первая же запись данных не расшифруется.
+type streamPeer struct {
+	nc   net.Conn
+	st   *wire.Stream
+	tx   *noise.Keys
+	row  []byte
+	done chan struct{} // закрывается, когда streamConn вернулся
+}
+
+// streamPeerUp проводит полное рукопожатие пира и возвращает поднятое соединение. То есть проходит
+// ровно тот путь, на котором соединение доживает до конца рукопожатия, — единственный, где хаб
+// заводит горутину побудки чтения и сессию в peerSess.
+func streamPeerUp(t *testing.T, h *Hub, ctx context.Context, seed int64) *streamPeer {
 	t.Helper()
 	srv, cli := net.Pipe()
-	done := make(chan struct{})
-	go func() { defer close(done); h.streamConn(ctx, srv) }()
+	p := &streamPeer{nc: cli, st: wire.NewStream(cli), done: make(chan struct{}),
+		row: make([]byte, wire.HdrRoom+wire.MaxRecord+wire.Tag)}
+	go func() { defer close(p.done); h.streamConn(ctx, srv) }()
 	_ = cli.SetDeadline(time.Now().Add(5 * time.Second))
 
 	cPriv, _ := standKeypair(t, 1)
@@ -123,7 +136,7 @@ func streamUpDown(t *testing.T, h *Hub, ctx context.Context, seed int64) {
 	if err != nil {
 		t.Fatalf("ClientHello: %v", err)
 	}
-	if _, err := cli.Write(hello); err != nil {
+	if err := p.st.WriteRaw(hello); err != nil {
 		t.Fatalf("Hello не ушёл: %v", err)
 	}
 	// Ответ хаба уходит одной записью (st.WriteRaw), поэтому одного чтения достаточно.
@@ -143,17 +156,43 @@ func streamUpDown(t *testing.T, h *Hub, ctx context.Context, seed int64) {
 	if err != nil {
 		t.Fatalf("ClientConfirm: %v", err)
 	}
-	if _, err := cli.Write(fin); err != nil {
+	if err := p.st.WriteRaw(fin); err != nil {
 		t.Fatalf("подтверждение не ушло: %v", err)
 	}
-	// Соединение поднялось. Обрыв со стороны пира — самый частый способ его конца: чтение записи
-	// в streamConn получает ошибку и обработчик возвращается.
-	_ = cli.Close()
+	p.tx = tx
+	// Срок на сокете пира снимается: дальше распоряжается сроками сам стенд.
+	_ = cli.SetDeadline(time.Time{})
+	return p
+}
+
+// send отправляет одну запись с нагрузкой n байт — так же, как это делает пир (client.streamSend).
+// Нулевая длина и есть keepalive: пустоту хаб опознаёт как вид кадра.
+func (p *streamPeer) send(n int) error {
+	rec := p.row[wire.HdrRoom-wire.RecHdr : wire.HdrRoom]
+	return p.st.WriteRecord(p.row, wire.RecHdr+n+wire.Tag, func(rel uint64) error {
+		if err := wire.RecBuild(rec, n+wire.Tag); err != nil {
+			return err
+		}
+		_, err := p.tx.Seal(p.row[wire.HdrRoom:wire.HdrRoom+n+wire.Tag], n, rec, rel)
+		return err
+	})
+}
+
+// closeWait рвёт соединение со стороны пира — самый частый способ его конца — и дожидается возврата
+// обработчика.
+func (p *streamPeer) closeWait(t *testing.T) {
+	t.Helper()
+	_ = p.nc.Close()
 	select {
-	case <-done:
+	case <-p.done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("streamConn не вернулся после обрыва соединения")
 	}
+}
+
+func streamUpDown(t *testing.T, h *Hub, ctx context.Context, seed int64) {
+	t.Helper()
+	streamPeerUp(t, h, ctx, seed).closeWait(t)
 }
 
 // TestПотокНеОставляетГорутинуПослеОбрыва: у горутины, которая будит чтение закрытием сокета, срок
@@ -199,5 +238,59 @@ func waitGoroutines(want int, limit time.Duration) int {
 			return n
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// ---- находка I-132: сессию потока не обслуживает никто -------------------------
+
+// TestПотокУмираетПоПростою: сессия потока обязана умирать по тому же простою, что и сессия
+// поддельного TCP, и срок обязан ПЕРЕСТАВЛЯТЬСЯ на каждой записи.
+//
+// Обслуживание сессий (w.maintain) зовётся только из rxLoop, то есть с половины поддельного TCP;
+// воркер, которого streamConn заводит под своё соединение, туда не попадает никогда. Значит для
+// потока не выполняется ни уборка по IdleMS, ни что-либо ещё, а после рукопожатия срок снимался
+// совсем — цикл чтения своего не ставил. Пир, пропавший молча (отображение NAT истекло, устройство
+// уснуло, провод выдернут), не обнаруживался НИЧЕМ, кроме ядерного keepalive: 7200 с тишины плюс
+// девять проб по 75 — около 2 ч 11 мин вместо 180 с у парной половины. Держались это время не
+// только горутина и 80 КиБ буферов, но и значение MTU мёртвой сессии: retuneMTU берёт минимум по
+// всем непустым слотам peerSess, поэтому пир с маленьким MTU зажимал MTU устройства ВСЕГО хаба два
+// часа после того, как перестал существовать.
+//
+// Вторая половина проверки не менее важна первой: живой пир присылает пробу живости каждые две
+// секунды, и срок, поставленный один раз на всё соединение, убивал бы живые сессии.
+func TestПотокУмираетПоПростою(t *testing.T) {
+	st := newStand(t)
+	saved := streamIdle
+	streamIdle = 250 * time.Millisecond // вместо трёх минут: стенд не должен их ждать
+	defer func() { streamIdle = saved }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p := streamPeerUp(t, st.h, ctx, 17)
+
+	// Пир жив и молчит короткими промежутками. Суммарно 480 мс — почти вдвое дольше срока, то есть
+	// без переставления соединение уже было бы закрыто.
+	for i := 1; i <= 6; i++ {
+		time.Sleep(80 * time.Millisecond)
+		if err := p.send(0); err != nil {
+			t.Fatalf("проба живости %d не ушла: %v — соединение закрыто раньше времени, срок не "+
+				"переставляется на каждой записи", i, err)
+		}
+		select {
+		case <-p.done:
+			t.Fatalf("обработчик вернулся на %d-й пробе живости: срок поставлен один раз на всё "+
+				"соединение, а живой пир молчит промежутками", i)
+		default:
+		}
+	}
+
+	// А теперь пир пропал молча: ни обрыва, ни FIN — так выглядит истёкшее отображение NAT.
+	select {
+	case <-p.done:
+	case <-time.After(3 * time.Second):
+		cancel()
+		t.Error("сессия потока не умерла по простою: срока на чтение нет, и пропавший молча пир " +
+			"держит слот peerSess, буферы и потолок MTU устройства до ядерного keepalive — около " +
+			"2 ч 11 мин")
 	}
 }
