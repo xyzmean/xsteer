@@ -147,6 +147,12 @@ func (w *worker) startProxy(k skey, s *session, seg *link.Seg) bool {
 	}
 	dest := w.decoyDest(s, seg)
 	if dest == "" {
+		// Место возвращается и здесь: этот выход был единственным, где занятое первым действием не
+		// освобождалось, и каждое срабатывание съедало одно из decoyMax мест навсегда (I-125).
+		// Ветка сегодня недостижима — Validate отвергает proxy без Dest, — но она и существует как
+		// оборона от «Dest пуст», а оборона не должна подтачивать предел, за которым режим proxy
+		// тихо становится alert.
+		w.h.decoyLive.Add(-1)
 		return false
 	}
 	timeout := d.Timeout
