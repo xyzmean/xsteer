@@ -499,11 +499,33 @@ PersistentKeepalive = 25
 EOF
 	)
 
+	# Ссылка xs:// — тот же доступ одной строкой. Рядом с файлом, а не вместо него: файл кладут в
+	# /etc и им живёт служба, а ссылку удобно передать и превратить в QR-код.
+	#
+	# Пишется в ФАЙЛ с правами 0600, а не только на экран: в ссылке лежит приватный ключ, и её
+	# место — там же, где конфигурация, а не в истории терминала. На экран она выводится тоже, но
+	# отдельным шагом и с предупреждением — иначе смысл выдачи (передать доступ) требовал бы
+	# лишних действий.
+	local link="/root/xsteer-${PEER_NAME}.link"
+	if ( umask 077; "$BIN" link "$out" --name "$PEER_NAME" >"$link" 2>/dev/null ); then
+		:
+	else
+		rm -f "$link"; link=""
+	fi
+
 	echo ""
 	printf "${GREEN}пир %s добавлен${NC}: %s, конфигурация в %s\n" "$PEER_NAME" "$PEER_IP" "$out"
 	echo ""
 	sed '/^PrivateKey/s/=.*/= <приватный ключ, он в файле>/' "$out"
 	echo ""
+	if [ -n "$link" ]; then
+		printf "ссылка (тот же доступ одной строкой): %s\n" "$link"
+		echo "  показать:  cat $link"
+		echo "  QR-код:    qrencode -t ansiutf8 < $link"
+		echo "  поднять:   xsteer up - < $link"
+		printf "${RED}в ссылке приватный ключ — открытым каналом её пересылать нельзя${NC}\n"
+		echo ""
+	fi
 	echo "MTU задавать НЕ НУЖНО: клиент согласует его сам и проверит путь пробами."
 	unset PEER_NAME
 }
@@ -548,7 +570,7 @@ function revokePeer() {
 	fi
 	rm -f "$CONF.bak"
 	hubApply || return 1
-	rm -f "/root/xsteer-${name}.conf"
+	rm -f "/root/xsteer-${name}.conf" "/root/xsteer-${name}.link"
 	printf "${GREEN}пир %s убран${NC}\n" "$name"
 	echo "На самом пире туннель после этого не поднимется: хаб его больше не знает."
 }
@@ -592,7 +614,7 @@ function uninstallHub() {
 	echo ""
 	echo "юнит, правило NAT и sysctl убраны."
 	echo "Ключи и список пиров оставлены в $CONFDIR — удалите сами, если не нужны:"
-	echo "  rm -rf $CONFDIR /root/xsteer-*.conf $BIN"
+	echo "  rm -rf $CONFDIR /root/xsteer-*.conf /root/xsteer-*.link $BIN"
 }
 
 function manageMenu() {

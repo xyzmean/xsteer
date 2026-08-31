@@ -42,13 +42,19 @@ var Version = "0.1.0"
 func usage() {
 	fmt.Fprintf(os.Stderr, `xsteer %s — клиент своего VPN-протокола с обликом TLS
 
-    xsteer up <файл.conf> [ключи]   поднять туннель (сторона, которая соединяется)
+    xsteer up <файл.conf|xs://…|-> [ключи]   поднять туннель (сторона, которая соединяется)
     xsteer hub <файл.conf> [ключи]   поднять хаб (сторона, которая слушает)
     xsteer genkey                    приватный ключ в base64 (на диск не пишет)
     xsteer pubkey                    публичный ключ из приватного на входе
-    xsteer check <файл.conf>         проверить конфигурацию, ничего не поднимая
+    xsteer check <файл.conf|xs://…|->  проверить конфигурацию, ничего не поднимая
+    xsteer link <файл.conf>          напечатать ссылку xs:// для этой конфигурации
+    xsteer conf <xs://…|->            напечатать файл конфигурации из ссылки
     xsteer show [файл состояния]     что происходит с туннелем
     xsteer version                   версия и накладные расходы протокола
+
+Где ждут <файл.conf>, принимается и ссылка xs://…, и «-» — тогда ссылка или целый файл читаются
+со стандартного ввода. В ссылке лежит ПРИВАТНЫЙ КЛЮЧ: аргументы команды видны в списке процессов и
+остаются в истории оболочки, поэтому на общей машине ссылку передавайте через «-», а не аргументом.
 
 Ключи для up:
     --dev <имя>       имя устройства (по умолчанию xs0)
@@ -111,6 +117,10 @@ func main() {
 		err = cmdShow(os.Args[2:])
 	case "check":
 		err = cmdCheck(os.Args[2:])
+	case "link":
+		err = cmdLink(os.Args[2:])
+	case "conf":
+		err = cmdConf(os.Args[2:])
 	case "version":
 		fmt.Printf("xsteer %s (Go %s, %s/%s)\n", Version, runtime.Version(), runtime.GOOS, runtime.GOARCH)
 		fmt.Printf("накладные расходы %d байт на пакет, MTU туннеля при канале 1500 — %d\n",
@@ -251,7 +261,7 @@ func cmdUp(args []string) error {
 		opt.AESPreferred = false
 	}
 
-	c, s, err := conf.Load(path, conf.RoleSpoke)
+	c, s, _, err := conf.LoadAny(path, conf.RoleSpoke)
 	if err != nil {
 		return err
 	}
@@ -357,7 +367,7 @@ func cmdHub(args []string) error {
 	if err := opt.Decoy.Validate(); err != nil {
 		return err
 	}
-	c, s, err := conf.Load(path, conf.RoleHub)
+	c, s, _, err := conf.LoadAny(path, conf.RoleHub)
 	if err != nil {
 		return err
 	}
@@ -437,6 +447,85 @@ func cmdShow(args []string) error {
 // ЗАЧЕМ ОТДЕЛЬНАЯ КОМАНДА. Обвязка (xs-quick, xs-install) правит файл, который читает РАБОТАЮЩИЙ
 // хаб или туннель, и обязана убедиться в годности файла ДО перезапуска: иначе одна опечатка в
 // добавленном пире роняет хаб вместе со всеми остальными пирами, и узнаётся это по тишине.
+// cmdLink печатает ссылку xs:// для конфигурации пира.
+//
+// ССЫЛКА СОДЕРЖИТ ПРИВАТНЫЙ КЛЮЧ, и это её суть, а не оплошность: ссылка и есть выданный доступ
+// целиком. Поэтому она уходит в стандартный ВЫВОД (её перенаправляют в файл или в QR-код), а
+// предупреждение — в стандартную ОШИБКУ: иначе оно попало бы в сам файл со ссылкой и сломало бы её.
+//
+// Имя после решётки берётся ключом --name или, если его нет, из имени файла: в конфигурации поля
+// «имя» нет, а человеку, у которого пять ссылок, различать их нужно.
+func cmdLink(args []string) error {
+	if len(args) == 0 {
+		return errors.New("нужен путь к файлу конфигурации пира (или xs://… чтобы пересобрать ссылку)")
+	}
+	path := args[0]
+	name := ""
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "--name":
+			if i+1 >= len(args) {
+				return errors.New("у ключа --name нет значения")
+			}
+			i++
+			name = args[i]
+		case "--no-name":
+			name = "-"
+		default:
+			return fmt.Errorf("неизвестный ключ %s (есть --name <имя> и --no-name)", args[i])
+		}
+	}
+	c, sec, got, err := conf.LoadAny(path, conf.RoleSpoke)
+	if err != nil {
+		return err
+	}
+	defer sec.Wipe()
+	switch {
+	case name == "-":
+		name = ""
+	case name != "":
+	case got != "":
+		name = got
+	case !conf.IsLink(path) && path != "-":
+		name = strings.TrimSuffix(filepath.Base(path), ".conf")
+	}
+	link, err := conf.Link(c, sec, name)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stderr, "ВНИМАНИЕ: в ссылке ниже лежит приватный ключ этого пира — это и есть "+
+		"выданный доступ целиком. Открытым каналом её пересылать нельзя.")
+	fmt.Println(link)
+	return nil
+}
+
+// cmdConf делает обратное: печатает файл конфигурации из ссылки.
+//
+// Нужно ровно потому, что ссылку присылают, а держать доступ хочется в /etc — файлом, у которого
+// есть права и который читает служба при загрузке. Права на печатаемое здесь не выставляются: вывод
+// перенаправляет человек, и подсказка про chmod уходит в стандартную ошибку.
+func cmdConf(args []string) error {
+	if len(args) == 0 {
+		return errors.New("нужна ссылка xs://… или «-», чтобы прочитать её со стандартного ввода")
+	}
+	c, sec, name, err := conf.LoadAny(args[0], conf.RoleSpoke)
+	if err != nil {
+		return err
+	}
+	defer sec.Wipe()
+	text, err := conf.Render(c, sec)
+	if err != nil {
+		return err
+	}
+	if name != "" {
+		fmt.Fprintf(os.Stderr, "имя из ссылки: %s\n", name)
+	}
+	fmt.Fprintln(os.Stderr, "ВНИМАНИЕ: ниже приватный ключ. Сохраняя в файл, закройте его: "+
+		"umask 077 или chmod 600 — разбор откажется читать конфигурацию, открытую остальным.")
+	fmt.Print(text)
+	return nil
+}
+
 // Проверять тем же кодом, что и запуск, — единственный способ не разойтись с ним: своя проверка в
 // скрипте повторяла бы разбор и однажды повторила бы его неверно.
 //
@@ -450,11 +539,11 @@ func cmdCheck(args []string) error {
 	path := args[0]
 	// Пробуем обе роли: подходящая скажет, что это за файл. Порядок важен только для сообщения об
 	// ошибке — её отдаём от той роли, которая по виду файла ожидалась.
-	c, sec, errSpoke := conf.Load(path, conf.RoleSpoke)
+	c, sec, _, errSpoke := conf.LoadAny(path, conf.RoleSpoke)
 	role := "пир"
 	if errSpoke != nil {
 		var errHub error
-		c, sec, errHub = conf.Load(path, conf.RoleHub)
+		c, sec, _, errHub = conf.LoadAny(path, conf.RoleHub)
 		if errHub != nil {
 			// Какую ошибку показать: если есть ListenPort и нет Endpoint — это хаб, и человеку
 			// нужна ошибка хаба, а не жалоба роли пира на отсутствие Endpoint.
