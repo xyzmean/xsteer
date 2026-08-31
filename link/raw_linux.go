@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strconv"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -21,6 +22,8 @@ import (
 type rawLinux struct {
 	fd    int
 	local [4]byte
+	// noBatch — ядро отказало в sendmmsg (его нет вовсе). Спрашивать второй раз незачем.
+	noBatch bool
 }
 
 // OpenRaw открывает сырой сокет к daddr и ставит на него фильтр.
@@ -80,16 +83,94 @@ func (r *rawLinux) Send(seg []byte) error {
 			return nil
 		case unix.EINTR:
 			continue
-		case unix.ENETUNREACH, unix.ENETDOWN, unix.EHOSTUNREACH, unix.EADDRNOTAVAIL, unix.EINVAL:
-			// Пути наружу нет: интерфейс упал, адрес уехал, маршрут исчез. Сокет ПОДКЛЮЧЁН, то есть
-			// адрес источника у него закреплён при открытии, и после смены адреса он не годится
-			// вовсе — его надо открывать заново, а не повторять отправку. EINVAL в этом списке
-			// именно поэтому: так ядро отвечает на отправку с адреса, которого на машине больше нет.
-			return fmt.Errorf("%w: %v", ErrPathGone, err)
 		default:
-			return err
+			return sendErr(err)
 		}
 	}
+}
+
+// SendBatch отдаёт сегменты одним sendmmsg: по два куска на сегмент — свой заголовок и срез тела в
+// записи.
+//
+// ЗАМЕР, из которого это выросло (эта машина, сегмент 1480 байт в сырой сокет): по одному 3325 нс,
+// пачкой по восемь 2641 нс, пачкой по 64 — 2543 нс. Снимается около четверти, и снимается с самого
+// дорогого шага на быстрой машине: путь вывода ядра стоит там больше, чем шифр и сумма вместе.
+// Дорог при этом НЕ вход в ядро — иначе выигрыш был бы кратным, — а сам путь вывода, и это стоит
+// знать, прежде чем искать здесь разы.
+//
+// НЕОТПРАВЛЕННЫЙ ОСТАТОК НЕ ПОВТОРЯЕТСЯ, и это не упрощение. Номера последовательности на всю запись
+// уже потрачены (см. инвариант в шапке пакета), а повтор с теми же номерами означал бы второй пакет
+// с тем же nonce. Потерянная датаграмма — обычное дело для этого протокола; повтор nonce —
+// полная потеря стойкости AEAD.
+func (r *rawLinux) SendBatch(segs []Seglet) (int, error) {
+	if len(segs) == 0 {
+		return 0, nil
+	}
+	if r.noBatch {
+		return 0, errNoBatch
+	}
+	// Массивы на стеке: пачка не длиннее batchSegs по построению, и выделять под неё память на
+	// каждую запись значило бы отдать сборщику мусора горячий путь.
+	var (
+		msgs [batchSegs]mmsghdr
+		iovs [batchSegs][2]unix.Iovec
+	)
+	n := len(segs)
+	if n > batchSegs {
+		n = batchSegs
+	}
+	for i := 0; i < n; i++ {
+		iovs[i][0].Base = &segs[i].Hdr[0]
+		iovs[i][0].SetLen(len(segs[i].Hdr))
+		iovs[i][1].Base = &segs[i].Body[0]
+		iovs[i][1].SetLen(len(segs[i].Body))
+		msgs[i].hdr.Iov = &iovs[i][0]
+		msgs[i].hdr.SetIovlen(2)
+	}
+	for {
+		got, _, e := unix.Syscall6(unix.SYS_SENDMMSG, uintptr(r.fd),
+			uintptr(unsafe.Pointer(&msgs[0])), uintptr(n), uintptr(unix.MSG_NOSIGNAL), 0, 0)
+		if e == unix.EINTR {
+			continue
+		}
+		if e != 0 {
+			// ENOSYS означает ядро без sendmmsg (до 3.0) — тогда пачки нет вовсе и спрашивать о ней
+			// больше не надо. Прочие ошибки разбирает вызывающий как обычные ошибки отправки.
+			if e == unix.ENOSYS || e == unix.EOPNOTSUPP {
+				r.noBatch = true
+				return 0, errNoBatch
+			}
+			return 0, sendErr(e)
+		}
+		return int(got), nil
+	}
+}
+
+// mmsghdr — struct mmsghdr ядра: заголовок сообщения и сколько байт ушло.
+//
+// ОПИСАН ЗДЕСЬ, ПОТОМУ ЧТО В x/sys ЕГО НЕТ. Раскладка выходит верной сама: unix.Msghdr описан там
+// же и той же генерацией, а естественное выравнивание Go совпадает с сишным на обеих ширинах слова
+// (на 64-битных 56+4 с добивкой до 64, на 32-битных 28+4 без добивки). Проверять это рассуждением
+// всё равно нельзя, поэтому проверяет стенд: пачка отправляется в настоящий сокет, пакеты ловятся с
+// провода и сверяются побайтово с тем, что даёт отправка по одному (см. TestПачкаНаПроводеТаЖе).
+type mmsghdr struct {
+	hdr unix.Msghdr
+	len uint32
+}
+
+// sendErr распознаёт «пути наружу больше нет».
+//
+// Сокет ПОДКЛЮЧЁН, то есть адрес источника у него закреплён при открытии, и после смены адреса он не
+// годится вовсе — его надо открывать заново, а не повторять отправку. EINVAL в списке именно поэтому:
+// так ядро отвечает на отправку с адреса, которого на машине больше нет.
+func sendErr(err error) error {
+	switch err {
+	case nil:
+		return nil
+	case unix.ENETUNREACH, unix.ENETDOWN, unix.EHOSTUNREACH, unix.EADDRNOTAVAIL, unix.EINVAL:
+		return fmt.Errorf("%w: %v", ErrPathGone, err)
+	}
+	return err
 }
 
 func (r *rawLinux) Recv(buf []byte) (int, error) {
