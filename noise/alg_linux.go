@@ -106,7 +106,7 @@ func newAlgSealer(kind AEAD, key []byte) (*algSealer, error) {
 		return nil, fmt.Errorf("ядро не даёт %s (%v)%s", name, err, hint)
 	}
 	s := &algSealer{bind: fd, op: -1, kind: kind, tag: algTagLen}
-	if err := unix.SetsockoptInt(fd, unix.SOL_ALG, unix.ALG_SET_AEAD_AUTHSIZE, algTagLen); err != nil {
+	if err := setAuthsize(fd, algTagLen); err != nil {
 		s.Close()
 		return nil, fmt.Errorf("%s: тег %d байт не принят: %v", name, algTagLen, err)
 	}
@@ -117,14 +117,84 @@ func newAlgSealer(kind AEAD, key []byte) (*algSealer, error) {
 	return s, nil
 }
 
+// setAuthsize задаёт длину тега AEAD.
+//
+// ЧИСЛО ПЕРЕДАЁТСЯ ДЛИНОЙ ПАРАМЕТРА, А НЕ ЕГО ЗНАЧЕНИЕМ, и это не причуда обёртки — так устроено
+// ядро:
+//
+//	case ALG_SET_AEAD_AUTHSIZE:
+//	        ...
+//	        err = type->setauthsize(ask->private, optlen);
+//
+// Значение не читается вовсе. Поэтому обычный setsockopt с целым числом задаёт тег в ЧЕТЫРЕ байта —
+// столько занимает переданное целое, — и делает это молча.
+//
+// Чем это кончилось на живом роутере: шифр согласился, отдал результат на двенадцать байт короче
+// ожидаемого, а наш цикл чтения встал ждать остаток, которого не будет никогда. То есть ошибка
+// проявилась не «неверным тегом», а ПОВИСШЕЙ командой — и нашлась только замером на настоящем
+// железе. Цена ошибки, если бы она доехала до трафика, ещё выше: тег в четыре байта это не
+// ослабление, а отсутствие защиты от подделки.
+func setAuthsize(fd, n int) error {
+	// optval == NULL, optlen == n: ровно так, как читает ядро.
+	_, _, e := unix.Syscall6(unix.SYS_SETSOCKOPT, uintptr(fd), uintptr(unix.SOL_ALG),
+		uintptr(unix.ALG_SET_AEAD_AUTHSIZE), 0, uintptr(n), 0)
+	if e != 0 {
+		return e
+	}
+	return nil
+}
+
+// acceptNoAddr — accept4 БЕЗ запроса адреса пира.
+//
+// ЭТО НЕ МИКРООПТИМИЗАЦИЯ, А ЕДИНСТВЕННЫЙ РАБОТАЮЩИЙ ВЫЗОВ. Обёртка unix.Accept4 всегда передаёт
+// ядру буфер под адрес пира, а у сокетов AF_ALG метода getname нет вовсе (sock_no_getname). Ядро в
+// do_accept, не сумев назвать адрес, превращает это в -ECONNABORTED и закрывает только что
+// созданный дескриптор:
+//
+//	if (upeer_sockaddr) {
+//	        len = ops->getname(newsock, ..., 2);
+//	        if (len < 0) { err = -ECONNABORTED; goto out_fd; }
+//
+// Снаружи это выглядит как «ядро отказало в ядерной криптографии» и уводит в сторону надёжно: и
+// привязка, и ключ приняты, а рабочий дескриптор «не выдаётся» — на машине сборки и на роутере
+// одинаково, то есть похоже на запрет, а не на свою ошибку. Нулевой адрес и нулевая длина проходят
+// оба условия.
+func acceptNoAddr(fd int) (int, error) {
+	for {
+		nfd, _, e := unix.Syscall6(unix.SYS_ACCEPT4, uintptr(fd), 0, 0,
+			uintptr(unix.SOCK_CLOEXEC), 0, 0)
+		if e == unix.EINTR {
+			continue
+		}
+		if e != 0 {
+			return -1, e
+		}
+		return int(nfd), nil
+	}
+}
+
 // setKey ставит ключ и заводит новый рабочий дескриптор. Зовётся и при смене эпохи.
 func (s *algSealer) setKey(key []byte) error {
 	if err := unix.SetsockoptString(s.bind, unix.SOL_ALG, unix.ALG_SET_KEY, string(key)); err != nil {
 		return fmt.Errorf("%s: ключ не принят: %v", algName(s.kind), err)
 	}
-	op, _, err := unix.Accept4(s.bind, unix.SOCK_CLOEXEC)
+	op, err := acceptNoAddr(s.bind)
 	if err != nil {
 		return fmt.Errorf("%s: рабочий дескриптор не выдан: %v", algName(s.kind), err)
+	}
+	// СРОК НА ЧТЕНИЕ ОБЯЗАТЕЛЕН, и это не осторожность. Ответ ядра читается циклом «пока не
+	// набрали столько, сколько ждём», и если ядро отдало меньше (другая версия, другой драйвер,
+	// частичный результат от ускорителя), цикл встаёт в read НАВСЕГДА. Замер на живом роутере это и
+	// показал: команда повисла, не напечатав ни строки, — а повисший туннель хуже отказавшего,
+	// потому что о нём никто не узнает.
+	//
+	// Две секунды: операция над предельной записью стоит на самой слабой из наших целей единицы
+	// миллисекунд, то есть запас трёхзначный, а срок при этом заведомо меньше любого людского
+	// терпения.
+	tv := unix.Timeval{Sec: 2}
+	if err := unix.SetsockoptTimeval(op, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv); err != nil {
+		unix.Close(op)
+		return fmt.Errorf("%s: срок на чтение не встал: %v", algName(s.kind), err)
 	}
 	if s.op >= 0 {
 		unix.Close(s.op)
@@ -250,21 +320,31 @@ func (s *algSealer) run(op int, iv []byte, assoclen int, in, out []byte) error {
 	if err := sendmsgAlg(s.op, in, ctrl); err != nil {
 		return err
 	}
-	got := 0
-	for got < len(out) {
-		n, err := unix.Read(s.op, out[got:])
+	// ЧТЕНИЕ РОВНО ОДНО, и это не экономия вызова, а условие того, что мы не повиснем.
+	//
+	// Сокет AF_ALG — SOCK_SEQPACKET: результат операции приходит ОДНИМ сообщением целиком.
+	// Дочитывать остаток неоткуда, и цикл «пока не набрали столько, сколько ждём» на коротком
+	// ответе встаёт в read навсегда — ровно это и случилось на живом роутере, когда тег оказался не
+	// той длины (см. setAuthsize). Поэтому длина сверяется, а не досбирается: расхождение — это
+	// ошибка, а не повод ждать.
+	for {
+		n, err := unix.Read(s.op, out)
 		if err == unix.EINTR {
 			continue
+		}
+		if err == unix.EAGAIN {
+			// Срок вышел (SO_RCVTIMEO): ядро приняло запрос и не ответило. Названо отдельно —
+			// спутать это с прочими ошибками значило бы искать причину не там.
+			return fmt.Errorf("AF_ALG не ответил за отведённый срок")
 		}
 		if err != nil {
 			return err
 		}
-		if n == 0 {
-			return fmt.Errorf("AF_ALG вернул %d байт из %d", got, len(out))
+		if n != len(out) {
+			return fmt.Errorf("AF_ALG вернул %d байт вместо %d", n, len(out))
 		}
-		got += n
+		return nil
 	}
-	return nil
 }
 
 func putU32(b []byte, v uint32) {

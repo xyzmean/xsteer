@@ -106,10 +106,11 @@ func frameOf(t *testing.T, segs [][]byte, gso int) []byte {
 		csum.PseudoV4(pkt[12:16], pkt[16:20], 6, len(th))))
 	f[0] = vnetNeedsCsum
 	f[1] = vnetGSOTCPv4
-	binary.LittleEndian.PutUint16(f[2:4], uint16(hdrLen))
-	binary.LittleEndian.PutUint16(f[4:6], uint16(gso))
-	binary.LittleEndian.PutUint16(f[6:8], 20)
-	binary.LittleEndian.PutUint16(f[8:10], 16)
+	// Порядок ХОСТА, как его читает ядро: см. оговорку в offload_linux.go.
+	vnetPut(f[2:4], uint16(hdrLen))
+	vnetPut(f[4:6], uint16(gso))
+	vnetPut(f[6:8], 20)
+	vnetPut(f[8:10], 16)
 	return f
 }
 
@@ -291,8 +292,8 @@ func TestOffloadCompletesPartialSum(t *testing.T) {
 	copy(f[vnetHdrLen:], p)
 	f[0] = vnetNeedsCsum
 	f[1] = vnetGSONone
-	binary.LittleEndian.PutUint16(f[6:8], 20)
-	binary.LittleEndian.PutUint16(f[8:10], 16)
+	vnetPut(f[6:8], 20)
+	vnetPut(f[8:10], 16)
 	i := 0
 	o := newOffload(func(b []byte) (int, error) {
 		if i > 0 {

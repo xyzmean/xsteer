@@ -42,6 +42,23 @@ import (
 	"github.com/xyzmean/xsteer/csum"
 )
 
+// ПОЛЯ ЗАГОЛОВКА VIRTIO ЧИТАЮТСЯ И ПИШУТСЯ В ПОРЯДКЕ ХОСТА, А НЕ В СЕТЕВОМ.
+//
+// Это не небрежность и не выбор: устройство tun согласовывает порядок только через
+// VIRTIO_F_VERSION_1, которого оно не объявляет, поэтому ядро читает поля как __virtio16 в
+// прежнем режиме — то есть родным порядком машины. Зашитый little-endian верен на amd64, arm64 и
+// mipsle и НЕВЕРЕН на big-endian (mips, ppc): разгрузка сломалась бы там молча, «на одной
+// архитектуре пакеты не доходят». Та же оговорка стоит у реализации на C (src/ext/tun.c).
+var hostU16 = func() (get func([]byte) uint16, put func([]byte, uint16)) {
+	var probe uint16 = 1
+	if *(*byte)(unsafe.Pointer(&probe)) == 1 {
+		return binary.LittleEndian.Uint16, binary.LittleEndian.PutUint16
+	}
+	return binary.BigEndian.Uint16, binary.BigEndian.PutUint16
+}
+
+var vnetGet, vnetPut = hostU16()
+
 const (
 	// vnetHdrLen — sizeof(struct virtio_net_hdr): флаги, тип разгрузки, длина заголовков, размер
 	// сегмента, начало суммы, смещение суммы.
@@ -176,10 +193,10 @@ func (o *offload) read(p []byte) (int, error) {
 func (o *offload) take(frame []byte) {
 	flags := frame[0]
 	gsoType := frame[1] &^ vnetGSOECN
-	hdrLen := int(binary.LittleEndian.Uint16(frame[2:4]))
-	gsoSize := int(binary.LittleEndian.Uint16(frame[4:6]))
-	csumStart := int(binary.LittleEndian.Uint16(frame[6:8]))
-	csumOff := int(binary.LittleEndian.Uint16(frame[8:10]))
+	hdrLen := int(vnetGet(frame[2:4]))
+	gsoSize := int(vnetGet(frame[4:6]))
+	csumStart := int(vnetGet(frame[6:8]))
+	csumOff := int(vnetGet(frame[8:10]))
 	pkt := frame[vnetHdrLen:]
 
 	o.segI, o.segN, o.single = 0, 0, nil
@@ -515,10 +532,10 @@ func (o *offload) Flush() error {
 		} else {
 			hdr[1] = vnetGSOTCPv4
 		}
-		binary.LittleEndian.PutUint16(hdr[2:4], uint16(o.wrHdr))
-		binary.LittleEndian.PutUint16(hdr[4:6], uint16(o.wrGSO))
-		binary.LittleEndian.PutUint16(hdr[6:8], uint16(o.wrIPH))
-		binary.LittleEndian.PutUint16(hdr[8:10], 16)
+		vnetPut(hdr[2:4], uint16(o.wrHdr))
+		vnetPut(hdr[4:6], uint16(o.wrGSO))
+		vnetPut(hdr[6:8], uint16(o.wrIPH))
+		vnetPut(hdr[8:10], 16)
 	}
 	// Один сегмент — обычный кадр с нулевыми метаданными: сумма в нём уже верная (пакет приехал из
 	// туннеля целиком), и просить ядро считать её заново незачем.
