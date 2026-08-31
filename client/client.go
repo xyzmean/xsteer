@@ -129,8 +129,43 @@ type Client struct {
 		lastRx atomic.Int64
 	}
 
+	// ---- слежение за сетью (netwatch_*.go) ----
+	//
+	// netGen — поколение сети: растёт, когда путь к хабу изменился (адрес выхода стал другим,
+	// пропал или появился). Живые соединения сверяются с ним и поднимаются заново сами; ждать при
+	// этом ни тишины, ни ошибки отправки не нужно.
+	netGen atomic.Uint64
+	// netMu и netWait — оповещение ждущих. Канал ЗАКРЫВАЕТСЯ на изменении и заменяется новым:
+	// закрытие — единственный способ разбудить сразу всех, не заводя списка подписчиков.
+	netMu   sync.Mutex
+	netWait chan struct{}
+
 	wg sync.WaitGroup
 }
+
+// netChanged — канал, который закроется при следующем изменении сети.
+func (c *Client) netChanged() <-chan struct{} {
+	c.netMu.Lock()
+	defer c.netMu.Unlock()
+	if c.netWait == nil {
+		c.netWait = make(chan struct{})
+	}
+	return c.netWait
+}
+
+// bumpNet объявляет, что сеть изменилась: поколение вперёд, все ждущие разбужены.
+func (c *Client) bumpNet() {
+	c.netGen.Add(1)
+	c.netMu.Lock()
+	if c.netWait != nil {
+		close(c.netWait)
+		c.netWait = nil
+	}
+	c.netMu.Unlock()
+}
+
+// linkEgress — обёртка над link.EgressAddr под одним именем для netwatch_*.go обеих платформ.
+func linkEgress(daddr [4]byte) ([4]byte, error) { return link.EgressAddr(daddr) }
 
 type hubInfo struct {
 	addr [4]byte
@@ -351,6 +386,13 @@ func Run(ctx context.Context, opt Options) error {
 	if conns > 1 {
 		c.logf("%s: соединений к хабу %d (по одному на ядро)", name, conns)
 	}
+	// Слежение за сетью поднимается ДО соединений: смена сети во время первого подключения — самый
+	// обычный случай (служба стартует, пока интерфейс ещё поднимается), и заметить её надо сразу.
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.watchNet(ctx)
+	}()
 	for i := 0; i < conns; i++ {
 		c.wg.Add(1)
 		go func(id int) {
@@ -587,9 +629,31 @@ func defaultConns() int {
 	return n
 }
 
-// worker — один поддельный соединение к хабу от подъёма до отмены.
+// Шаг повтора подключения.
+//
+// БЫЛО ПЯТЬ СЕКУНД ПОСТОЯННО, и это плохо в обе стороны сразу. Когда сеть на месте и соединение
+// оборвалось по своей причине (смена ключей, потеря пути, перезапуск хаба), пять секунд молчания
+// туннеля — очень много: восстановиться можно за один круг обмена. А когда сети нет вовсе, повтор
+// раз в пять секунд — это долбёж в пустоту, который на роутере ещё и будит модем.
+//
+// Поэтому шаг растёт: четверть секунды, потом вдвое, до пяти секунд. И сбрасывается он не по
+// таймеру, а по двум событиям, каждое из которых означает «условия изменились»: соединение прожило
+// дольше redialReset (значит подключаться получается) или сеть сменилась (значит прошлая неудача про
+// новую сеть ничего не говорит).
+const (
+	redialMin   = 250 * time.Millisecond
+	redialMax   = 5 * time.Second
+	redialReset = 10 * time.Second
+)
+
+// worker — одно поддельное соединение к хабу от подъёма до отмены.
 func (c *Client) worker(ctx context.Context, id int, dev tun.Device, devName string) {
+	wait := redialMin
 	for ctx.Err() == nil {
+		// Подписка берётся ДО попытки: иначе смена сети, случившаяся во время подключения,
+		// осталась бы незамеченной и мы прождали бы полный шаг.
+		changed := c.netChanged()
+		began := time.Now()
 		var err error
 		if c.opt.Stream {
 			err = c.streamSession(ctx, id, dev)
@@ -602,12 +666,18 @@ func (c *Client) worker(ctx context.Context, id int, dev tun.Device, devName str
 		if err != nil {
 			c.logf("соединение %d: %v", id, err)
 		}
-		// Пауза перед повтором: без неё неудачное подключение молотило бы сеть, которой ещё нет.
-		// Пять секунд — тот же ритм, с каким службу поднимает система.
+		if time.Since(began) >= redialReset {
+			wait = redialMin
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(5 * time.Second):
+		case <-changed:
+			wait = redialMin
+		case <-time.After(wait):
+			if wait *= 2; wait > redialMax {
+				wait = redialMax
+			}
 		}
 	}
 }
@@ -797,10 +867,10 @@ func (c *Client) session(ctx context.Context, id int, dev tun.Device, devName st
 	wg.Add(2)
 	go func() { defer wg.Done(); defer stop(); c.outbound(sctx, id, s, dev) }()
 	go func() { defer wg.Done(); defer stop(); c.inbound(sctx, id, s, dev, devName) }()
-	c.timeLoop(sctx, id, s, dev, devName)
+	err = c.timeLoop(sctx, id, s, dev, devName)
 	stop()
 	wg.Wait()
-	return nil
+	return err
 }
 
 // outbound: TUN → поддельный TCP.
@@ -870,6 +940,13 @@ func (c *Client) outbound(ctx context.Context, id int, s *sess, dev tun.Device) 
 		if err := c.sendFrames(s, row, scratch, frames, mtu); err != nil {
 			c.stats.dropped.Add(uint64(len(frames)))
 			if errors.Is(err, link.ErrDead) {
+				return
+			}
+			// Путь наружу пропал — ждать тишины незачем, ядро уже ответило прямо. Прежде такая
+			// ошибка была неотличима от прочих и только растила счётчик отброшенных: при пропавшем
+			// интернете клиент молотил в мёртвый сокет весь DeadMS.
+			if errors.Is(err, link.ErrPathGone) {
+				c.logf("соединение %d: %v — поднимаю заново, когда путь вернётся", id, err)
 				return
 			}
 		} else {
@@ -1083,7 +1160,12 @@ func (c *Client) onPack(s *sess, id, acked int, dev tun.Device, devName string) 
 }
 
 // timeLoop — ход времени: подтверждения, keepalive, пробы пути, пределы соединения.
-func (c *Client) timeLoop(ctx context.Context, id int, s *sess, dev tun.Device, devName string) {
+//
+// Он же следит за поколением сети: соединение, открытое в прежней сети, после смены адреса выхода
+// не годится вовсе — сокет ПОДКЛЮЧЁН, то есть адрес источника закреплён при открытии. Ждать, пока
+// это выяснится по тишине или по ошибке отправки, незачем: ядро уже сказало, что сеть другая.
+func (c *Client) timeLoop(ctx context.Context, id int, s *sess, dev tun.Device, devName string) error {
+	gen := c.netGen.Load()
 	t := time.NewTicker(link.TickMS * time.Millisecond)
 	defer t.Stop()
 	keepalive := int64(c.opt.Conf.Peers[0].Keepalive) * 1000
@@ -1093,16 +1175,21 @@ func (c *Client) timeLoop(ctx context.Context, id int, s *sess, dev tun.Device, 
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		case acked := <-s.packs:
 			c.onPack(s, id, acked, dev, devName)
 			continue
 		case <-t.C:
 		}
+		// Сеть стала другой: поднимаемся заново немедленно. Проверка стоит ПЕРЕД Tick, потому что
+		// после смены адреса Tick ничего полезного не скажет — он ждёт тишины, которая тут уже
+		// известна заранее.
+		if c.netGen.Load() != gen {
+			return errors.New("сеть изменилась — поднимаю соединение заново")
+		}
 		if err := s.conn.Tick(); err != nil {
-			c.logf("соединение %d: путь молчит %d мс при активной отправке — поднимаю заново",
-				id, link.DeadMS)
-			return
+			return fmt.Errorf("путь молчит %d мс при активной отправке — поднимаю заново",
+				link.DeadMS)
 		}
 		now := time.Now().UnixNano() / int64(time.Millisecond)
 

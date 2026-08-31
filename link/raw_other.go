@@ -55,7 +55,7 @@ func OpenRawListen(port uint16, mask, id uint16) (Raw, error) {
 		runtime.GOOS)
 }
 
-func OpenRawSend(daddr [4]byte) (Raw, error) {
+func OpenRawSend(daddr, saddr [4]byte) (Raw, error) {
 	return nil, fmt.Errorf("сырой сокет на %s не сделан: клиент здесь работает режимом потока (--stream)",
 		runtime.GOOS)
 }

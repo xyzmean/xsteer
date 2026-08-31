@@ -75,10 +75,20 @@ func OpenRaw(daddr [4]byte, sport, dport uint16) (Raw, error) {
 func (r *rawLinux) Send(seg []byte) error {
 	for {
 		err := unix.Send(r.fd, seg, unix.MSG_NOSIGNAL)
-		if err == unix.EINTR {
+		switch err {
+		case nil:
+			return nil
+		case unix.EINTR:
 			continue
+		case unix.ENETUNREACH, unix.ENETDOWN, unix.EHOSTUNREACH, unix.EADDRNOTAVAIL, unix.EINVAL:
+			// Пути наружу нет: интерфейс упал, адрес уехал, маршрут исчез. Сокет ПОДКЛЮЧЁН, то есть
+			// адрес источника у него закреплён при открытии, и после смены адреса он не годится
+			// вовсе — его надо открывать заново, а не повторять отправку. EINVAL в этом списке
+			// именно поэтому: так ядро отвечает на отправку с адреса, которого на машине больше нет.
+			return fmt.Errorf("%w: %v", ErrPathGone, err)
+		default:
+			return err
 		}
-		return err
 	}
 }
 
@@ -183,10 +193,24 @@ func EgressMTU(local [4]byte) (mtu int, ifname string) {
 
 // OpenRawSend — сырой сокет ТОЛЬКО для отправки конкретному адресу.
 //
+// saddr — адрес источника, С КОТОРОГО обязаны уходить наши пакеты. Нулевой означает «выбери сам,
+// ядро».
+//
+// ЗАЧЕМ ЕГО НАЗЫВАТЬ, А НЕ ОСТАВЛЯТЬ ЯДРУ. Хаб отвечает пиру тем адресом, НА КОТОРЫЙ пир написал, а
+// не тем, который ядро выберет для обратного маршрута. У хаба с одним адресом это одно и то же, а у
+// многоадресного — нет, и расхождение ломает туннель молча сразу по двум причинам: сумма TCP
+// считается с адресом из принятого сегмента (link.Accept берёт SAddr именно оттуда), а фильтр на
+// сокете клиента пропускает только сегменты С АДРЕСА ХАБА — ответ с другого адреса ядро клиента
+// отбрасывает ещё до нашего кода.
+//
+// Найдено стендом переезда (tests/roam.sh): пир, пришедший к тому же хабу другим путём, получал в
+// ответ тишину, потому что хаб отвечал ему с адреса того интерфейса, через который лежал обратный
+// маршрут.
+//
 // Фильтр ставится глухой: принимать этому сокету нечего, а без фильтра он получал бы копию каждого
 // локально доставляемого сегмента TCP и переполнял бы очередь — на хабе с тридцатью сессиями это
 // тридцать лишних копий каждого пакета.
-func OpenRawSend(daddr [4]byte) (Raw, error) {
+func OpenRawSend(daddr, saddr [4]byte) (Raw, error) {
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_TCP)
 	if err != nil {
 		return nil, fmt.Errorf("сырой сокет: %w", err)
@@ -194,6 +218,11 @@ func OpenRawSend(daddr [4]byte) (Raw, error) {
 	r := &rawLinux{fd: fd}
 	_ = unix.SetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_MTU_DISCOVER, unix.IP_PMTUDISC_DONT)
 	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, 1<<20)
+	if saddr != [4]byte{} {
+		// Отказ здесь НЕ отказ отправки: адрес мог уехать между приёмом сегмента и этой строкой, и
+		// тогда лучше ответить с того, который выберет ядро, чем не ответить вовсе.
+		_ = unix.Bind(fd, &unix.SockaddrInet4{Addr: saddr})
+	}
 	if err := unix.Connect(fd, &unix.SockaddrInet4{Addr: daddr}); err != nil {
 		unix.Close(fd)
 		return nil, fmt.Errorf("connect: %w", err)
