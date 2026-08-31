@@ -26,6 +26,7 @@ import (
 	"github.com/xyzmean/xsteer/client"
 	"github.com/xyzmean/xsteer/conf"
 	"github.com/xyzmean/xsteer/hub"
+	"github.com/xyzmean/xsteer/noise"
 	"github.com/xyzmean/xsteer/wire"
 )
 
@@ -50,6 +51,7 @@ func usage() {
     xsteer link <файл.conf>          напечатать ссылку xs:// для этой конфигурации
     xsteer conf <xs://…|->            напечатать файл конфигурации из ссылки
     xsteer show [файл состояния]     что происходит с туннелем
+    xsteer crypto                    замер: чем быстрее считать шифр на этой машине
     xsteer version                   версия и накладные расходы протокола
 
 Где ждут <файл.conf>, принимается и ссылка xs://…, и «-» — тогда ссылка или целый файл читаются
@@ -67,6 +69,7 @@ func usage() {
     --probe-ms <N>    как часто перепроверять путь (по умолчанию %d)
     --chacha          заставить ChaCha20-Poly1305 (по умолчанию решает наличие AES в процессоре)
     --no-offload      не включать разгрузку сегментации устройства (для разбирательства)
+    --crypto <кто>    кто считает шифр: auto (умолчание, решает замер), go, kernel
     --no-batch        не собирать кадры в одну запись: нужно для разговора с хабом на C,
                       пока перенос не сделан. Облик на проводе при этом хуже
     --stream          вести записи по НАСТОЯЩЕМУ TCP вместо поддельного: без сырого сокета и
@@ -83,6 +86,7 @@ func usage() {
     --workers <N>     воркеров (по умолчанию по числу ядер, не больше %d)
     --no-tun          не поднимать устройство: только трафик пир↔пир
     --no-offload      не включать разгрузку сегментации устройства (для разбирательства)
+    --crypto <кто>    кто считает шифр: auto (умолчание, решает замер), go, kernel
     --no-batch        не собирать кадры в одну запись: для клиента на C
     --stream-port <N> слушать НАСТОЯЩИЙ TCP на этом порту (режим потока), помимо поддельного
     --stream-only     не поднимать поддельный TCP вовсе: порт занимает только поток
@@ -119,6 +123,8 @@ func main() {
 		err = cmdCheck(os.Args[2:])
 	case "link":
 		err = cmdLink(os.Args[2:])
+	case "crypto":
+		err = cmdCrypto(os.Args[2:])
 	case "conf":
 		err = cmdConf(os.Args[2:])
 	case "version":
@@ -163,6 +169,114 @@ func cipherName() string {
 	return "ChaCha20-Poly1305 (аппаратного AES нет)"
 }
 
+// backendOf — значение ключа --crypto.
+func backendOf(v string) (noise.Backend, error) {
+	switch strings.ToLower(v) {
+	case "auto", "авто":
+		return noise.BackendAuto, nil
+	case "go", "свой":
+		return noise.BackendGo, nil
+	case "kernel", "ядро", "af_alg":
+		return noise.BackendKernel, nil
+	}
+	return noise.BackendAuto, fmt.Errorf("--crypto принимает auto, go или kernel, а не %q", v)
+}
+
+// applyCrypto ставит исполнителя шифра ДО первого рукопожатия и возвращает, оказался ли AES быстрее.
+//
+// При «auto» это замер (десятки миллисекунд один раз), при остальных — прямое указание. Числа
+// печатаются в любом случае, потому что «медленно» без них выясняется догадками; при явном указании
+// печатается ещё и то, что замер проигнорирован — иначе человек будет искать в них объяснение.
+func applyCrypto(want noise.Backend, logf func(string, ...any)) (aesFaster bool, err error) {
+	if want == noise.BackendAuto {
+		return noise.Choose(logf), nil
+	}
+	if want == noise.BackendGo {
+		noise.SetBackend(noise.BackendGo)
+		logf("шифр: считает свой код (задано ключом --crypto go)")
+		return aesPreferred(), nil
+	}
+	// --crypto kernel — просьба прямая, поэтому ядро пробуется по-настоящему (это может подгрузить
+	// algif_aead) и сверяется с эталоном. Не сошлось или недоступно — ОТКАЗ подъёма, а не тихий
+	// возврат к своему коду: человек, назвавший этот режим, обязан узнать, что он не работает, а не
+	// выяснять это потом по скорости.
+	okAny := false
+	for _, kind := range []noise.AEAD{noise.AEADAES128, noise.AEADChaCha} {
+		ok, why := noise.KernelUsable(kind, true)
+		if ok {
+			noise.SetBackendFor(kind, noise.BackendKernel)
+			okAny = true
+			logf("шифр: %s считает ядро, драйвер %s", kind, driverOr(noise.KernelDriver(kind)))
+			continue
+		}
+		noise.SetBackendFor(kind, noise.BackendGo)
+		logf("шифр: %s ядру не отдан — %s", kind, why)
+	}
+	if !okAny {
+		return false, fmt.Errorf("--crypto kernel: ядро не берёт ни один из наших шифров " +
+			"(подробности выше). Уберите ключ — считать будет свой код")
+	}
+	for _, x := range noise.Measure(true) {
+		logf("шифр: %s", x.Line())
+	}
+	return aesPreferred(), nil
+}
+
+func driverOr(d string) string {
+	if d == "" {
+		return "(имя не читается)"
+	}
+	return d
+}
+
+// cmdCrypto печатает замер и ничего не меняет: этим числом решается, стоит ли ставить ядерные модули
+// криптографии на роутер, и знать его надо ДО того, как поднимать туннель.
+func cmdCrypto(args []string) error {
+	probe := false
+	for _, a := range args {
+		switch a {
+		case "--probe":
+			probe = true
+		default:
+			return fmt.Errorf("у команды crypto есть только ключ --probe (а не %s)", a)
+		}
+	}
+	fmt.Printf("%s/%s, %d ядер\n\n", runtime.GOOS, runtime.GOARCH, numCPUOf())
+	if probe {
+		fmt.Fprintln(os.Stderr, "--probe: ядро будет опрошено по-настоящему. Это может ЗАГРУЗИТЬ "+
+			"модуль algif_aead,\nкоторый в защищённых сборках выключен намеренно (CVE-2026-31431).")
+		fmt.Fprintln(os.Stderr, "")
+	}
+	res := noise.Measure(probe)
+	for _, x := range res {
+		fmt.Println(x.Line())
+	}
+	fmt.Println()
+	// Подсказка про модули — там, где она полезна: на машине без ядерной криптографии.
+	need := false
+	for _, x := range res {
+		if x.Backend == noise.BackendKernel && x.NsPerPkt == 0 {
+			need = true
+		}
+	}
+	if need && runtime.GOOS == "linux" {
+		fmt.Println("Ядро не отдаёт часть шифров. Это не поломка: набор криптографии в ядре собирается")
+		fmt.Println("модулями, и пока их нет, считать может только свой код. На OpenWrt их приносит")
+		fmt.Println("kmod-crypto-gcm (для gcm(aes), поверх аппаратного ctr(aes), если он есть) и")
+		fmt.Println("kmod-crypto-lib-chacha20poly1305 (его же тянет за собой wireguard и amneziawg).")
+		fmt.Println("Ставить их стоит только если замер после установки покажет выигрыш: у ядерного")
+		fmt.Println("пути два системных вызова на пакет, и на быстром процессоре он проигрывает.")
+	}
+	return nil
+}
+
+// numCPUOf — вынесено функцией, чтобы cmdCrypto не тянул зависимость от пакета client.
+func numCPUOf() int { return runtime.NumCPU() }
+
+// stderrf — журнал подъёма идёт в стандартную ошибку, как и всё остальное осведомление: в
+// стандартный вывод пишут только то, что предназначено для перенаправления (ссылка, конфигурация).
+func stderrf(f string, a ...any) { fmt.Fprintf(os.Stderr, "xsteer: "+f+"\n", a...) }
+
 func cmdUp(args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("нужен путь к файлу конфигурации (подсказка: xsteer --help)")
@@ -179,6 +293,7 @@ func cmdUp(args []string) error {
 	// поднимал устройство, ставил маршруты и не мог отправить ни одного пакета. Требовать ключ,
 	// без которого на этой системе ничего не работает, — это ловушка, а не настройка: человек
 	// получал молчащий туннель и никакого указания на причину.
+	cryptoWant := noise.BackendAuto
 	opt := client.Options{AESPreferred: aesPreferred(), Routes: true,
 		Stream: runtime.GOOS == "windows"}
 	forceChaCha := false
@@ -238,6 +353,16 @@ func cmdUp(args []string) error {
 			opt.NoBatch = true
 		case "--no-offload":
 			opt.NoOffload = true
+		case "--crypto":
+			v, ok := value()
+			if !ok {
+				return fmt.Errorf("у ключа --crypto нет значения (auto, go, kernel)")
+			}
+			b, err := backendOf(v)
+			if err != nil {
+				return err
+			}
+			cryptoWant = b
 		case "--stream":
 			opt.Stream = true
 		case "--no-stream":
@@ -271,6 +396,19 @@ func cmdUp(args []string) error {
 	defer s.Wipe()
 	opt.Conf, opt.Sec = c, s
 
+	// Исполнитель шифра выбирается ДО первого рукопожатия: ключи разворачиваются в нём, и менять
+	// его на живой сессии значило бы менять то, чем уже зашифрованы записи.
+	//
+	// ЗАМЕР МОЖЕТ ПЕРЕИГРАТЬ И ВЫБОР ШИФРА, но только если человек не выбрал его сам: --chacha
+	// остаётся сильнее замера. Это не осторожность, а разделение: замер отвечает на вопрос «что
+	// быстрее», а ключ — на вопрос «чего я хочу», и второй всегда старше.
+	aesFast, err := applyCrypto(cryptoWant, stderrf)
+	if err != nil {
+		return err
+	}
+	if !forceChaCha {
+		opt.AESPreferred = aesFast
+	}
 	fmt.Fprintf(os.Stderr, "xsteer %s: %s, накладные %d байт\n", Version, cipherName(), wire.Overhead)
 
 	// Ctrl-C и SIGTERM снимают туннель по-настоящему: снимается правило против RST, закрывается
@@ -294,6 +432,7 @@ func cmdHub(args []string) error {
 		return fmt.Errorf("нужен путь к файлу конфигурации хаба (подсказка: xsteer --help)")
 	}
 	path := args[0]
+	cryptoWant := noise.BackendAuto
 	opt := hub.Options{}
 	for i := 1; i < len(args); i++ {
 		key := args[i]
@@ -327,6 +466,16 @@ func cmdHub(args []string) error {
 			opt.NoBatch = true
 		case "--no-offload":
 			opt.NoOffload = true
+		case "--crypto":
+			v, ok := value()
+			if !ok {
+				return fmt.Errorf("у ключа --crypto нет значения (auto, go, kernel)")
+			}
+			b, err := backendOf(v)
+			if err != nil {
+				return err
+			}
+			cryptoWant = b
 		case "--stream-port":
 			v, ok := value()
 			if !ok {
@@ -374,6 +523,12 @@ func cmdHub(args []string) error {
 	defer s.Wipe()
 	opt.Conf, opt.Sec = c, s
 
+	// Шифр называет КЛИЕНТ, поэтому хаб выбирает только исполнителя — каждому из двух шифров
+	// своего. Замер ему нужен ровно так же: ускоритель в ядре либо есть, либо нет, и на хабе это
+	// решает столько же.
+	if _, err := applyCrypto(cryptoWant, stderrf); err != nil {
+		return err
+	}
 	fmt.Fprintf(os.Stderr, "xsteer %s: хаб, %s\n", Version, cipherName())
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

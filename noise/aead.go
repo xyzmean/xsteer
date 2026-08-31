@@ -39,6 +39,7 @@ import (
 	"crypto/cipher"
 	"errors"
 	"fmt"
+	"sync/atomic"
 
 	"golang.org/x/crypto/chacha20poly1305"
 )
@@ -85,7 +86,7 @@ func aeadOfSuite(s uint16) AEAD {
 // (цена setkey), и в Go то же самое: cipher.NewGCM разворачивает таблицы, и делать это на каждый
 // пакет означало бы отдать заметную часть процессора под работу, результат которой не меняется.
 type Keys struct {
-	aead cipher.AEAD
+	aead sealer
 	iv   [12]byte
 	kind AEAD
 
@@ -96,7 +97,7 @@ type Keys struct {
 	epochsOn bool
 	root     [32]byte // корень текущей эпохи; ратчетится вперёд и стирается за собой
 	epoch    uint64
-	prevAEAD cipher.AEAD // одна ступень назад: запись на границе эпох не должна стоить обрыва
+	prevAEAD sealer // одна ступень назад: запись на границе эпох не должна стоить обрыва
 	prevIV   [12]byte
 	prevOK   bool
 }
@@ -106,22 +107,173 @@ var errCrypto = errors.New("noise: сбой примитива")
 func newKeys(kind AEAD, key, iv []byte) (*Keys, error) {
 	k := &Keys{kind: kind}
 	copy(k.iv[:], iv)
+	sl, err := newSealer(kind, key)
+	if err != nil {
+		return nil, err
+	}
+	k.aead = sl
+	return k, nil
+}
+
+// ---- КТО СЧИТАЕТ ШИФР -------------------------------------------------------
+//
+// Арифметика шифра отделена от всего остального интерфейсом, и это ради одной возможности: отдать
+// её ядру, а через ядро — железу. Почему это важно, видно только на замере слабой машины. Живой
+// роутер (mt7621, mipsel 24Kc), пакет 1440 байт:
+//
+//	AES-128-GCM        424 мкс      27 Мбит/с на ядро
+//	ChaCha20-Poly1305  268 мкс      43 Мбит/с на ядро
+//	сумма TCP           7,2 мкс   1604 Мбит/с на ядро
+//
+// Криптография там дороже суммы в тридцать семь раз, то есть составляет 97% стоимости пакета.
+// Работа над вызовами, копиями и разгрузкой устройства этого не сдвигает вовсе — сдвинуть может
+// только другой исполнитель.
+//
+// ЧТО МЕНЯЕТСЯ НА ПРОВОДЕ: НИЧЕГО. gcm(aes) и rfc7539(chacha20,poly1305) в наборе ядра — те же
+// конструкции, что crypto/cipher и x/crypto здесь: те же ключи, те же nonce, те же теги. Поэтому
+// движок можно выбирать на каждой стороне свой, и вторая ничего не заметит; поэтому же выбор не
+// требует ни согласования, ни ключа в конфигурации на обеих сторонах.
+
+// sealer — исполнитель шифра.
+type sealer interface {
+	seal(dst, nonce, pt, aad []byte) ([]byte, error)
+	open(dst, nonce, ct, aad []byte) ([]byte, error)
+	overhead() int
+	name() string
+	close()
+}
+
+// Backend — кто считает шифр.
+type Backend int32
+
+const (
+	// BackendAuto — решает замер при подъёме (см. Choose). Умолчание.
+	BackendAuto Backend = iota
+	// BackendGo — только свой код: crypto/cipher и x/crypto.
+	BackendGo
+	// BackendKernel — только ядро через AF_ALG. Если ядро не умеет — ОТКАЗ, а не тихий возврат к
+	// Go: человек, назвавший этот режим, обязан узнать, что он не работает, а не выяснять потом по
+	// скорости.
+	BackendKernel
+)
+
+func (b Backend) String() string {
+	switch b {
+	case BackendGo:
+		return "go"
+	case BackendKernel:
+		return "ядро"
+	}
+	return "авто"
+}
+
+// chosen — выбранный движок ДЛЯ КАЖДОГО шифра отдельно, по номеру AEAD.
+//
+// Раздельно, а не одним значением, и это не запас на будущее. Шифр выбирает КЛИЕНТ (он один знает
+// своё железо), хаб же обязан считать тем, что назвал клиент, — значит на хабе выбирать шифр нельзя,
+// а выбирать исполнителя для каждого из двух можно и нужно. И соотношение у них разное:
+// аппаратный ускоритель почти всегда умеет AES и почти никогда ChaCha, а у процессора без AES-NI
+// наоборот.
+//
+// Атомарные: ставятся один раз при подъёме, читаются на каждое рукопожатие.
+var chosen [2]atomic.Int32
+
+func slot(a AEAD) int {
+	if a == AEADAES128 {
+		return 1
+	}
+	return 0
+}
+
+// SetBackend задаёт движок для ОБОИХ шифров. Зовётся ключом командной строки; замер (Choose) ставит
+// каждому свой.
+func SetBackend(b Backend) {
+	chosen[0].Store(int32(b))
+	chosen[1].Store(int32(b))
+}
+
+// SetBackendFor задаёт движок ОДНОМУ шифру: аппаратный ускоритель почти всегда умеет AES и почти
+// никогда ChaCha, поэтому выбор бывает разным для двух.
+func SetBackendFor(a AEAD, b Backend) { chosen[slot(a)].Store(int32(b)) }
+
+// BackendFor — что выбрано для этого шифра.
+func BackendFor(a AEAD) Backend { return Backend(chosen[slot(a)].Load()) }
+
+func newSealer(kind AEAD, key []byte) (sealer, error) {
+	switch BackendFor(kind) {
+	case BackendKernel:
+		s, err := newKernelSealer(kind, key)
+		if err != nil {
+			return nil, fmt.Errorf("%w: ядерная криптография запрошена, но недоступна: %v",
+				errCrypto, err)
+		}
+		return s, nil
+	}
+	// И «go», и «авто» до замера означают свой код. Choose переключает на ядро только когда оно
+	// ВЫИГРАЛО замер, поэтому «авто» доходит сюда уже решённым.
+	return newGoSealer(kind, key)
+}
+
+// goSealer — свой код: crypto/cipher для AES-GCM, x/crypto для ChaCha20-Poly1305.
+type goSealer struct {
+	a    cipher.AEAD
+	kind AEAD
+}
+
+func newGoSealer(kind AEAD, key []byte) (sealer, error) {
+	g := &goSealer{kind: kind}
 	switch kind {
 	case AEADAES128:
 		b, err := aes.NewCipher(key[:16])
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", errCrypto, err)
 		}
-		if k.aead, err = cipher.NewGCM(b); err != nil {
+		if g.a, err = cipher.NewGCM(b); err != nil {
 			return nil, fmt.Errorf("%w: %v", errCrypto, err)
 		}
 	default:
 		var err error
-		if k.aead, err = chacha20poly1305.New(key[:32]); err != nil {
+		if g.a, err = chacha20poly1305.New(key[:32]); err != nil {
 			return nil, fmt.Errorf("%w: %v", errCrypto, err)
 		}
 	}
-	return k, nil
+	return g, nil
+}
+
+func (g *goSealer) seal(dst, nonce, pt, aad []byte) ([]byte, error) {
+	return g.a.Seal(dst, nonce, pt, aad), nil
+}
+
+func (g *goSealer) open(dst, nonce, ct, aad []byte) ([]byte, error) {
+	return g.a.Open(dst, nonce, ct, aad)
+}
+
+func (g *goSealer) overhead() int { return g.a.Overhead() }
+func (g *goSealer) name() string  { return "go/" + g.kind.String() }
+func (g *goSealer) close()        {}
+
+// Close освобождает ресурсы шифра.
+//
+// НУЖЕН ИЗ-ЗА ЯДЕРНОГО ДВИЖКА, и это не гигиена. У своего кода освобождать нечего — сборщик мусора
+// разберётся, — а ядерный держит ДВА дескриптора на направление. Сессия, ушедшая без Close, теряет
+// их навсегда: на хабе со тридцатью пирами и переподключениями это исчерпание предела дескрипторов
+// за часы, причём проявится оно не «медленно», а «новые пиры не подключаются».
+//
+// Зовётся владельцем сессии при её освобождении. Двойной вызов безопасен, вызов на nil — тоже:
+// освобождение идёт по путям, где сессия могла не дойти до ключей.
+func (k *Keys) Close() {
+	if k == nil {
+		return
+	}
+	if k.aead != nil {
+		k.aead.close()
+		k.aead = nil
+	}
+	if k.prevAEAD != nil {
+		k.prevAEAD.close()
+		k.prevAEAD = nil
+		k.prevOK = false
+	}
 }
 
 // Kind — какой шифр согласован. Нужен журналу при подъёме туннеля: разница между шифрами на
@@ -149,7 +301,7 @@ func (k *Keys) nonceWith(iv [12]byte, seq uint64) [12]byte {
 // Go позволяет так делать: dst = buf[:0] при plaintext = buf[:n] задокументировано как
 // переиспользование памяти.
 func (k *Keys) Seal(buf []byte, n int, aad []byte, seq uint64) ([]byte, error) {
-	if cap(buf) < n+k.aead.Overhead() {
+	if cap(buf) < n+k.aead.overhead() {
 		return nil, fmt.Errorf("noise: буфер без места под тег")
 	}
 	// Эпоха записи определяется её смещением, и получатель посчитает ту же самую: номер эпохи
@@ -160,7 +312,7 @@ func (k *Keys) Seal(buf []byte, n int, aad []byte, seq uint64) ([]byte, error) {
 		}
 	}
 	nc := k.nonce(seq)
-	return k.aead.Seal(buf[:0], nc[:], buf[:n], aad), nil
+	return k.aead.seal(buf[:0], nc[:], buf[:n], aad)
 }
 
 // Open расшифровывает НА МЕСТЕ и возвращает открытый текст.
@@ -177,7 +329,7 @@ func (k *Keys) Open(buf []byte, aad []byte, seq uint64) ([]byte, error) {
 		case k.prevOK && e+1 == k.epoch:
 			// Запись прошлой эпохи: расшифровываем прошлым ключом и НЕ откатываем состояние.
 			nc := k.nonceWith(k.prevIV, seq)
-			out, err := k.prevAEAD.Open(buf[:0], nc[:], buf, aad)
+			out, err := k.prevAEAD.open(buf[:0], nc[:], buf, aad)
 			if err != nil {
 				return nil, ErrAuth
 			}
@@ -192,7 +344,7 @@ func (k *Keys) Open(buf []byte, aad []byte, seq uint64) ([]byte, error) {
 		}
 	}
 	nc := k.nonce(seq)
-	out, err := k.aead.Open(buf[:0], nc[:], buf, aad)
+	out, err := k.aead.open(buf[:0], nc[:], buf, aad)
 	if err != nil {
 		return nil, ErrAuth
 	}

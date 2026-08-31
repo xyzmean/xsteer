@@ -252,6 +252,10 @@ func (w *worker) free(k skey, s *session) {
 		s.hs.Wipe()
 		s.hs = nil
 	}
+	// Ключи закрываются, а не просто забываются: за ядерным движком шифра стоят дескрипторы, и
+	// сессия, ушедшая без этого, теряет их навсегда (см. noise.Keys.Close).
+	s.tx.Close()
+	s.rx.Close()
 	s.tx, s.rx = nil, nil
 	s.conn.Close()
 	s.mu.Unlock()

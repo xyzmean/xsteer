@@ -76,6 +76,7 @@ func (c *Client) streamSession(ctx context.Context, id int, dev tun.Device) erro
 	}
 	_ = nc.SetDeadline(time.Time{})
 	tx, rx := hres.tx, hres.rx
+	defer func() { tx.Close(); rx.Close() }()
 
 	// Согласование MTU: первая ступень та же — минимум пределов сторон. Второй (проб пути) в
 	// потоке нет: сегментацией распоряжается ядро.
