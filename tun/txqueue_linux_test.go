@@ -41,7 +41,7 @@ func readQueueLen(t *testing.T, name string) int {
 }
 
 func TestSetTxQueueLenApplied(t *testing.T) {
-	d, err := openOne(devQueue, false)
+	d, err := openOne(devQueue, false, false)
 	if err != nil {
 		t.Skipf("пропущено: TUNSETIFF недоступен (%v) — нужны /dev/net/tun и CAP_NET_ADMIN", err)
 	}

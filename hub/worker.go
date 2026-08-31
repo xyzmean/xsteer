@@ -12,6 +12,7 @@ import (
 	"github.com/xyzmean/xsteer/link"
 	"github.com/xyzmean/xsteer/noise"
 	"github.com/xyzmean/xsteer/route"
+	"github.com/xyzmean/xsteer/tun"
 	"github.com/xyzmean/xsteer/wire"
 )
 
@@ -40,6 +41,15 @@ func (w *worker) rxLoop(ctx context.Context) {
 					continue
 				}
 				w.onSeg(&seg)
+			}
+			// Заход кончился — отдаём ядру то, что накопила разгрузка сегментации устройства.
+			// Пакеты, ушедшие в устройство внутри захода, склеены в супер-кадр и уезжают одним
+			// вызовом вместо сорока пяти; сброс ровно здесь, на границе всплеска, поэтому задержки
+			// это не добавляет. Без сброса последний пакет лежал бы до следующего события.
+			if w.dev != nil {
+				if err := w.dev.Flush(); err != nil {
+					w.h.stats.dropped.Add(1)
+				}
 			}
 		}
 		if time.Since(last) >= 100*time.Millisecond {
@@ -821,6 +831,22 @@ func (w *worker) sendRST(seg *link.Seg) {
 	n := link.BuildSeg(buf, seg.DAddr, seg.SAddr, uint16(w.h.opt.Conf.ListenPort), seg.SPort,
 		seg.Ack, seg.Seq+uint32(len(seg.Payload)), link.RST|link.ACK, link.OptNone, nil)
 	_ = sender.SendTo(buf[:n], seg.SAddr)
+}
+
+// offloadLine — строка про разгрузку сегментации устройства. Печатается ВСЕГДА: разница в скорости
+// здесь измеряется разами (замер: 3920 нс на пакет против 269 нс), поэтому «почему медленно» не
+// должно требовать догадок. Проверка через утверждение типа, а не через метод интерфейса: разгрузка
+// есть только на Linux, и знание об этом обязано остаться в пакете tun.
+func offloadLine(d tun.Device) string {
+	o, ok := d.(interface{ Offload() (bool, string) })
+	if !ok {
+		return "разгрузка сегментации: нет на этой системе"
+	}
+	on, why := o.Offload()
+	if on {
+		return "разгрузка сегментации устройства: включена (склейка пакетов в супер-кадр)"
+	}
+	return "разгрузка сегментации устройства: НЕТ (" + why + ") — путь по одному пакету"
 }
 
 // retuneMTU — MTU устройства по минимуму среди пиров.

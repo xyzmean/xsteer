@@ -28,8 +28,14 @@ type rawLinux struct {
 // ФИЛЬТР СТАВИТСЯ ДО ПЕРВОГО SYN, и это не мелочь: сырой сокет получает КОПИЮ каждого локально
 // доставляемого сегмента TCP, и между socket() и настройкой фильтра очередь успевает набрать
 // чужого — на нагруженной машине это тысячи пакетов, из-за которых теряются настоящие.
+//
+// СОКЕТ НЕБЛОКИРУЮЩИЙ, и это не мелочь настройки, а минус один системный вызов на каждый принятый
+// пакет. С блокирующим сокетом узнать «пришло ли ещё» можно было только через poll, поэтому цикл
+// приёма делал poll ПЕРЕД КАЖДЫМ чтением: на полутора гигабитах это пятьдесят тысяч лишних вызовов
+// в секунду. С O_NONBLOCK цикл читает, пока не получит ErrAgain, и ждёт только тогда, когда очередь
+// действительно пуста. Ровно так же устроены сокет хаба (OpenRawListen) и устройство TUN.
 func OpenRaw(daddr [4]byte, sport, dport uint16) (Raw, error) {
-	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_TCP)
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW|unix.SOCK_NONBLOCK, unix.IPPROTO_TCP)
 	if err != nil {
 		if err == unix.EPERM {
 			return nil, fmt.Errorf("сырой сокет запрещён: нужен root или CAP_NET_RAW " +
@@ -79,10 +85,19 @@ func (r *rawLinux) Send(seg []byte) error {
 func (r *rawLinux) Recv(buf []byte) (int, error) {
 	for {
 		n, err := unix.Read(r.fd, buf)
-		if err == unix.EINTR {
+		switch err {
+		case nil:
+			return n, nil
+		case unix.EINTR:
 			continue
+		case unix.EAGAIN:
+			// НЕ отказ: очередь пуста. Отдельной ошибкой, потому что вызывающий на ней перестаёт
+			// добирать пакеты и отдаёт накопленное, а на всякой прочей — поднимает соединение
+			// заново. Спутать это значило бы рвать туннель на каждом пустом чтении.
+			return 0, ErrAgain
+		default:
+			return n, err
 		}
-		return n, err
 	}
 }
 

@@ -34,7 +34,7 @@ func devExists(t *testing.T, name string) bool {
 }
 
 func TestOpenRefusesTruncatedName(t *testing.T) {
-	d, err := openOne(nameOK, false)
+	d, err := openOne(nameOK, false, false)
 	if err != nil {
 		t.Skipf("пропущено: TUNSETIFF недоступен (%v) — нужны /dev/net/tun и CAP_NET_ADMIN", err)
 	}
@@ -49,7 +49,7 @@ func TestOpenRefusesTruncatedName(t *testing.T) {
 	// Усечение даёт то же имя без последнего знака — то есть ДРУГОЕ устройство, чем просили.
 	long := nameLong
 	cut := long[:15]
-	d2, err := openOne(long, false)
+	d2, err := openOne(long, false, false)
 	if err == nil {
 		d2.Close()
 		t.Fatalf("имя из %d символов принято, а должно быть отвергнуто", len(long))

@@ -91,6 +91,13 @@ func OpenQueues(name string, n int) ([]Device, error) {
 	return []Device{d}, nil
 }
 
+// OpenPlain и OpenQueuesPlain — те же самые: разгрузки сегментации на Wintun нет, и ключ «без
+// разгрузки» здесь ничего не меняет. Функции существуют, чтобы вызывающему не приходилось знать
+// платформу.
+func OpenPlain(name string) (Device, error) { return Open(name) }
+
+func OpenQueuesPlain(name string, n int) ([]Device, error) { return OpenQueues(name, n) }
+
 // guidFromName — устойчивый GUID из имени. Версия и вариант выставляются как у GUID версии 4, чтобы
 // система не сочла его испорченным.
 func guidFromName(name string) windows.GUID {
@@ -166,6 +173,10 @@ func (d *winDev) Write(p []byte) (int, error) {
 		return 0, err
 	}
 }
+
+// Flush на Windows делать нечего: разгрузки сегментации здесь нет — Wintun принимает пакеты по
+// одному через своё кольцо, и метаданных virtio у него не бывает.
+func (d *winDev) Flush() error { return nil }
 
 func (d *winDev) Name() string { return d.name }
 

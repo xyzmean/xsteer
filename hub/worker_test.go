@@ -75,6 +75,7 @@ func (d *fakeDev) Write(p []byte) (int, error) {
 	d.wrote = append(d.wrote, append([]byte(nil), p...))
 	return len(p), nil
 }
+func (d *fakeDev) Flush() error     { return nil }
 func (d *fakeDev) Name() string     { return "xstest0" }
 func (d *fakeDev) SetMTU(int) error { return nil }
 func (d *fakeDev) Close() error     { return nil }
@@ -688,9 +689,11 @@ func (d *feedDev) Read(p []byte) (int, error) {
 }
 func (d *feedDev) WaitRead(time.Duration) (bool, error) { return true, nil }
 func (d *feedDev) Write(p []byte) (int, error)          { return len(p), nil }
-func (d *feedDev) Name() string                         { return "xsfeed0" }
-func (d *feedDev) SetMTU(int) error                     { return nil }
-func (d *feedDev) Close() error                         { return nil }
+func (d *feedDev) Flush() error                         { return nil }
+
+func (d *feedDev) Name() string     { return "xsfeed0" }
+func (d *feedDev) SetMTU(int) error { return nil }
+func (d *feedDev) Close() error     { return nil }
 
 // udpPkt — кадр из устройства: пакет IPv4 к внутреннему адресу второго пира. Протокол UDP взят
 // намеренно — подрезка MSS его не касается, и в проверке остаётся только то, что проверяется.

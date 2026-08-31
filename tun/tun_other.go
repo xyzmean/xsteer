@@ -20,6 +20,12 @@ func Open(name string) (Device, error) {
 	return nil, fmt.Errorf("%w: TUN на %s ещё не сделан", ErrNoDevice, runtime.GOOS)
 }
 
+// OpenPlain — то же: разгрузки сегментации без устройства не бывает.
+func OpenPlain(name string) (Device, error) { return Open(name) }
+
+// OpenQueuesPlain — то же.
+func OpenQueuesPlain(name string, n int) ([]Device, error) { return OpenQueues(name, n) }
+
 // OpenQueues — то же самое: пока нечего открывать.
 func OpenQueues(name string, n int) ([]Device, error) {
 	_, err := Open(name)
@@ -32,6 +38,7 @@ type notImplemented struct{}
 
 func (notImplemented) Read([]byte) (int, error)             { return 0, ErrNoDevice }
 func (notImplemented) Write([]byte) (int, error)            { return 0, ErrNoDevice }
+func (notImplemented) Flush() error                         { return nil }
 func (notImplemented) WaitRead(time.Duration) (bool, error) { return false, ErrNoDevice }
 func (notImplemented) Name() string                         { return "" }
 func (notImplemented) SetMTU(int) error                     { return ErrNoDevice }

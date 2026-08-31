@@ -63,6 +63,12 @@ type Options struct {
 	StatePath string
 	// Logf — куда писать журнал. nil означает «в stderr».
 	Logf func(format string, args ...any)
+	// NoOffload — не включать разгрузку сегментации устройства.
+	//
+	// Ключ существует не для настройки, а для РАЗБИРАТЕЛЬСТВА: разгрузка меняет то, как выглядит
+	// путь данных (склейка на отправке, нарезка на приёме), и когда однажды придётся выяснять, не
+	// она ли виновата, единственный честный способ — прогнать то же самое без неё и сравнить.
+	NoOffload bool
 	// Routes — направить ли AllowedIPs хаба в устройство. Ложь нужна тогда, когда маршрутами
 	// распоряжается кто-то другой.
 	Routes bool
@@ -222,7 +228,11 @@ func Run(ctx context.Context, opt Options) error {
 		conns = wire.ConnsMax
 	}
 
-	devs, err := tun.OpenQueues(dev, conns)
+	open := tun.OpenQueues
+	if opt.NoOffload {
+		open = tun.OpenQueuesPlain
+	}
+	devs, err := open(dev, conns)
 	if err != nil {
 		return err
 	}
@@ -266,6 +276,7 @@ func Run(ctx context.Context, opt Options) error {
 				"их сможет меньше, остальные ядро на пиках отбросит", name, err, tun.TxQueueLen)
 		}
 		c.logf("%s: адрес %s, MTU %d (накладные %d)", name, cidr, mtu, wire.Overhead)
+		c.logf("%s: %s", name, offloadLine(devs[0]))
 		if len(opt.Conf.DNS) > 0 {
 			if err := tun.SetDNS(name, opt.Conf.DNS); err != nil {
 				c.logf("серверы имён не заданы (%v) — запросы пойдут прежним резолвером", err)
@@ -380,6 +391,22 @@ func Run(ctx context.Context, opt Options) error {
 // closeDevs закрывает очереди устройства. Зовётся ТОЛЬКО из drainThenClose и только после того,
 // как воркеры ушли: закрытый номер дескриптора немедленно достаётся следующему, кто откроет
 // что-нибудь, — а этим следующим в момент завершения оказывается труба к nft или ip.
+// offloadLine — строка про разгрузку сегментации устройства. Печатается ВСЕГДА: разница в скорости
+// здесь измеряется разами (замер: 3920 нс на пакет против 269 нс), поэтому «почему медленно» не
+// должно требовать догадок. Проверка через утверждение типа, а не через метод интерфейса: разгрузка
+// есть только на Linux, и знание об этом обязано остаться в пакете tun.
+func offloadLine(d tun.Device) string {
+	o, ok := d.(interface{ Offload() (bool, string) })
+	if !ok {
+		return "разгрузка сегментации: нет на этой системе"
+	}
+	on, why := o.Offload()
+	if on {
+		return "разгрузка сегментации устройства: включена (склейка пакетов в супер-кадр)"
+	}
+	return "разгрузка сегментации устройства: НЕТ (" + why + ") — путь по одному пакету"
+}
+
 func (c *Client) closeDevs() {
 	for _, d := range c.devs {
 		d.Close()
@@ -669,6 +696,11 @@ func (c *Client) session(ctx context.Context, id int, dev tun.Device, devName st
 		}
 		if ok {
 			seg, mine, err := conn.Recv(buf)
+			if errors.Is(err, link.ErrAgain) {
+				// Готовность без данных бывает: фильтр на сокете отбил пакет уже после того, как
+				// poll его посчитал. Это не отказ — ждём дальше.
+				continue
+			}
 			if err != nil {
 				return err
 			}
@@ -909,50 +941,83 @@ func (c *Client) inbound(ctx context.Context, id int, s *sess, dev tun.Device, d
 			return
 		}
 		if !ok {
-			continue
-		}
-		seg, mine, err := s.conn.Recv(buf)
-		if err != nil {
-			return
-		}
-		if !mine {
-			continue
-		}
-		data, err := s.conn.OnSeg(&seg)
-		if err != nil {
-			c.logf("соединение %d: %v", id, err)
-			return
-		}
-		if !data {
-			continue
-		}
-		// Сборка записи, которая могла быть разрезана между сегментами. Она же служит предфильтром:
-		// сегмент, не начинающийся с заголовка записи и не продолжающий начатую, отбрасывается до
-		// всякой криптографии.
-		body, hdr, rel, done := s.reasm.Feed(seg.Seq, isn, seg.Payload)
-		if !done {
-			continue
-		}
-		if !s.win.Check(rel) {
-			continue
-		}
-		// AAD — заголовок записи, как в TLS 1.3: для разрезанной это байты ПЕРВОГО сегмента, то
-		// есть у обеих сторон одни и те же.
-		pt, err := s.rx.Open(body, hdr, uint64(rel))
-		if err != nil {
-			continue
-		}
-		// Коммит окна ТОЛЬКО после сошедшегося тега: иначе подделанный пакет с далёким смещением
-		// выбил бы из окна весь честный поток.
-		s.win.Commit(rel)
-		if len(pt) > 0 && pt[0] == wire.CtlBatch {
-			if !wire.BatchIter(pt, func(f []byte) { c.onFrame(s, id, f, dev) }) {
+			// Ожидание истекло, значит всплеск точно кончился: отдаём ядру то, что накопила
+			// разгрузка сегментации. Обычно к этой строке отдавать уже нечего — сброс произошёл на
+			// ErrAgain ниже, — но оставить пакет в буфере на двести миллисекунд нельзя ни при каком
+			// стечении обстоятельств.
+			if err := dev.Flush(); err != nil {
 				c.stats.dropped.Add(1)
 			}
 			continue
 		}
-		c.onFrame(s, id, pt, dev)
+		// ДОБИРАЕМ ВСЁ, ЧТО УЖЕ ПРИШЛО, ОДНИМ ЗАХОДОМ, и это два выигрыша сразу.
+		//
+		// Первый: сокет неблокирующий, поэтому «пришло ли ещё» узнаётся самим чтением, а не
+		// отдельным poll перед каждым пакетом — на полутора гигабитах это пятьдесят тысяч
+		// системных вызовов в секунду, снятых начисто.
+		//
+		// Второй: пока заход не кончился, записанные в устройство пакеты копятся в супер-кадр
+		// разгрузки, и в ядро они уедут ОДНИМ вызовом вместо сорока пяти. Отдаётся накопленное
+		// ровно на границе всплеска (ErrAgain), поэтому задержки это не добавляет.
+		for i := 0; i < 64; i++ {
+			if !c.inSeg(s, id, buf, isn, dev, devName) {
+				break
+			}
+		}
+		if err := dev.Flush(); err != nil {
+			c.stats.dropped.Add(1)
+		}
 	}
+}
+
+// inSeg разбирает ОДИН принятый сегмент. false означает «больше сегментов сейчас нет либо
+// соединение пора поднимать заново» — то есть выход из захода.
+func (c *Client) inSeg(s *sess, id int, buf []byte, isn uint32, dev tun.Device, devName string) bool {
+	seg, mine, err := s.conn.Recv(buf)
+	if err != nil {
+		// ErrAgain — очередь пуста, всплеск кончился. Любая другая ошибка чтения означает, что
+		// сокет больше не работает: там выходить надо не из захода, а из соединения, и это делает
+		// вызывающий по отмене общего контекста.
+		return false
+	}
+	if !mine {
+		return true
+	}
+	data, err := s.conn.OnSeg(&seg)
+	if err != nil {
+		c.logf("соединение %d: %v", id, err)
+		return false
+	}
+	if !data {
+		return true
+	}
+	// Сборка записи, которая могла быть разрезана между сегментами. Она же служит предфильтром:
+	// сегмент, не начинающийся с заголовка записи и не продолжающий начатую, отбрасывается до
+	// всякой криптографии.
+	body, hdr, rel, done := s.reasm.Feed(seg.Seq, isn, seg.Payload)
+	if !done {
+		return true
+	}
+	if !s.win.Check(rel) {
+		return true
+	}
+	// AAD — заголовок записи, как в TLS 1.3: для разрезанной это байты ПЕРВОГО сегмента, то есть у
+	// обеих сторон одни и те же.
+	pt, err := s.rx.Open(body, hdr, uint64(rel))
+	if err != nil {
+		return true
+	}
+	// Коммит окна ТОЛЬКО после сошедшегося тега: иначе подделанный пакет с далёким смещением выбил
+	// бы из окна весь честный поток.
+	s.win.Commit(rel)
+	if len(pt) > 0 && pt[0] == wire.CtlBatch {
+		if !wire.BatchIter(pt, func(f []byte) { c.onFrame(s, id, f, dev) }) {
+			c.stats.dropped.Add(1)
+		}
+		return true
+	}
+	c.onFrame(s, id, pt, dev)
+	return true
 }
 
 // onFrame — один кадр открытого текста: внутренний пакет или служебное сообщение.

@@ -60,6 +60,7 @@ func usage() {
     --managed         устройство настраивает кто-то другой: не трогать адрес, MTU и маршруты
     --probe-ms <N>    как часто перепроверять путь (по умолчанию %d)
     --chacha          заставить ChaCha20-Poly1305 (по умолчанию решает наличие AES в процессоре)
+    --no-offload      не включать разгрузку сегментации устройства (для разбирательства)
     --no-batch        не собирать кадры в одну запись: нужно для разговора с хабом на C,
                       пока перенос не сделан. Облик на проводе при этом хуже
     --stream          вести записи по НАСТОЯЩЕМУ TCP вместо поддельного: без сырого сокета и
@@ -75,6 +76,7 @@ func usage() {
     --dev <имя>       имя устройства (по умолчанию %s)
     --workers <N>     воркеров (по умолчанию по числу ядер, не больше %d)
     --no-tun          не поднимать устройство: только трафик пир↔пир
+    --no-offload      не включать разгрузку сегментации устройства (для разбирательства)
     --no-batch        не собирать кадры в одну запись: для клиента на C
     --stream-port <N> слушать НАСТОЯЩИЙ TCP на этом порту (режим потока), помимо поддельного
     --stream-only     не поднимать поддельный TCP вовсе: порт занимает только поток
@@ -224,6 +226,8 @@ func cmdUp(args []string) error {
 			forceChaCha = true
 		case "--no-batch":
 			opt.NoBatch = true
+		case "--no-offload":
+			opt.NoOffload = true
 		case "--stream":
 			opt.Stream = true
 		case "--no-stream":
@@ -311,6 +315,8 @@ func cmdHub(args []string) error {
 			opt.StreamOnly = true
 		case "--no-batch":
 			opt.NoBatch = true
+		case "--no-offload":
+			opt.NoOffload = true
 		case "--stream-port":
 			v, ok := value()
 			if !ok {

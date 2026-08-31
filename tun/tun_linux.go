@@ -24,6 +24,10 @@ import (
 type linuxDev struct {
 	fd   int
 	name string
+	// off — разгрузка сегментации, если ядро её приняло. nil означает прежний путь: один пакет —
+	// одно чтение, один пакет — одна запись. См. offload_linux.go.
+	off    *offload
+	offWhy string // почему разгрузки нет — для строки при подъёме
 }
 
 type ifreq struct {
@@ -37,9 +41,13 @@ type ifreq struct {
 // existing == true означает «устройством владеет кто-то другой»: адрес, MTU и правила ему уже
 // задал он, и трогать их нельзя — две стороны, настраивающие одно устройство, это гонка, в которой
 // проигрывает та, что настроила первой, а заметно это будет как «MTU иногда не тот».
-func Open(name string) (Device, error) { return openOne(name, false) }
+func Open(name string) (Device, error) { return openOne(name, false, true) }
 
-func openOne(name string, multiQueue bool) (Device, error) {
+// OpenPlain — устройство БЕЗ разгрузки сегментации. Нужно ровно двум: ключу командной строки, если
+// разгрузка однажды окажется виновата, и тесту, который проверяет прежний путь.
+func OpenPlain(name string) (Device, error) { return openOne(name, false, false) }
+
+func openOne(name string, multiQueue, offload bool) (Device, error) {
 	fd, err := unix.Open("/dev/net/tun", unix.O_RDWR|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("%w: /dev/net/tun (%v) — на Linux нужен модуль tun и права root",
@@ -52,6 +60,18 @@ func openOne(name string, multiQueue bool) (Device, error) {
 	req.flags = unix.IFF_TUN | unix.IFF_NO_PI
 	if multiQueue {
 		req.flags |= unix.IFF_MULTI_QUEUE
+	}
+	// IFF_VNET_HDR запрашивается В ТОМ ЖЕ TUNSETIFF, а не отдельным вызовом: сменить набор флагов у
+	// уже созданного устройства ядро не даёт, и «включим потом» означало бы закрыть и открыть
+	// устройство заново — то есть на миг снять его вместе с маршрутами.
+	//
+	// Проверяем, умеет ли ядро, ДО запроса: TUNGETFEATURES отвечает набором поддерживаемых флагов, и
+	// без этой проверки старое ядро отказало бы на TUNSETIFF целиком, то есть разгрузка стоила бы
+	// полной невозможности поднять туннель.
+	if offload && kernelHasVnetHdr(fd) {
+		req.flags |= unix.IFF_VNET_HDR
+	} else {
+		offload = false
 	}
 	if _, _, e := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(unix.TUNSETIFF),
 		uintptr(unsafe.Pointer(&req))); e != 0 {
@@ -76,7 +96,31 @@ func openOne(name string, multiQueue bool) (Device, error) {
 		return nil, fmt.Errorf("%w: ядро создало устройство %q вместо %q — имя длиннее предела "+
 			"в 15 значащих символов; задайте короче", ErrNoDevice, got, name)
 	}
-	return &linuxDev{fd: fd, name: got}, nil
+	d := &linuxDev{fd: fd, name: got}
+	if offload {
+		// Отказ здесь НЕ отказ подъёма: без разгрузки туннель работает прежним путём, только
+		// медленнее. Причина отказа названа вызывающему через OffloadWhy, чтобы «почему медленно»
+		// не приходилось выяснять догадками.
+		off, err := tryOffload(fd)
+		if err != nil {
+			d.offWhy = err.Error()
+		} else {
+			d.off = off
+		}
+	} else {
+		d.offWhy = "не запрошена"
+	}
+	return d, nil
+}
+
+// kernelHasVnetHdr — умеет ли ядро метаданные virtio на этом устройстве.
+func kernelHasVnetHdr(fd int) bool {
+	var feat uint32
+	if _, _, e := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(unix.TUNGETFEATURES),
+		uintptr(unsafe.Pointer(&feat))); e != 0 {
+		return false
+	}
+	return feat&unix.IFF_VNET_HDR != 0
 }
 
 // OpenQueues открывает устройство с НЕСКОЛЬКИМИ очередями: по одной на воркера.
@@ -89,13 +133,18 @@ func openOne(name string, multiQueue bool) (Device, error) {
 //
 // Если ядро не умеет многоочерёдность (IFF_MULTI_QUEUE появился в 3.8), возвращаем одну очередь:
 // туннель будет работать одним воркером, и это лучше отказа.
-func OpenQueues(name string, n int) ([]Device, error) {
+func OpenQueues(name string, n int) ([]Device, error) { return openQueues(name, n, true) }
+
+// OpenQueuesPlain — то же без разгрузки сегментации.
+func OpenQueuesPlain(name string, n int) ([]Device, error) { return openQueues(name, n, false) }
+
+func openQueues(name string, n int, offload bool) ([]Device, error) {
 	if n < 1 {
 		n = 1
 	}
 	var out []Device
 	for i := 0; i < n; i++ {
-		d, err := openOne(name, n > 1)
+		d, err := openOne(name, n > 1, offload)
 		if err != nil {
 			if i == 0 {
 				return nil, err
@@ -119,8 +168,17 @@ func indexZero(b []byte) int {
 }
 
 func (d *linuxDev) Read(p []byte) (int, error) {
+	if d.off != nil {
+		return d.off.read(p)
+	}
+	return readFD(d.fd, p)
+}
+
+// readFD — чтение дескриптора устройства. Отдельной функцией, потому что читает и путь без
+// разгрузки, и разбор супер-кадров.
+func readFD(fd int, p []byte) (int, error) {
 	for {
-		n, err := unix.Read(d.fd, p)
+		n, err := unix.Read(fd, p)
 		switch err {
 		case nil:
 			return n, nil
@@ -135,8 +193,33 @@ func (d *linuxDev) Read(p []byte) (int, error) {
 }
 
 func (d *linuxDev) Write(p []byte) (int, error) {
+	if d.off != nil {
+		return d.off.write(p)
+	}
+	return writeFD(d.fd, p)
+}
+
+// Flush отдаёт ядру то, что накопила разгрузка. Без разгрузки — ничего не делает: писать уже
+// нечего, каждый пакет ушёл своим вызовом.
+func (d *linuxDev) Flush() error {
+	if d.off == nil {
+		return nil
+	}
+	return d.off.Flush()
+}
+
+// Offload — работает ли разгрузка сегментации, и если нет — почему. Печатается при подъёме: разница
+// в скорости здесь измеряется разами, и знать её надо ДО замеров, а не после.
+func (d *linuxDev) Offload() (bool, string) {
+	if d.off != nil {
+		return true, ""
+	}
+	return false, d.offWhy
+}
+
+func writeFD(fd int, p []byte) (int, error) {
 	for {
-		n, err := unix.Write(d.fd, p)
+		n, err := unix.Write(fd, p)
 		if err == unix.EINTR {
 			continue
 		}

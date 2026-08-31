@@ -153,6 +153,9 @@ type Options struct {
 	Workers int
 	// Device — имя устройства; пусто означает Device.
 	Device string
+	// NoOffload — не включать разгрузку сегментации устройства. Смысл ключа тот же, что у клиента:
+	// возможность прогнать то же самое без неё и сравнить.
+	NoOffload bool
 	// NoTUN — не поднимать устройство вовсе. Нужно там, где хаб обслуживает только трафик пир↔пир
 	// (например, в тесте): на LXC и OpenVZ устройства TUN часто нет, и отказ из-за него означал бы
 	// «звезда не работает» там, где она работала бы полностью.
@@ -408,7 +411,11 @@ func Run(ctx context.Context, opt Options) error {
 	}
 
 	if !opt.NoTUN {
-		devs, err := tun.OpenQueues(dev, n)
+		open := tun.OpenQueues
+		if opt.NoOffload {
+			open = tun.OpenQueuesPlain
+		}
+		devs, err := open(dev, n)
 		if err != nil {
 			return fmt.Errorf("%w — хаб не сможет отдавать трафик наружу (на LXC и OpenVZ "+
 				"устройства TUN часто нет вовсе; тогда --no-tun и только трафик пир↔пир)", err)
@@ -434,6 +441,7 @@ func Run(ctx context.Context, opt Options) error {
 				"их сможет меньше, остальные ядро на пиках отбросит", name, err, tun.TxQueueLen)
 		}
 		h.devMTU = mtu
+		h.logf("%s: %s", name, offloadLine(devs[0]))
 		// Маршруты к сетям пиров: без них ядро не знает, что ответы им идут через это устройство, и
 		// выход в интернет работал бы только в одну сторону.
 		for i := range opt.Conf.Peers {
