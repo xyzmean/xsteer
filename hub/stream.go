@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/xyzmean/xsteer/conf"
@@ -114,6 +115,132 @@ func (h *Hub) streamServe(ctx context.Context, ln net.Listener) error {
 	return ctx.Err()
 }
 
+// streamStranger — ответ тому, кто постучался на порт потока и своим не оказался.
+//
+// ЗАЧЕМ ЭТО ЗДЕСЬ. Ключ Decoy читала только половина поддельного TCP (onStranger живёт в
+// worker.handshake), а поток отвечал одним и тем же оповещением на всех четырёх развилках. При
+// этом Hub.Run печатает при подъёме «неопознанным: <describe>» независимо от того, поднят ли
+// поддельный TCP: с --stream-only --decoy proxy хаб говорил «отдавать настоящему серверу X» и не
+// отдавал никого никому. Оператор, выбравший proxy ради защиты от активного зондирования, получал
+// alert — то самое поведение, про которое в шапке decoy.go написано, что оно отличимо от
+// настоящего сервера с сертификатом.
+//
+// hello — присланное ЦЕЛИКОМ, чтобы прикрытие получило ровно то, что прислал прибор. nil означает
+// «присланного у нас нет», и тогда проксировать нечего.
+func (h *Hub) streamStranger(nc net.Conn, hello []byte) {
+	h.stats.strangers.Add(1)
+	switch h.opt.Decoy.Mode {
+	case "silent":
+		// Не отвечать вовсе: закрытие даст FIN, и это всё, что прибор увидит.
+	case "reset":
+		// RST вместо FIN. Единственный способ послать его из Go — закрыть сокет с нулевым
+		// linger; на паре net.Pipe в стенде этого нет, и там режим неотличим от silent.
+		if tc, ok := nc.(*net.TCPConn); ok {
+			_ = tc.SetLinger(0)
+		}
+	case "proxy":
+		if h.streamProxy(nc, hello) {
+			return
+		}
+		// Не вышло отдать настоящему серверу (нет назначения, кончились места, прикрытие не
+		// ответило) — отвечаем как alert. Молчание здесь сообщало бы прибору больше: порт,
+		// который завершил рукопожатие TCP и замолчал, в интернете почти не встречается.
+		_, _ = nc.Write(noise.Alert())
+	default:
+		_, _ = nc.Write(noise.Alert())
+	}
+}
+
+// streamProxy отдаёт соединение настоящему серверу и переливает байты в обе стороны. Возвращает
+// true, если перелив состоялся.
+//
+// В ПОТОКЕ ЭТО ПРОЩЕ И ЛУЧШЕ, ЧЕМ В ПОДДЕЛЬНОМ TCP. У той половины оговорка названа прямо в шапке
+// decoy.go: свой поддельный TCP не делает повторных передач, и потерянный сегмент рукопожатия TLS
+// для прибора выглядит зависшим соединением. Здесь обе стороны — настоящие сокеты ядра, повторы
+// делает стек, и этой оговорки нет вовсе: прибор получает подлинный ServerHello, подлинный
+// сертификат и подлинную страницу.
+func (h *Hub) streamProxy(nc net.Conn, hello []byte) bool {
+	if len(hello) == 0 {
+		return false
+	}
+	dest := h.decoyDestFor(hello)
+	if dest == "" {
+		return false
+	}
+	// Предел общий с половиной поддельного TCP, и это не экономия на счётчике: место занимает
+	// сокет к САЙТУ-ПРИКРЫТИЮ, а он один на обе половины. Два независимых предела по 32 означали
+	// бы 64 одновременных соединения к прикрытию, то есть предел, которого никто не назначал.
+	if h.decoyLive.Add(1) > decoyMax {
+		h.decoyLive.Add(-1)
+		if ok, held := h.rlStream.Allow(nowMS(), wire.LogEveryMS); ok {
+			h.logf("неопознанных больше %d одновременно — этому отказываю%s", decoyMax,
+				wire.HeldSuffix(held))
+		}
+		return false
+	}
+	defer h.decoyLive.Add(-1)
+
+	timeout := h.opt.Decoy.Timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	up, err := net.DialTimeout("tcp", dest, timeout)
+	if err != nil {
+		if ok, held := h.rlStream.Allow(nowMS(), wire.LogEveryMS); ok {
+			h.logf("прикрытие %s не отвечает (%v)%s", dest, err, wire.HeldSuffix(held))
+		}
+		return false
+	}
+	defer up.Close()
+	// Присланное уходит ЦЕЛИКОМ и БЕЗ ПРАВОК: прикрытие обязано увидеть тот же ClientHello,
+	// который прислал прибор, иначе оно ответит ошибкой, и прибор увидит не подлинный сертификат,
+	// а разрыв (эта же мысль — и та же ошибка — записана у половины поддельного TCP, I-086).
+	_ = up.SetDeadline(time.Now().Add(timeout))
+	if _, err := up.Write(hello); err != nil {
+		return false
+	}
+	_ = up.SetDeadline(time.Time{})
+	// Срок рукопожатия снимается: дальше это обычный разговор двух настоящих сокетов, и
+	// пятнадцатисекундная крышка оборвала бы его на середине страницы.
+	_ = nc.SetDeadline(time.Time{})
+
+	// Перелив в обе стороны с порогом простоя. Порог тот же, что у половины поддельного TCP
+	// (proxyDown, 30 с): без него один прибор держал бы сокет к прикрытию столько, сколько
+	// захочет, — а место в пределе одно на обе половины.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	relay := func(dst, src net.Conn) {
+		defer wg.Done()
+		_ = src.SetReadDeadline(time.Now().Add(decoyIdle))
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := src.Read(buf)
+			if n > 0 {
+				if _, werr := dst.Write(buf[:n]); werr != nil {
+					break
+				}
+				_ = src.SetReadDeadline(time.Now().Add(decoyIdle))
+			}
+			if err != nil {
+				break
+			}
+		}
+		// Обрыв одной половины закрывает обе: иначе вторая дорожка ждала бы своего порога
+		// простоя, а прибор видел бы открытый порт, который молчит, — ровно тот признак, ради
+		// устранения которого дорожка и заведена (тот же урок, что у proxyDown).
+		_ = dst.Close()
+		_ = src.Close()
+	}
+	go relay(up, nc)
+	go relay(nc, up)
+	wg.Wait()
+	return true
+}
+
+// decoyIdle — после какой тишины перелив к прикрытию считается законченным. Число то же, что у
+// половины поддельного TCP (proxyDown).
+const decoyIdle = 30 * time.Second
+
 // streamConn обслуживает одно соединение: рукопожатие, потом данные.
 func (h *Hub) streamConn(ctx context.Context, nc net.Conn) {
 	defer nc.Close()
@@ -138,8 +265,10 @@ func (h *Hub) streamConn(ctx context.Context, nc net.Conn) {
 	// Не похоже на рукопожатие TLS вовсе — отвечаем как настоящий сервер и уходим. Молчание здесь
 	// отличимо не хуже, чем молчание на Hello (см. onStranger).
 	if hdr[0] != 0x16 || hdr[1] != 0x03 || n < 100 || n > 4096 {
-		h.stats.strangers.Add(1)
-		_, _ = nc.Write(noise.Alert())
+		// Присланного целиком у нас здесь нет — только заголовок записи, — и отдавать прикрытию
+		// заголовок без тела было бы хуже, чем не отдавать ничего: настоящий сервер ответил бы
+		// на такое ошибкой. Поэтому у этой развилки прикрытия нет, и она отвечает как alert.
+		h.streamStranger(nc, nil)
 		return
 	}
 	rec := make([]byte, wire.RecHdr+n)
@@ -150,16 +279,14 @@ func (h *Hub) streamConn(ctx context.Context, nc net.Conn) {
 
 	hs := &noise.HS{}
 	if err := hs.ServerRead(h.opt.Sec.Priv, rec, nil); err != nil {
-		h.stats.strangers.Add(1)
-		_, _ = nc.Write(noise.Alert())
+		h.streamStranger(nc, rec)
 		return
 	}
 	found := h.findPeer(hs.PeerStatic)
 	if found < 0 {
-		h.stats.strangers.Add(1)
 		h.logf("поток с %s: пир %s не описан в конфигурации — отказ", peerAddr,
 			conf.KeyFP(hs.PeerStatic))
-		_, _ = nc.Write(noise.Alert())
+		h.streamStranger(nc, rec)
 		return
 	}
 	// Защита от воспроизведения — та же и та же общая: пир приходит с разных портов, а метка
@@ -172,8 +299,7 @@ func (h *Hub) streamConn(ctx context.Context, nc net.Conn) {
 		// молчанием там, где три соседние развилки отвечают оповещением. Та же правка и по той же
 		// причине сделана на половине поддельного TCP (worker.go, handshake) и в реализации на C
 		// (xshub.c, hs_step).
-		h.stats.strangers.Add(1)
-		_, _ = nc.Write(noise.Alert())
+		h.streamStranger(nc, rec)
 		return
 	}
 

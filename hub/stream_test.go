@@ -443,3 +443,89 @@ func TestПотокОтказываетСверхПредела(t *testing.T) {
 		t.Fatal("streamServe не вышла по отмене контекста")
 	}
 }
+
+// ---- находка I-129: режим потока не знал про Decoy вовсе ----------------------
+//
+// streamConn отвечал одним и тем же оповещением на всех четырёх развилках «не наш», а ключ Decoy
+// читала только половина поддельного TCP. При этом Hub.Run печатает при подъёме «неопознанным:
+// <describe>» независимо от того, поднят ли поддельный TCP: с --stream-only --decoy proxy хаб
+// обещал отдавать соединения настоящему серверу и не отдавал никого никому. То есть оператор,
+// выбравший proxy ради защиты от активного зондирования, получал alert — поведение, про которое в
+// шапке decoy.go прямо написано, что оно отличимо от настоящего сервера с сертификатом.
+
+func TestПотокМолчитПоНастройкеSilent(t *testing.T) {
+	st := newStand(t)
+	st.h.opt.Decoy = DecoyMode{Mode: "silent"}
+	got := streamAnswer(t, st.h, tlsRecord(900))
+	if len(got) != 0 {
+		t.Errorf("при silent хаб ответил %x, а обещал молчать", got)
+	}
+	if st.h.stats.strangers.Load() == 0 {
+		t.Error("посторонний не сосчитан")
+	}
+}
+
+func TestПотокОтдаётНеопознанногоПрикрытию(t *testing.T) {
+	// Настоящее прикрытие — обычный слушатель в стенде: он записывает то, что ему прислали, и
+	// отвечает своей строкой. Проверяется главное свойство дорожки: прибор получает ответ ИМЕННО
+	// прикрытия, а прикрытие получает присланный ClientHello ЦЕЛИКОМ и без правок.
+	decoy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("нет петли для стенда: %v", err)
+	}
+	defer decoy.Close()
+	gotHello := make(chan []byte, 1)
+	go func() {
+		c, err := decoy.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		buf := make([]byte, 4096)
+		n, _ := c.Read(buf)
+		gotHello <- append([]byte(nil), buf[:n]...)
+		_, _ = c.Write([]byte("подлинный ответ прикрытия"))
+	}()
+
+	st := newStand(t)
+	st.h.opt.Decoy = DecoyMode{Mode: "proxy", Dest: decoy.Addr().String(), Timeout: 2 * time.Second}
+
+	hello := tlsRecord(900)
+	got := streamAnswer(t, st.h, hello)
+	if string(got) != "подлинный ответ прикрытия" {
+		t.Errorf("прибор получил %q, а должен был получить ответ прикрытия", got)
+	}
+	select {
+	case sent := <-gotHello:
+		if string(sent) != string(hello) {
+			t.Errorf("прикрытию ушло %d байт из %d — присланное обязано уходить целиком",
+				len(sent), len(hello))
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("прикрытие не получило ClientHello вовсе")
+	}
+	if got := st.h.decoyLive.Load(); got != 0 {
+		t.Errorf("место в пределе не возвращено: занято %d", got)
+	}
+}
+
+func TestПотокПриНеотвечающемПрикрытииОтвечаетОповещением(t *testing.T) {
+	// Молчание при неудаче сообщало бы прибору больше, чем оповещение: порт, который завершил
+	// рукопожатие TCP и замолчал, в интернете почти не встречается.
+	st := newStand(t)
+	// Порт, на котором заведомо никого нет: слушатель поднят и сразу закрыт.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("нет петли для стенда: %v", err)
+	}
+	dead := ln.Addr().String()
+	ln.Close()
+	st.h.opt.Decoy = DecoyMode{Mode: "proxy", Dest: dead, Timeout: 300 * time.Millisecond}
+	got := streamAnswer(t, st.h, tlsRecord(900))
+	if string(got) != string(noise.Alert()) {
+		t.Errorf("ответ %x, ждали фатальное оповещение %x", got, noise.Alert())
+	}
+	if got := st.h.decoyLive.Load(); got != 0 {
+		t.Errorf("место в пределе не возвращено: занято %d", got)
+	}
+}

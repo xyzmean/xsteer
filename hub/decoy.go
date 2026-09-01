@@ -265,11 +265,6 @@ func (w *worker) proxyUp(k skey, s *session, seg *link.Seg) {
 // сделан decoy_dest_for: разбор идёт по недоверенным байтам с публичного порта, до всякой
 // аутентификации, и проверять его надо самим по себе, а не через сокеты вокруг.
 func (w *worker) decoyDest(s *session, seg *link.Seg) string {
-	d := w.h.opt.Decoy
-	dest := d.Dest
-	if !d.FollowSNI {
-		return dest
-	}
 	// Разбирается ВСЁ накопленное, а не последний сегмент, и это здесь важнее, чем при переливе
 	// байтов: SNI лежит в НАЧАЛЕ ClientHello, а браузерный Hello в один сегмент не влезает — то
 	// есть по последнему сегменту имя не разобралось бы никогда, и звонок молча уходил бы в
@@ -278,6 +273,19 @@ func (w *worker) decoyDest(s *session, seg *link.Seg) string {
 	hello := s.hsBuf
 	if len(hello) == 0 {
 		hello = seg.Payload
+	}
+	return w.h.decoyDestFor(hello)
+}
+
+// decoyDestFor — куда отдавать ЭТОГО неопознанного. Отдельно от worker.decoyDest, потому что тем
+// же выбором пользуется половина ПОТОКА, где ни воркера, ни сессии поддельного TCP нет вовсе, а
+// правило выбора обязано быть одно: разойдясь, две половины давали бы прибору разный сертификат
+// на один и тот же запрос — то есть сами становились бы признаком.
+func (h *Hub) decoyDestFor(hello []byte) string {
+	d := h.opt.Decoy
+	dest := d.Dest
+	if !d.FollowSNI {
+		return dest
 	}
 	// Имя из SNI — то, ради чего прибор и пришёл. Отдав ему сертификат другого сайта, мы сообщим
 	// ровно то, что пытались скрыть.
