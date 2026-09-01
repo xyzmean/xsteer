@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"time"
@@ -30,6 +31,24 @@ import (
 // не приходилось ждать три минуты.
 var streamIdle = time.Duration(IdleMS) * time.Millisecond
 
+// streamMax — сколько соединений потока хаб держит одновременно.
+//
+// Предел обязателен, а не «на всякий случай»: соединение занимает горутину и приёмный буфер до
+// пятнадцатисекундного срока рукопожатия, и НИЧЕГО из этого не требует, чтобы стучащийся был
+// описанным пиром — порт публичный по построению. Без предела объём занятой памяти и число
+// занятых дескрипторов выбирал бы тот, кто стучится.
+//
+// Число то же, что у таблицы сессий (SessTotal), и по той же причине: законная звезда — 32 пира
+// по 4 соединения, то есть 128, — входит в него с двойным запасом на переподключение без
+// разрыва. Отказать законному пиру этот предел поэтому не может.
+//
+// Переменная, а не константа, только затем, чтобы стенду не требовалось 256 соединений.
+var streamMax int64 = SessTotal
+
+// streamAcceptPause — пауза после НЕУДАЧНОГО accept. Нужна, чтобы цикл не крутился на полной
+// скорости, пока причина не пройдёт: кончившиеся дескрипторы освобождаются не мгновенно.
+var streamAcceptPause = 20 * time.Millisecond
+
 // streamListen поднимает слушателя и обслуживает соединения до отмены контекста.
 func (h *Hub) streamListen(ctx context.Context, port int) error {
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
@@ -37,6 +56,13 @@ func (h *Hub) streamListen(ctx context.Context, port int) error {
 		return fmt.Errorf("слушатель потока на :%d: %w", port, err)
 	}
 	h.logf("слушаю настоящий TCP :%d (режим потока)", port)
+	return h.streamServe(ctx, ln)
+}
+
+// streamServe принимает соединения с готового слушателя. Отдельно от streamListen затем, чтобы
+// стенд мог подставить свой: ни ошибку accept, ни исчерпание дескрипторов настоящим сокетом не
+// воспроизвести.
+func (h *Hub) streamServe(ctx context.Context, ln net.Listener) error {
 	go func() {
 		<-ctx.Done()
 		ln.Close()
@@ -44,14 +70,46 @@ func (h *Hub) streamListen(ctx context.Context, port int) error {
 	for ctx.Err() == nil {
 		nc, err := ln.Accept()
 		if err != nil {
-			return err
+			// РАЗЛИЧАТЬ «СЛУШАТЕЛЬ ЗАКРЫТ» И «НЕ ВЫШЛО ПРИНЯТЬ ЭТОГО». Прежде здесь стоял
+			// `return err` на любую ошибку, то есть слушатель умирал НАВСЕГДА от чего угодно:
+			// кончились дескрипторы процесса, соединение отвалилось между SYN и accept
+			// (ECONNABORTED), ядро вернуло EMFILE под потоком. Хаб при этом оставался жив,
+			// поддельный TCP работал, а половина потока молча перестала принимать — и снаружи
+			// это выглядит как беда сети, потому что ни в журнале, ни в состоянии следа нет.
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if errors.Is(err, net.ErrClosed) {
+				return err
+			}
+			if ok, held := h.rlAccept.Allow(nowMS(), wire.LogEveryMS); ok {
+				h.logf("слушатель потока: принять не удалось (%v) — продолжаю принимать%s",
+					err, wire.HeldSuffix(held))
+			}
+			time.Sleep(streamAcceptPause)
+			continue
+		}
+		// Место под соединение занимается ДО горутины: иначе предел проверялся бы уже после
+		// того, как горутина и буферы созданы, то есть не проверялся бы вовсе.
+		if h.streamLive.Add(1) > streamMax {
+			h.streamLive.Add(-1)
+			if ok, held := h.rlStream.Allow(nowMS(), wire.LogEveryMS); ok {
+				h.logf("соединений потока больше %d одновременно — этому отказываю%s",
+					streamMax, wire.HeldSuffix(held))
+			}
+			nc.Close()
+			continue
 		}
 		// Соединение потока учитывается в общем счётчике горутин, а не живёт само по себе: его
 		// обработчик пишет пакеты В УСТРОЙСТВО (onFrame), и завершение обязано дождаться его
 		// прежде, чем закрыть дескриптор устройства (I-109). Add здесь безопасен: сама
-		// streamListen тоже в счётчике и держит его больше нуля, пока принимает соединения.
+		// streamServe тоже в счётчике и держит его больше нуля, пока принимает соединения.
 		h.wg.Add(1)
-		go func() { defer h.wg.Done(); h.streamConn(ctx, nc) }()
+		go func() {
+			defer h.wg.Done()
+			defer h.streamLive.Add(-1)
+			h.streamConn(ctx, nc)
+		}()
 	}
 	return ctx.Err()
 }

@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -292,5 +293,153 @@ func TestПотокУмираетПоПростою(t *testing.T) {
 		t.Error("сессия потока не умерла по простою: срока на чтение нет, и пропавший молча пир " +
 			"держит слот peerSess, буферы и потолок MTU устройства до ядерного keepalive — около " +
 			"2 ч 11 мин")
+	}
+}
+
+// ---- слушатель потока: ошибка accept и предел одновременных ------------------
+//
+// Обе проверки идут через streamServe, а не через streamListen: слушателя подставляет стенд.
+// Настоящим сокетом ни ошибку accept, ни исчерпание дескрипторов не воспроизвести — первое
+// требует состояния ядра (кончились дескрипторы, соединение отвалилось между SYN и accept),
+// второе заняло бы все дескрипторы процесса стенда.
+
+// errListener — слушатель, который сначала отдаёт заданное число ошибок, потом соединения.
+//
+// Close ведёт себя как настоящий: после него Accept отвечает net.ErrClosed. Без этого стенд
+// проверял бы выход по отмене на слушателе, который вечно ждёт, — то есть проверял бы свою
+// заглушку, а не streamServe.
+type errListener struct {
+	errs   int           // сколько раз ответить ошибкой
+	conns  chan net.Conn // что отдавать дальше
+	fail   error
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newErrListener(errs int, fail error) *errListener {
+	return &errListener{errs: errs, fail: fail,
+		conns: make(chan net.Conn, 8), closed: make(chan struct{})}
+}
+
+func (l *errListener) Accept() (net.Conn, error) {
+	if l.errs > 0 {
+		l.errs--
+		return nil, l.fail
+	}
+	select {
+	case nc := <-l.conns:
+		return nc, nil
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+func (l *errListener) Close() error   { l.once.Do(func() { close(l.closed) }); return nil }
+func (l *errListener) Addr() net.Addr { return &net.TCPAddr{} }
+
+// tempErr — ошибка того рода, который accept возвращает на временной беде.
+type tempErr struct{}
+
+func (tempErr) Error() string { return "слишком много открытых файлов" }
+
+func TestПотокПереживаетОшибкуAccept(t *testing.T) {
+	// Раньше любая ошибка accept возвращалась из streamListen наружу, то есть слушатель умирал
+	// НАВСЕГДА: хаб при этом оставался жив, поддельный TCP работал, а половина потока молча
+	// перестала принимать соединения. Ни в журнале, ни в состоянии этого не видно — пир просто
+	// не может подключиться, и причина выглядит как проблема сети.
+	h := newStand(t).h
+	ln := newErrListener(3, tempErr{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	streamAcceptPause = time.Millisecond // стенду не ждать
+	defer func() { streamAcceptPause = 20 * time.Millisecond }()
+
+	done := make(chan error, 1)
+	go func() { done <- h.streamServe(ctx, ln) }()
+
+	// После трёх ошибок слушатель обязан принять соединение.
+	srv, cli := net.Pipe()
+	select {
+	case ln.conns <- srv:
+	case <-time.After(2 * time.Second):
+		t.Fatal("слушатель не дошёл до приёма соединения после ошибок accept")
+	}
+	_ = cli.SetDeadline(time.Now().Add(2 * time.Second))
+	// Соединение принято, если хаб на мусор ответил оповещением: значит streamConn его получил.
+	if _, err := cli.Write([]byte("не рукопожатие вовсе, но записи хватит")); err != nil {
+		t.Fatalf("запись в принятое соединение: %v", err)
+	}
+	buf := make([]byte, 8)
+	if _, err := cli.Read(buf); err != nil {
+		t.Fatalf("хаб не ответил на принятое соединение: %v", err)
+	}
+	cli.Close()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("streamServe не вышла по отмене контекста")
+	}
+}
+
+func TestПотокОтказываетСверхПредела(t *testing.T) {
+	// Слушатель принимал без потолка: каждое НЕПОДТВЕРЖДЁННОЕ соединение занимает горутину и
+	// буферы до пятнадцатисекундного срока рукопожатия, то есть поток соединений — это память
+	// хаба и его дескрипторы, а выбирает объём тот, кто стучится. Предел тот же, что у таблицы
+	// сессий: законная звезда (32 пира × 4 соединения) в него входит с двойным запасом.
+	h := newStand(t).h
+	saved := streamMax
+	streamMax = 2
+	defer func() { streamMax = saved }()
+
+	ln := newErrListener(0, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- h.streamServe(ctx, ln) }()
+
+	// Два молчащих соединения занимают оба места и держат их: рукопожатия не будет.
+	var held []net.Conn
+	for i := 0; i < 2; i++ {
+		srv, cli := net.Pipe()
+		ln.conns <- srv
+		held = append(held, cli)
+	}
+	// Ждём, пока оба дойдут до обработчика.
+	deadline := time.Now().Add(2 * time.Second)
+	for h.streamLive.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := h.streamLive.Load(); got != 2 {
+		t.Fatalf("занято мест: %d, хочу 2", got)
+	}
+
+	// Третье обязано быть закрыто сразу, а не поставлено в очередь: чтение с него получит EOF.
+	srv, cli := net.Pipe()
+	ln.conns <- srv
+	_ = cli.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := cli.Read(make([]byte, 1)); err == nil {
+		t.Fatal("соединение сверх предела не закрыто")
+	}
+	if got := h.streamLive.Load(); got != 2 {
+		t.Fatalf("после отказа занято мест: %d, хочу 2 — место утекло", got)
+	}
+
+	// Место освобождается, когда соединение уходит: иначе предел был бы одноразовым.
+	held[0].Close()
+	deadline = time.Now().Add(3 * time.Second)
+	for h.streamLive.Load() > 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := h.streamLive.Load(); got != 1 {
+		t.Fatalf("после обрыва занято мест: %d, хочу 1", got)
+	}
+	for _, c := range held {
+		c.Close()
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("streamServe не вышла по отмене контекста")
 	}
 }
