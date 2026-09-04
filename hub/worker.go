@@ -22,7 +22,7 @@ import (
 // принадлежит этому воркеру, и трогать её из второй горутины значило бы завести замок на пути,
 // который и так под потоком.
 func (w *worker) rxLoop(ctx context.Context) {
-	buf := make([]byte, wire.Row)
+	buf := make([]byte, wire.RowRX)
 	last := time.Now()
 	for ctx.Err() == nil {
 		ok, err := w.rx.WaitRead(50 * time.Millisecond)
@@ -446,14 +446,20 @@ func (w *worker) roamStart(ns *session) {
 	}
 }
 
-// onData — собрать запись, расшифровать и развести пакеты.
+// onData — собрать записи из нагрузки сегмента, расшифровать и развести пакеты.
+//
+// ЦИКЛОМ, а не по одной записи на сегмент: ядро отдаёт в сырой сокет склеенное GRO, и записей в
+// одной нагрузке бывает несколько (см. Reasm.Feed).
 func (w *worker) onData(s *session, seg *link.Seg) {
 	// Сборка записи, которая могла быть разрезана между сегментами. Она же предфильтр: сегмент, не
 	// начинающийся с заголовка записи и не продолжающий начатую, отбрасывается до криптографии.
-	body, hdr, rel, done := s.reasm.Feed(seg.Seq, s.conn.ISNRX(), seg.Payload)
-	if !done {
-		return
-	}
+	s.reasm.FeedAll(seg.Seq, s.conn.ISNRX(), seg.Payload, func(body, hdr []byte, rel uint32) {
+		w.onRecord(s, body, hdr, rel)
+	})
+}
+
+// onRecord — одна собранная запись.
+func (w *worker) onRecord(s *session, body, hdr []byte, rel uint32) {
 	if !s.win.Check(rel) {
 		return
 	}

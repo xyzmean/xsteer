@@ -1013,7 +1013,9 @@ func (c *Client) sendFrame(s *sess, row []byte, n int) error {
 
 // inbound: поддельный TCP → TUN.
 func (c *Client) inbound(ctx context.Context, id int, s *sess, dev tun.Device, devName string) {
-	buf := make([]byte, wire.Row)
+	// RowRX, а не Row: в сырой сокет приходит склеенное GRO, и чтение в канальный предел обрезало
+	// бы такой пакет вместе с записями, которые в нём лежат (см. wire.RowRX).
+	buf := make([]byte, wire.RowRX)
 	isn := s.conn.ISNRX()
 	for ctx.Err() == nil {
 		ok, err := s.conn.WaitRead(200 * time.Millisecond)
@@ -1074,29 +1076,30 @@ func (c *Client) inSeg(s *sess, id int, buf []byte, isn uint32, dev tun.Device, 
 	// Сборка записи, которая могла быть разрезана между сегментами. Она же служит предфильтром:
 	// сегмент, не начинающийся с заголовка записи и не продолжающий начатую, отбрасывается до
 	// всякой криптографии.
-	body, hdr, rel, done := s.reasm.Feed(seg.Seq, isn, seg.Payload)
-	if !done {
-		return true
-	}
-	if !s.win.Check(rel) {
-		return true
-	}
-	// AAD — заголовок записи, как в TLS 1.3: для разрезанной это байты ПЕРВОГО сегмента, то есть у
-	// обеих сторон одни и те же.
-	pt, err := s.rx.Open(body, hdr, uint64(rel))
-	if err != nil {
-		return true
-	}
-	// Коммит окна ТОЛЬКО после сошедшегося тега: иначе подделанный пакет с далёким смещением выбил
-	// бы из окна весь честный поток.
-	s.win.Commit(rel)
-	if len(pt) > 0 && pt[0] == wire.CtlBatch {
-		if !wire.BatchIter(pt, func(f []byte) { c.onFrame(s, id, f, dev) }) {
-			c.stats.dropped.Add(1)
+	//
+	// ЦИКЛОМ по всей нагрузке, а не по одной записи: ядро отдаёт в сырой сокет склеенное GRO, и
+	// записей в одной нагрузке бывает несколько (см. Reasm.Feed).
+	s.reasm.FeedAll(seg.Seq, isn, seg.Payload, func(body, hdr []byte, rel uint32) {
+		if !s.win.Check(rel) {
+			return
 		}
-		return true
-	}
-	c.onFrame(s, id, pt, dev)
+		// AAD — заголовок записи, как в TLS 1.3: для разрезанной это байты ПЕРВОГО сегмента, то
+		// есть у обеих сторон одни и те же.
+		pt, err := s.rx.Open(body, hdr, uint64(rel))
+		if err != nil {
+			return
+		}
+		// Коммит окна ТОЛЬКО после сошедшегося тега: иначе подделанный пакет с далёким смещением
+		// выбил бы из окна весь честный поток.
+		s.win.Commit(rel)
+		if len(pt) > 0 && pt[0] == wire.CtlBatch {
+			if !wire.BatchIter(pt, func(f []byte) { c.onFrame(s, id, f, dev) }) {
+				c.stats.dropped.Add(1)
+			}
+			return
+		}
+		c.onFrame(s, id, pt, dev)
+	})
 	return true
 }
 

@@ -588,7 +588,7 @@ func TestСборкаРазрезаннойЗаписи(t *testing.T) {
 	var out []byte
 	var rel uint32
 	for i, p := range parts {
-		b, hdr, rl, ok := r.Feed(seq, isn, p)
+		b, hdr, rl, ok, _ := r.Feed(seq, isn, p)
 		if ok && len(hdr) != RecHdr {
 			t.Fatalf("заголовок записи отдан длиной %d", len(hdr))
 		}
@@ -613,7 +613,7 @@ func TestСборкаРазрезаннойЗаписи(t *testing.T) {
 	// Пропавший средний сегмент: запись обязана быть выброшена, а не склеена из чужих байтов.
 	r = Reasm{}
 	r.Feed(1, 0, rec[:1400])
-	if _, _, _, ok := r.Feed(1400+1000, 0, rec[2800:]); ok {
+	if _, _, _, ok, _ := r.Feed(1400+1000, 0, rec[2800:]); ok {
 		t.Error("собралась запись из несмежных сегментов")
 	}
 	if r.Dropped == 0 {
@@ -624,7 +624,7 @@ func TestСборкаРазрезаннойЗаписи(t *testing.T) {
 	r = Reasm{}
 	one := make([]byte, RecHdr+Tag+10)
 	_ = RecBuild(one, Tag+10)
-	if _, _, _, ok := r.Feed(5, 0, one); !ok {
+	if _, _, _, ok, _ := r.Feed(5, 0, one); !ok {
 		t.Error("целая запись в одном сегменте не разобралась")
 	}
 
@@ -637,7 +637,7 @@ func TestСборкаРазрезаннойЗаписи(t *testing.T) {
 	huge := make([]byte, RecMin+64)
 	huge[0], huge[1], huge[2] = recType, recV0, recV1
 	huge[3], huge[4] = byte((MaxRecord+1)>>8), byte((MaxRecord+1)&0xFF)
-	if _, _, _, ok := r.Feed(9, 0, huge); ok {
+	if _, _, _, ok, _ := r.Feed(9, 0, huge); ok {
 		t.Error("запись с заявленной длиной больше MaxRecord принята")
 	}
 	if r.active {
@@ -817,5 +817,74 @@ func TestПределПачкиИПределЗаписи(t *testing.T) {
 	// пускал всё до 0xFFFF, переполнение доезжало до провода и обрывало соединение у получателя.
 	if err := RecBuild(make([]byte, RecHdr), MaxRecord+1); err == nil {
 		t.Error("RecBuild принял тело длиннее MaxRecord")
+	}
+}
+
+// Склейка GRO: в одной нагрузке несколько записей, и последняя может быть обрезана посередине.
+//
+// Это не теоретический случай и не чужая реализация — так нагрузку отдаёт СВОЁ ЖЕ ядро. В сырой
+// сокет пакеты приходят после сборки GRO, и идущие подряд сегменты одного потока склеиваются в
+// один. Пока приёмник отвергал такую нагрузку целиком, каждая склейка уносила пачку внутренних
+// пакетов: на живой связи роутер↔VPS это стоило 0,45 Мбит/с против 110 при нуле потерь на канале.
+// В пространствах имён этого не видно вовсе, поэтому случай закреплён здесь.
+func TestСклейкаGROРазбираетсяПоЗаписям(t *testing.T) {
+	mk := func(plen int) []byte {
+		b := make([]byte, RecHdr+plen)
+		if err := RecBuild(b, plen); err != nil {
+			t.Fatal(err)
+		}
+		for i := RecHdr; i < len(b); i++ {
+			b[i] = byte(plen)
+		}
+		return b
+	}
+	r1, r2, r3 := mk(Tag+100), mk(Tag+50), mk(Tag+1000)
+	pay := append(append(append([]byte{}, r1...), r2...), r3...)
+
+	var r Reasm
+	var rels []uint32
+	var lens []int
+	r.FeedAll(1, 0, pay, func(body, hdr []byte, rel uint32) {
+		rels = append(rels, rel)
+		lens = append(lens, len(body))
+	})
+	if len(rels) != 3 {
+		t.Fatalf("из склейки трёх записей разобрано %d", len(rels))
+	}
+	wantRel := []uint32{1, 1 + uint32(len(r1)), 1 + uint32(len(r1)+len(r2))}
+	wantLen := []int{Tag + 100, Tag + 50, Tag + 1000}
+	for i := range rels {
+		// Смещение — это то, чем шифруется запись: возьми вызывающий номер сегмента вместо номера
+		// САМОЙ записи, и у второй записи в склейке не сошёлся бы тег.
+		if rels[i] != wantRel[i] {
+			t.Errorf("запись %d: смещение %d, ждали %d", i, rels[i], wantRel[i])
+		}
+		if lens[i] != wantLen[i] {
+			t.Errorf("запись %d: длина тела %d, ждали %d", i, lens[i], wantLen[i])
+		}
+	}
+	if r.Dropped != 0 {
+		t.Errorf("на исправной склейке выброшено %d сборок", r.Dropped)
+	}
+
+	// Тот же случай, но склейка ОБРЕЗАНА посередине третьей записи: хвост приходит следующим
+	// сегментом. Так выглядит склейка, упёршаяся в предел GRO.
+	r = Reasm{}
+	cut := len(r1) + len(r2) + 40
+	rels = nil
+	r.FeedAll(1, 0, pay[:cut], func(body, hdr []byte, rel uint32) { rels = append(rels, rel) })
+	if len(rels) != 2 {
+		t.Fatalf("до обрыва ждали две готовые записи, получили %d", len(rels))
+	}
+	r.FeedAll(1+uint32(cut), 0, pay[cut:], func(body, hdr []byte, rel uint32) { rels = append(rels, rel) })
+	if len(rels) != 3 {
+		t.Fatalf("после хвоста ждали три записи, получили %d", len(rels))
+	}
+	if rels[2] != wantRel[2] {
+		t.Errorf("разрезанная запись: смещение %d, ждали %d (номер ПЕРВОГО сегмента записи)",
+			rels[2], wantRel[2])
+	}
+	if r.Dropped != 0 {
+		t.Errorf("на разрезанной склейке выброшено %d сборок", r.Dropped)
 	}
 }
