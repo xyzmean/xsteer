@@ -33,12 +33,25 @@ import (
 // fakeRaw — сырой сокет, которого нет: отправленные сегменты складываются в память.
 type fakeRaw struct {
 	local [4]byte
-	sent  [][]byte
+	// mu — потому что отправлять в сессию может НЕ ТОЛЬКО горутина приёма: ответ сайта-прикрытия
+	// переливает proxyDown, а с асинхронным набором (I-126) отправляет и горутина набора. Настоящий
+	// сырой сокет к этому готов, память — нет, и без замка детектор гонок ловит стенд, а не движок.
+	mu   sync.Mutex
+	sent [][]byte
 }
 
 func (r *fakeRaw) Send(seg []byte) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.sent = append(r.sent, append([]byte(nil), seg...))
 	return nil
+}
+
+// sentLen — сколько сегментов уже отправлено; под тем же замком, что и запись.
+func (r *fakeRaw) sentLen() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.sent)
 }
 func (r *fakeRaw) Recv([]byte) (int, error)             { return 0, io.EOF }
 func (r *fakeRaw) WaitRead(time.Duration) (bool, error) { return false, nil }
@@ -47,6 +60,8 @@ func (r *fakeRaw) Close() error                         { return nil }
 
 // payloadsSince склеивает нагрузку сегментов, отправленных начиная с индекса from.
 func (r *fakeRaw) payloadsSince(from int) []byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	var out []byte
 	for _, s := range r.sent[from:] {
 		hl := int(s[12]>>4) * 4
@@ -59,6 +74,8 @@ func (r *fakeRaw) payloadsSince(from int) []byte {
 
 // flagsSince — флаги сегментов, отправленных начиная с индекса from.
 func (r *fakeRaw) flagsSince(from int) []byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	var out []byte
 	for _, s := range r.sent[from:] {
 		out = append(out, s[13])
@@ -187,7 +204,7 @@ func newStand(t *testing.T) *stand {
 	if err != nil {
 		t.Fatalf("ClientHello: %v", err)
 	}
-	before := len(st.raw.sent)
+	before := st.raw.sentLen()
 	st.feed(link.PSH|link.ACK, hello)
 	if st.s.phase != phHS {
 		t.Fatalf("после Hello фаза %d, ждали phHS — рукопожатие не разобрано", st.s.phase)
@@ -435,7 +452,7 @@ func TestПоддельныйSYNНеСбрасываетСессию(t *testing.
 
 	isnWas := st.s.conn.ISNRX()
 	phaseWas := st.s.phase
-	before := len(st.raw.sent)
+	before := st.raw.sentLen()
 
 	// Поддельный SYN: адрес и порт те же, номер посторонний.
 	spoof, ok := link.ParseSeg(st.mkSeg(0x7EEEEEEE, link.SYN, nil))
@@ -746,13 +763,13 @@ func TestMTUИзПроводаЗажатПотолком(t *testing.T) {
 	// И главное: с таким MTU разрезаемая запись обязана уехать, а не попасть в счётчик отброшенных.
 	row := make([]byte, wire.HdrRoom+wire.MaxRecord+wire.Tag)
 	dropped := st.h.stats.dropped.Load()
-	before := len(st.raw.sent)
+	before := st.raw.sentLen()
 	st.w.sendTo(s, row, 4000)
 	if got := st.h.stats.dropped.Load(); got != dropped {
 		t.Errorf("разрезаемая запись отброшена при согласованном MTU %d: dropped %d → %d",
 			s.mtu.Load(), dropped, got)
 	}
-	if n := len(st.raw.sent) - before; n < 2 {
+	if n := st.raw.sentLen() - before; n < 2 {
 		t.Errorf("запись 4000 байт уехала %d сегментами — разрезания не было", n)
 	}
 }

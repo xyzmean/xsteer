@@ -11,8 +11,10 @@ package hub
 
 import (
 	"encoding/binary"
+	"errors"
 	"math/rand"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -187,7 +189,7 @@ func TestПовторMsg1ОтвечаетТемЖе(t *testing.T) {
 	st.h.opt.Decoy = DecoyMode{}
 
 	// Ответ на постороннего: эталон, с которым сравнивается ответ на повтор.
-	base := len(st.raw.sent)
+	base := st.raw.sentLen()
 	garbage := newProbe(t, st, 3)
 	garbage.feed(link.PSH|link.ACK, tlsRecord(120))
 	want := st.raw.payloadsSince(base)
@@ -206,7 +208,7 @@ func TestПовторMsg1ОтвечаетТемЖе(t *testing.T) {
 		t.Fatalf("ClientHello: %v", err)
 	}
 
-	base = len(st.raw.sent)
+	base = st.raw.sentLen()
 	replay := newProbe(t, st, 4)
 	replay.feed(link.PSH|link.ACK, hello)
 	got := st.raw.payloadsSince(base)
@@ -319,5 +321,220 @@ func TestИсчерпаниеПределаНеопознанныхОтказы�
 	if live := st.h.decoyLive.Load(); live != decoyMax {
 		t.Errorf("занято %d мест, ожидалось ровно %d — отказ по пределу считает не то",
 			live, decoyMax)
+	}
+}
+
+// ---- находка I-126: набор номера прикрытия шёл прямо в цикле воркера ----------
+
+// waitReady — дождаться, пока прикрытие подняло трубку и накопленное ему отдано. Нужна потому,
+// что звонок делает не тот, кто скормил сегмент: фаза phProxy стоит сразу, а готовность приходит
+// позже (см. session.upReady).
+func waitReady(t *testing.T, s *session, limit time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(limit)
+	for time.Now().Before(deadline) {
+		if s.upReady.Load() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatal("прикрытие так и не подняло трубку: накопленное ему не отдано")
+}
+
+// heldDialer — набор, который остановлен на месте: сообщает о начале и ждёт разрешения.
+// Единственный способ проверить, что делает воркер ВО ВРЕМЯ набора: настоящая сеть набирает
+// слишком быстро и слишком непредсказуемо, чтобы на этом стоял стенд.
+func heldDialer(st *stand) (started, release chan struct{}) {
+	started, release = make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	st.h.dial = func(dest string, timeout time.Duration) (net.Conn, error) {
+		once.Do(func() { close(started) })
+		<-release
+		return net.DialTimeout("tcp", dest, timeout)
+	}
+	return started, release
+}
+
+// TestНаборПрикрытияНеОстанавливаетВоркер: приём возвращается, пока соединение к сайту-прикрытию
+// ещё набирается.
+//
+// `startProxy` звал `net.DialTimeout` внутри `onStranger`, то есть внутри `onSeg`, то есть внутри
+// `rxLoop` — а `rxLoop` это ОДНА горутина на воркера, и она же, по прямому решению в своей шапке,
+// ведёт обслуживание. Значит на время рукопожатия TCP с прикрытием воркер не принимал ни одного
+// сегмента своих пиров, не слал keepalive, не отдавал отложенных подтверждений и не убирал сессий
+// по простою. Цена — от миллисекунд до `DecoyMode.Timeout` (по умолчанию пять секунд), а вызвать
+// это мог кто угодно из интернета: нужен адрес, порт и один сегмент, похожий на начало TLS.
+// Подтверждать при этом не нужно ничего — дорожка неопознанного идёт ДО аутентификации.
+//
+// Стенд держит набор на месте и проверяет ровно то, что и нужно: управление вернулось, пока набор
+// ещё идёт. В реализации на C этого нет по построению — `decoy_start` открывает сокет
+// SOCK_NONBLOCK и допускает EINPROGRESS, а готовность приходит событием POLLOUT в `decoy_event`.
+func TestНаборПрикрытияНеОстанавливаетВоркер(t *testing.T) {
+	st := newStand(t)
+	dest, got := decoySite(t)
+	started, release := heldDialer(st)
+	st.h.opt.Decoy = DecoyMode{Mode: "proxy", Dest: dest, Timeout: 2 * time.Second}
+
+	hello := tlsRecord(200)
+	p := newProbe(t, st, 70)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.feed(link.PSH|link.ACK, hello)
+	}()
+
+	<-started
+	select {
+	case <-done:
+		// Приём вернулся, пока набор ещё держат, — то, ради чего правка и делается.
+	case <-time.After(2 * time.Second):
+		close(release)
+		<-done
+		t.Fatal("приём не вернулся, пока шёл набор к прикрытию: воркер стоит на стороннем узле, " +
+			"и остановить его может любой из интернета одним сегментом, похожим на начало TLS")
+	}
+
+	// Набор доводится до конца: правка обязана не только вернуть управление, но и доделать работу.
+	close(release)
+	waitReady(t, p.s, 2*time.Second)
+	if seen := <-got; string(seen) != string(hello) {
+		t.Errorf("прикрытие получило %d байт из %d", len(seen), len(hello))
+	}
+}
+
+// TestСегментыДоГотовностиПрикрытияНеТеряются: продолжение потока, пришедшее ПОКА идёт звонок,
+// уходит прикрытию сразу за Hello и в том же порядке.
+//
+// Красный этот стенд не на прежнем коде, а на НАИВНОЙ правке — асинхронном звонке без буфера, — и
+// заведён именно поэтому. Пока звонок шёл в цикле воркера, потерять эти байты было невозможно по
+// построению: воркер стоял, и продолжение ждало в очереди сокета. Как только звонок уехал в свою
+// горутину, у сессии появился промежуток, в котором она жива, а s.up ещё нет: без dialBuf сегменты
+// этого промежутка молча пропадали бы (в onSeg у фазы phDial не было бы ветки), и прикрытие
+// получило бы запрос с дырой посередине — то есть ответило бы не так, как ответило бы прибору.
+// В реализации на C ту же роль играет hs_buf: «иначе продолжение потока обогнало бы своё же
+// начало» (xshub.c, decoy_up при !up_ready).
+func TestСегментыДоГотовностиПрикрытияНеТеряются(t *testing.T) {
+	st := newStand(t)
+	dest, got := decoySite(t)
+	started, release := heldDialer(st)
+	st.h.opt.Decoy = DecoyMode{Mode: "proxy", Dest: dest, Timeout: 2 * time.Second}
+
+	hello := tlsRecord(200)
+	tail := []byte("GET / HTTP/1.1\r\nHost: cover.example.org\r\n\r\n")
+	p := newProbe(t, st, 71)
+	p.feed(link.PSH|link.ACK, hello) // возвращается сразу: звонок держат
+	<-started
+	p.feed(link.PSH|link.ACK, tail) // продолжение, а прикрытия ещё нет
+	close(release)
+
+	waitReady(t, p.s, 3*time.Second)
+	want := append(append([]byte(nil), hello...), tail...)
+	if seen := <-got; string(seen) != string(want) {
+		t.Errorf("прикрытие получило %d байт, ожидалось %d (Hello %d + продолжение %d): "+
+			"продолжение, пришедшее во время звонка, обязано уйти сразу за Hello и в том же "+
+			"порядке", len(seen), len(want), len(hello), len(tail))
+	}
+}
+
+// TestОтказЗвонкаОтвечаетОповещением: если дозвониться не удалось, прибор получает то же
+// оповещение, что и раньше, а место в пределе возвращается.
+//
+// Прежде это делал fallthrough в onStranger: startProxy возвращал false, и управление падало в
+// ветку оповещения. С асинхронным звонком отказ выясняется, когда onStranger давно вернулся, —
+// значит отвечать обязана горутина звонка, иначе поведение при недоступном прикрытии молча
+// сменилось бы с «оповещение» на «тишина». Разница видна прибору: молчание отличимо сильнее.
+func TestОтказЗвонкаОтвечаетОповещением(t *testing.T) {
+	st := newStand(t)
+	st.h.opt.Decoy = DecoyMode{Mode: "proxy", Dest: "203.0.113.9:443", Timeout: time.Second}
+	st.h.dial = func(dest string, timeout time.Duration) (net.Conn, error) {
+		return nil, errors.New("прикрытие недоступно")
+	}
+
+	// База берётся ПОСЛЕ подъёма пробы: newProbe сам отправляет SYN-ACK, и отсчёт от неё показал
+	// бы «ответ уже есть» до того, как звонок вообще начался.
+	p := newProbe(t, st, 72)
+	base := st.raw.sentLen()
+	p.feed(link.PSH|link.ACK, tlsRecord(200))
+
+	deadline := time.Now().Add(3 * time.Second)
+	for st.raw.sentLen() == base && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	seen := st.raw.payloadsSince(base)
+	if string(seen) != string(noise.Alert()) {
+		t.Errorf("на отказ звонка ответ %x, ждали оповещение %x — молчание отличимо от ответа "+
+			"настоящего сервера сильнее, чем оповещение", seen, noise.Alert())
+	}
+	if !p.s.dead.Load() {
+		t.Error("сессия не помечена к уборке: владелец не уберёт её, и она доживёт до простоя")
+	}
+	if live := st.h.decoyLive.Load(); live != 0 {
+		t.Errorf("после отказа звонка занято %d мест из %d, ожидалось 0", live, decoyMax)
+	}
+}
+
+// TestСессиюОсвободилиПокаШёлЗвонок: владелец убрал сессию, пока горутина висела на звонке.
+//
+// Это тот пограничный случай, которого до асинхронного звонка не существовало вовсе, и самый
+// опасный из новых: горутина возвращается к сессии, которой уже нет в таблице воркера. Проверяется
+// два свойства сразу — место в пределе возвращается (иначе decoyMax утекает по одному месту на
+// каждую такую уборку, и режим proxy тихо вырождается в alert), и горутина не трогает чужое: с
+// -race этот стенд поймал бы запись в освобождённую сессию.
+func TestСессиюОсвободилиПокаШёлЗвонок(t *testing.T) {
+	st := newStand(t)
+	dest, _ := decoySite(t)
+	started, release := heldDialer(st)
+	st.h.opt.Decoy = DecoyMode{Mode: "proxy", Dest: dest, Timeout: 2 * time.Second}
+
+	p := newProbe(t, st, 73)
+	p.feed(link.PSH|link.ACK, tlsRecord(200))
+	<-started
+	st.w.free(p.k, p.s) // владелец убирает сессию прямо во время звонка
+	close(release)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for st.h.decoyLive.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if live := st.h.decoyLive.Load(); live != 0 {
+		t.Errorf("занято %d мест из %d: место, занятое под звонок, не вернулось после уборки "+
+			"сессии — исчерпание предела превращает режим proxy в alert", live, decoyMax)
+	}
+	if _, ok := st.w.sess[p.k]; ok {
+		t.Error("освобождённая сессия осталась в таблице воркера")
+	}
+}
+
+// TestНакопленноеЗаЗвонокОграничено: буфер продолжения не растёт без предела.
+//
+// dialBuf наполняет кто угодно из интернета — дорожка неопознанного идёт ДО всякой
+// аутентификации, — и держится он ровно столько, сколько длится звонок к стороннему узлу, то есть
+// до DecoyMode.Timeout. Без предела это способ съесть память хаба чужими байтами при decoyMax
+// одновременных сессий; предел выражен константой dialMax по той же причине, по которой у
+// накопления Hello есть helloMax.
+func TestНакопленноеЗаЗвонокОграничено(t *testing.T) {
+	st := newStand(t)
+	dest, _ := decoySite(t)
+	started, release := heldDialer(st)
+	st.h.opt.Decoy = DecoyMode{Mode: "proxy", Dest: dest, Timeout: 2 * time.Second}
+	defer close(release)
+
+	p := newProbe(t, st, 74)
+	p.feed(link.PSH|link.ACK, tlsRecord(200))
+	<-started
+	chunk := make([]byte, 1400)
+	for sent := 0; sent < dialMax+4*len(chunk); sent += len(chunk) {
+		p.feed(link.PSH|link.ACK, chunk)
+	}
+
+	p.s.mu.Lock()
+	held := len(p.s.dialBuf)
+	p.s.mu.Unlock()
+	if held > dialMax {
+		t.Errorf("накоплено %d байт при пределе %d: буфер продолжения растёт по воле постороннего",
+			held, dialMax)
+	}
+	if !p.s.dead.Load() {
+		t.Error("перебравший предел не помечен к уборке: сессия останется висеть с чужим буфером")
 	}
 }
