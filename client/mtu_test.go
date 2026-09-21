@@ -75,6 +75,13 @@ func segPkt(seq uint32, flags byte) []byte {
 func standConn(t *testing.T) (*link.Conn, *fakeRaw) {
 	t.Helper()
 	raw := &fakeRaw{}
+	return standConnOn(t, raw), raw
+}
+
+// standConnOn — то же соединение поверх ЗАДАННОГО сырого сокета: стендам, которым надо не только
+// смотреть на отправленное, но и подсовывать принятое (rst_test.go).
+func standConnOn(t *testing.T, raw link.Raw) *link.Conn {
+	t.Helper()
 	syn, ok := link.ParseSeg(segPkt(standISN, link.SYN))
 	if !ok {
 		t.Fatal("свой же SYN не разобрался")
@@ -93,7 +100,7 @@ func standConn(t *testing.T) (*link.Conn, *fakeRaw) {
 	if conn.State() != link.StateEst {
 		t.Fatalf("соединение не поднялось: состояние %d", conn.State())
 	}
-	return conn, raw
+	return conn
 }
 
 // standKeys — ключи на отправку из настоящего рукопожатия. Подделать их нечем: Seal зовётся по

@@ -1049,6 +1049,17 @@ func (c *Client) inbound(ctx context.Context, id int, s *sess, dev tun.Device, d
 		if err := dev.Flush(); err != nil {
 			c.stats.dropped.Add(1)
 		}
+		// Соединение закрылось сбросом — выходим ИЗ СОЕДИНЕНИЯ, а не только из захода. Больше
+		// этого не сделает никто: отправка на закрытом соединении получает «не установлено» (ни
+		// ErrDead, ни ErrPathGone — просто растёт счётчик отброшенных), а Tick для любого состояния,
+		// кроме SynSent и Est, возвращает nil. Без этой проверки после штатного перезапуска хаба —
+		// его ядро отвечает RST на первый же наш сегмент, пока правило против RST снято — сессия
+		// стояла мёртвой до смены сети или перезапуска клиента. Половина на C зовёт в этом месте
+		// session_down. Возврат снимает контекст сессии (defer stop у вызывающего), и worker
+		// поднимает соединение заново.
+		if s.conn.State() == link.StateClosed {
+			return
+		}
 	}
 }
 
@@ -1057,9 +1068,9 @@ func (c *Client) inbound(ctx context.Context, id int, s *sess, dev tun.Device, d
 func (c *Client) inSeg(s *sess, id int, buf []byte, isn uint32, dev tun.Device, devName string) bool {
 	seg, mine, err := s.conn.Recv(buf)
 	if err != nil {
-		// ErrAgain — очередь пуста, всплеск кончился. Любая другая ошибка чтения означает, что
-		// сокет больше не работает: там выходить надо не из захода, а из соединения, и это делает
-		// вызывающий по отмене общего контекста.
+		// ErrAgain — очередь пуста, всплеск кончился. Прочие ошибки чтения сырого сокета
+		// одноразовые (ошибка ICMP отдаётся ядром одним чтением и снимается) — заход кончается,
+		// следующее ожидание начинается заново. Мёртвый путь при активной отправке признаёт Tick.
 		return false
 	}
 	if !mine {
@@ -1067,7 +1078,14 @@ func (c *Client) inSeg(s *sess, id int, buf []byte, isn uint32, dev tun.Device, 
 	}
 	data, err := s.conn.OnSeg(&seg)
 	if err != nil {
-		c.logf("соединение %d: %v", id, err)
+		// Единственная ошибка OnSeg — ErrDead на законный RST, и её текст («путь молчит при
+		// активной отправке») написан для Tick: здесь он называл бы чужую причину. Хаб ОТВЕТИЛ,
+		// и это надо сказать словами.
+		if errors.Is(err, link.ErrDead) {
+			c.logf("соединение %d: %s ответил RST — поднимаю соединение заново", id, c.hub.str)
+		} else {
+			c.logf("соединение %d: %v", id, err)
+		}
 		return false
 	}
 	if !data {
