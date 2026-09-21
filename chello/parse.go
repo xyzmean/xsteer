@@ -159,12 +159,14 @@ func Parse(rec []byte) (*Ref, error) {
 		switch {
 		case typ == 0x0000 && ln >= 5: // server_name
 			e := &cur{p: rec[:body+ln], i: body}
-			if _, ok := e.u16(); ok {
-				if nt, ok := e.u8(); ok && nt == 0 {
-					if nl, ok := e.u16(); ok && nl < 128 && e.need(nl) {
-						out.SNI = string(rec[e.i : e.i+nl])
-					}
-				}
+			listLen, ok1 := e.u16()
+			nt, ok2 := e.u8()
+			nl, ok3 := e.u16()
+			if !ok1 || !ok2 || !ok3 || 2+listLen != ln || listLen != 3+nl {
+				return nil, ErrNotHello
+			}
+			if nt == 0 && nl < 128 && e.need(nl) {
+				out.SNI = string(rec[e.i : e.i+nl])
 			}
 		case typ == 0x0033 && ln >= 6: // key_share
 			e := &cur{p: rec[:body+ln], i: body}
@@ -176,7 +178,7 @@ func Parse(rec []byte) (*Ref, error) {
 			for e.i < shEnd {
 				grp, ok1 := e.u16()
 				kl, ok2 := e.u16()
-				if !ok1 || !ok2 || !e.need(kl) {
+				if !ok1 || !ok2 || !e.need(kl) || e.i+kl > shEnd {
 					return nil, ErrNotHello
 				}
 				// GREASE-группа лежит в key_share первой и несёт один случайный байт — взять её

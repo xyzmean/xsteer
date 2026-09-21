@@ -59,11 +59,14 @@ func (c *Client) Snapshot(devName string) State {
 	if hs := c.stats.lastHandshake.Load(); hs != 0 {
 		age = time.Now().Unix() - hs
 	}
+	// Одно чтение на оба поля: между двумя Load последняя сессия может уйти, и наружу уехала бы
+	// пара «поднят, соединений ноль», по смыслу невозможная.
+	up := c.stats.up.Load()
 	return State{
 		Schema:       1,
 		Device:       devName,
-		Up:           c.stats.up.Load() > 0,
-		Conns:        int(c.stats.up.Load()),
+		Up:           up > 0,
+		Conns:        int(up),
 		MTU:          int(c.mtuNow.Load()),
 		MTUConfirmed: int(c.mtuPub.Load()),
 		Hub:          c.hub.str,
@@ -85,8 +88,8 @@ func (c *Client) Snapshot(devName string) State {
 func (c *Client) stateLoop(ctx context.Context, devName string) {
 	t := time.NewTicker(2 * time.Second)
 	defer t.Stop()
-	write := func() {
-		b, err := json.Marshal(c.Snapshot(devName))
+	write := func(st State) {
+		b, err := json.Marshal(st)
 		if err != nil {
 			return
 		}
@@ -100,13 +103,16 @@ func (c *Client) stateLoop(ctx context.Context, devName string) {
 		_ = os.Rename(tmp, c.opt.StatePath)
 	}
 	for {
-		write()
+		write(c.Snapshot(devName))
 		select {
 		case <-ctx.Done():
 			// Последний снимок при уходе: иначе файл остался бы врать «up», пока его кто-нибудь не
-			// перечитает.
-			c.stats.up.Store(0)
-			write()
+			// перечитает. Ноль пишется В СНИМОК, а не в счётчик: up — число живых соединений,
+			// которым владеют сессии и уменьшают его своими defer; обнуление под ними уводило бы
+			// его в минус для любого другого читателя.
+			st := c.Snapshot(devName)
+			st.Up, st.Conns = false, 0
+			write(st)
 			return
 		case <-t.C:
 		}

@@ -269,6 +269,45 @@ func TestБитыеHelloОтвергаются(t *testing.T) {
 	if _, err := Parse(notHello); err == nil {
 		t.Error("ServerHello принят за ClientHello")
 	}
+
+	// Вложенные длины, не сходящиеся с внешними (I-280)
+	ref, err := Parse(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	i := ref.HSOff + 4 + 2 + 32 + 1 + 32
+	sl := int(rec[i])<<8 | int(rec[i+1])
+	i += 2 + sl
+	i += 1 + int(rec[i])
+	el := int(rec[i])<<8 | int(rec[i+1])
+	extEnd := i + 2 + el
+	sniBody, ksBody := 0, 0
+	for p := i + 2; p+4 <= extEnd; {
+		typ := int(rec[p])<<8 | int(rec[p+1])
+		l := int(rec[p+2])<<8 | int(rec[p+3])
+		if typ == 0x0000 {
+			sniBody = p + 4
+		}
+		if typ == 0x0033 {
+			ksBody = p + 4
+		}
+		p += 4 + l
+	}
+	if sniBody > 0 {
+		badSni := append([]byte(nil), rec...)
+		badSni[sniBody+1]++ // длина списка имён на байт больше
+		if _, err := Parse(badSni); err == nil {
+			t.Error("брак: длина списка server_name не сходится с именем")
+		}
+	}
+	if ksBody > 0 {
+		badKs := append([]byte(nil), rec...)
+		badKs[ksBody] = 0
+		badKs[ksBody+1] = 8 // список ключей короче ключа
+		if _, err := Parse(badKs); err == nil {
+			t.Error("брак: ключ key_share длиннее объявленного списка ключей")
+		}
+	}
 }
 
 // Замороженный отпечаток: не байты (они разные на каждое соединение из-за GREASE и
