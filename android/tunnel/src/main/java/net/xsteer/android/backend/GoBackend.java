@@ -19,8 +19,14 @@
 
 package net.xsteer.android.backend;
 
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkRequest;
+import android.os.PowerManager;
 import android.os.Build;
 import android.os.ParcelFileDescriptor;
 import android.system.OsConstants;
@@ -64,6 +70,8 @@ public final class GoBackend implements Backend {
     @Nullable private Config currentConfig;
     @Nullable private Tunnel currentTunnel;
     @Nullable private xsteer.Tunnel goTunnel;
+    @Nullable private ConnectivityManager.NetworkCallback netCallback;
+    @Nullable private BroadcastReceiver wakeReceiver;
 
     public GoBackend(final Context context) {
         this.context = context;
@@ -359,6 +367,7 @@ public final class GoBackend implements Backend {
             goTunnel = go;
             currentTunnel = tunnel;
             currentConfig = config;
+            watchPath(context);
         } else {
             final xsteer.Tunnel go = goTunnel;
             if (go == null) {
@@ -368,6 +377,7 @@ public final class GoBackend implements Backend {
             goTunnel = null;
             currentTunnel = null;
             currentConfig = null;
+            stopWatchingPath(context);
             // Stop ждёт, пока клиент отдаст накопленное и закроет дескриптор.
             go.stop();
             try {
@@ -385,6 +395,89 @@ public final class GoBackend implements Backend {
         final xsteer.Tunnel go = goTunnel;
         if (go != null)
             go.netChanged();
+    }
+
+    /**
+     * Слежение за тем, под чем живёт туннель. Своё слежение половины на Go выключено
+     * (`NoNetWatch`): без netlink оно опрашивает адрес выхода раз в пять секунд, а внутри
+     * туннеля адресом источника ядро может назвать адрес самого туннеля. Правду знает платформа
+     * — значит платформа и обязана сказать.
+     *
+     * ДВА ИСТОЧНИКА, И ВТОРОЙ ВАЖНЕЕ ПЕРВОГО НА ТЕЛЕФОНЕ.
+     *
+     * 1. Смена сети: Wi-Fi ушёл, пришла мобильная. Обычный `NetworkCallback`.
+     * 2. ВОЗВРАЩЕНИЕ ИЗ СНА. Экран гаснет, телефон засыпает, и всё, что у нас есть, —
+     *    соединение TCP: оно переживает сон только до тех пор, пока его держит чужой NAT, а
+     *    записей от нас в это время не уходит вовсе. Хаб освобождает сессию по простою,
+     *    оператор закрывает трансляцию, и после разблокировки туннель «поднят», а не несёт
+     *    ничего. Событий сети при этом НЕ БЫЛО — сеть та же самая, — поэтому первый источник
+     *    молчит. Отсюда второй: включение экрана, разблокировка и выход из дремоты.
+     */
+    private void watchPath(final Context context) {
+        stopWatchingPath(context);
+
+        final ConnectivityManager cm = context.getSystemService(ConnectivityManager.class);
+        if (cm != null) {
+            final ConnectivityManager.NetworkCallback cb = new ConnectivityManager.NetworkCallback() {
+                @Override
+                public void onAvailable(final Network network) {
+                    Log.i(TAG, "сеть сменилась — переподнимаю соединения");
+                    netChanged();
+                }
+
+                @Override
+                public void onLost(final Network network) {
+                    netChanged();
+                }
+            };
+            try {
+                cm.registerNetworkCallback(new NetworkRequest.Builder().build(), cb);
+                netCallback = cb;
+            } catch (final Exception e) {
+                Log.w(TAG, "слежение за сетью не завелось: " + e.getMessage());
+            }
+        }
+
+        final BroadcastReceiver rx = new BroadcastReceiver() {
+            @Override
+            public void onReceive(final Context ctx, final Intent intent) {
+                Log.i(TAG, "телефон проснулся (" + intent.getAction() + ") — переподнимаю соединения");
+                netChanged();
+            }
+        };
+        final IntentFilter f = new IntentFilter();
+        f.addAction(Intent.ACTION_SCREEN_ON);
+        f.addAction(Intent.ACTION_USER_PRESENT);
+        // Все три — защищённые системные извещения, поэтому приёмнику не нужен признак
+        // «кому видно»: с четырнадцатого Android он обязателен только тем, кто слушает и чужое.
+        f.addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED);
+        try {
+            context.registerReceiver(rx, f);
+            wakeReceiver = rx;
+        } catch (final Exception e) {
+            Log.w(TAG, "слежение за пробуждением не завелось: " + e.getMessage());
+        }
+    }
+
+    private void stopWatchingPath(final Context context) {
+        if (netCallback != null) {
+            try {
+                final ConnectivityManager cm = context.getSystemService(ConnectivityManager.class);
+                if (cm != null)
+                    cm.unregisterNetworkCallback(netCallback);
+            } catch (final Exception e) {
+                Log.w(TAG, "снятие слежения за сетью: " + e.getMessage());
+            }
+            netCallback = null;
+        }
+        if (wakeReceiver != null) {
+            try {
+                context.unregisterReceiver(wakeReceiver);
+            } catch (final Exception e) {
+                Log.w(TAG, "снятие слежения за пробуждением: " + e.getMessage());
+            }
+            wakeReceiver = null;
+        }
     }
 
     public interface AlwaysOnCallback {
@@ -413,6 +506,7 @@ public final class GoBackend implements Backend {
                 final Tunnel tunnel = owner.currentTunnel;
                 if (tunnel != null) {
                     final xsteer.Tunnel go = owner.goTunnel;
+                    owner.stopWatchingPath(owner.context);
                     if (go != null)
                         go.stop();
                     owner.goTunnel = null;
