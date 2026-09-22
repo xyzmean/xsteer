@@ -113,11 +113,10 @@ jobs:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
-      # enablement: true включает страницы у хранилища, если они ещё не включены. Без этого первая
-      # выкладка отказывает с «Not Found», и выглядит это как поломка описания сборки.
-      - uses: actions/configure-pages@v5
-        with:
-          enablement: true
+      # Страницы включаются у хранилища ОДИН РАЗ и руками — Settings → Pages → Source → GitHub
+      # Actions. Отсюда это сделать нельзя: `configure-pages` с `enablement: true` пробовали, и
+      # выкладка отказала словами «Create Pages site failed: Resource not accessible by
+      # integration» — заводить сайт правом хранилища, выданным заданию, GitHub не разрешает.
       - id: deploy
         uses: actions/deploy-pages@v4
       - name: Где страница

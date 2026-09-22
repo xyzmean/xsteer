@@ -65,10 +65,27 @@ jobs:
 
       # NDK ставится отдельно: в образе бегунка есть SDK, но NDK в нём бывает не той версии,
       # а gomobile без него не соберёт ни одной архитектуры.
+      #
+      # ДВЕ ЛОВУШКИ, НА КОТОРЫЕ ЭТОТ ШАГ УЖЕ НАСТУПИЛ.
+      #
+      # 1. `sdkmanager` НЕ ЛЕЖИТ В PATH. Он в $ANDROID_HOME/cmdline-tools/<версия>/bin, и первый
+      #    же прогон отказал с «sdkmanager: command not found».
+      # 2. `yes | sdkmanager …` отказывает ДАЖЕ ПРИ УДАЧНОЙ УСТАНОВКЕ. Когда sdkmanager
+      #    заканчивает, `yes` умирает от SIGPIPE с кодом 141, а pipefail берёт код любой упавшей
+      #    части конвейера — то есть его. Согласие поэтому подаётся строкой на ввод.
+      #
+      # И проверка в конце — не вежливость: без неё «поставил» означало бы «команда вернулась»,
+      # а сборка библиотеки падала бы дальше словами про несуществующий каталог.
       - name: Поставить NDK
         run: |
-          yes | sdkmanager --install "ndk;27.2.12479018" >/dev/null
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          ndk=27.2.12479018
+          if [ ! -d "$ANDROID_HOME/ndk/$ndk" ]; then
+            sdkmanager=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | tail -1 || true)
+            [ -n "$sdkmanager" ] || { echo "::error::в образе бегунка нет cmdline-tools"; exit 1; }
+            "$sdkmanager" --install "ndk;$ndk" <<< "y" > /dev/null
+          fi
+          [ -d "$ANDROID_HOME/ndk/$ndk" ] || { echo "::error::NDK $ndk не поставился"; exit 1; }
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ndk" >> "$GITHUB_ENV"
 
       - name: Собрать библиотеку Go в xsteer.aar
         run: android/build-aar.sh
