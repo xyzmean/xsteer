@@ -56,14 +56,26 @@ def main() -> None:
         (os.path.join(SITE, "icon-512.png"), 512),
     ]
     # Android берёт иконку под плотность экрана. Размеры — те, что ждёт система; без них
-    # запуск получает серый квадрат по умолчанию.
+    # запуск получает серый квадрат по умолчанию. Круглая — то же изображение: наше и так
+    # вписано в круг, и рисовать второй вариант незачем.
     for dens, size in (("mdpi", 48), ("hdpi", 72), ("xhdpi", 96),
                        ("xxhdpi", 144), ("xxxhdpi", 192)):
-        out.append((os.path.join(ANDROID, f"app/src/main/res/mipmap-{dens}/ic_launcher.png"), size))
+        out.append((os.path.join(ANDROID, f"ui/src/main/res/mipmap-{dens}/ic_launcher.png"), size))
+        out.append((os.path.join(ANDROID, f"ui/src/main/res/mipmap-{dens}/ic_launcher_round.png"), size))
     for path, size in out:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         draw(size).save(path, "PNG", optimize=True)
         print(f"{path}  {size}x{size}")
+
+    # Полоска для телевизора: система показывает её в списке приложений Android TV, и размер у
+    # неё свой — 320×180, не квадрат.
+    banner = Image.new("RGB", (320, 180), BG)
+    icon = draw(120)
+    banner.paste(icon, ((320 - 120) // 2, (180 - 120) // 2))
+    bpath = os.path.join(ANDROID, "ui/src/main/res/mipmap-xhdpi/banner.png")
+    os.makedirs(os.path.dirname(bpath), exist_ok=True)
+    banner.save(bpath, "PNG", optimize=True)
+    print(f"{bpath}  320x180")
 
 
 if __name__ == "__main__":

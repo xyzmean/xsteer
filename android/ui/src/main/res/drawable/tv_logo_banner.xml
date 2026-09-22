@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Полоска для телевизора: та же пара шевронов на тёмном. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="320dp"
+    android:height="180dp"
+    android:viewportWidth="320"
+    android:viewportHeight="180">
+    <path
+        android:pathData="M0,0 H320 V180 H0 Z"
+        android:fillColor="#0b1220" />
+    <path
+        android:pathData="M128,62 L152,90 L128,118"
+        android:strokeColor="#1b7f5f"
+        android:strokeWidth="14"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:fillColor="#00000000" />
+    <path
+        android:pathData="M160,62 L184,90 L160,118"
+        android:strokeColor="#34d399"
+        android:strokeWidth="14"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:fillColor="#00000000" />
+</vector>

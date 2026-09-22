@@ -1,17 +1,16 @@
 #!/bin/sh
-# Собирает Go-часть клиента в android/app/libs/xsteer.aar.
+# Собирает половину xsteer на Go в android/tunnel/libs/xsteer.aar.
 #
 # Запускается из каталога mobile: у моста свой модуль Go, потому что gomobile требует
 # golang.org/x/mobile в графе зависимостей, а тот требует Go 1.26 и тащит четыре чужие
 # зависимости. Подробнее — в mobile/go.mod.
 #
-# Нужны Android SDK и NDK. В отличие от iOS, никакого Mac здесь не требуется: собирается на
-# любой системе, где есть Go и NDK.
+# Нужны Go, Android SDK и NDK. Mac не нужен: собирается на любой системе.
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/.." && pwd)
-out="$here/app/libs"
+out="$here/tunnel/libs"
 
 command -v go >/dev/null 2>&1 || { echo "нет go" >&2; exit 1; }
 
@@ -33,6 +32,12 @@ if [ -z "$ANDROID_NDK_HOME" ] || [ ! -d "$ANDROID_NDK_HOME" ]; then
 fi
 export ANDROID_NDK_HOME
 
+# Версия для окна «о приложении»: номер прогона, если сборка идёт у бегунка, иначе короткий хеш.
+ver="${XSTEER_VERSION:-}"
+if [ -z "$ver" ]; then
+    ver=$(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo "из дерева")
+fi
+
 cd "$root/mobile"
 
 # gomobile и gobind зовутся через `go tool`, а не из GOPATH/bin: так их версия берётся из
@@ -43,14 +48,14 @@ go tool gomobile init
 mkdir -p "$out"
 rm -f "$out/xsteer.aar" "$out/xsteer-sources.jar"
 
-echo "== собираю xsteer.aar =="
+echo "== собираю xsteer.aar ($ver) =="
 # Четыре архитектуры: два ARM покрывают телефоны, два x86 — эмуляторы и редкие планшеты.
 # Минимальный уровень 24 тот же, что у приложения: ниже Go всё равно не поддерживает.
 go tool gomobile bind \
     -target=android/arm64,android/arm,android/amd64,android/386 \
     -androidapi 24 \
     -o "$out/xsteer.aar" \
-    -ldflags="-s -w" \
+    -ldflags "-s -w -X github.com/xyzmean/xsteer/mobile.version=$ver" \
     .
 
 echo "== готово =="

@@ -20,8 +20,15 @@
 /ios/Support/local.xcconfig
 
 # Сборка под Android: библиотека собирается из Go, остальное — Gradle.
-/android/app/libs/*.aar
-/android/app/libs/*.jar
+/android/tunnel/libs/*.aar
+/android/tunnel/libs/*.jar
 /android/build/
-/android/app/build/
+/android/ui/build/
+/android/tunnel/build/
 /android/.gradle/
+/android/local.properties
+
+# Образцы настроек в стендах приложения — НЕ секреты, а входные данные разбора. Без этого
+# исключения правило «*.conf» выше выбросило бы их из истории, и стенды разбора не собрались бы
+# ни у кого, кроме того, у кого они лежат на диске.
+!/android/tunnel/src/test/resources/*.conf

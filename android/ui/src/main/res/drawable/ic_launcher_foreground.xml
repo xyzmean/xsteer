@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Иконка приложения: два шеврона вправо — поток, который куда-то направили. Рисунок помещён в
+     середину полотна 108×108: внешние восемнадцать точек с каждой стороны система обрезает по
+     своей маске, и всё, что туда попадёт, на части телефонов исчезнет. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:pathData="M40,38 L54,54 L40,70"
+        android:strokeColor="#1b7f5f"
+        android:strokeWidth="8"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:fillColor="#00000000" />
+    <path
+        android:pathData="M58,38 L72,54 L58,70"
+        android:strokeColor="#34d399"
+        android:strokeWidth="8"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:fillColor="#00000000" />
+</vector>

@@ -1,23 +1,22 @@
-// Сборка приложения под Android.
-//
-// ПОЧЕМУ ЗДЕСЬ НАМНОГО ПРОЩЕ, ЧЕМ НА iOS. Android разрешает приложению поднять туннель без
-// особых прав: достаточно объявить службу VpnService, и система сама спросит у человека
-// разрешение при первом подключении. Ни платного участия, ни сертификатов, ни чужих профилей —
-// файл .apk собирается и ставится как есть.
+@file:Suppress("UnstableApiUsage")
+
 pluginManagement {
     repositories {
+        gradlePluginPortal()
         google()
         mavenCentral()
-        gradlePluginPortal()
     }
 }
 
 dependencyResolutionManagement {
+    repositoriesMode = RepositoriesMode.FAIL_ON_PROJECT_REPOS
     repositories {
         google()
         mavenCentral()
     }
 }
 
-rootProject.name = "xsteer"
-include(":app")
+rootProject.name = "xsteer-android"
+
+include(":tunnel")
+include(":ui")

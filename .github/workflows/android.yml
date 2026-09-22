@@ -88,6 +88,8 @@ jobs:
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ndk" >> "$GITHUB_ENV"
 
       - name: Собрать библиотеку Go в xsteer.aar
+        env:
+          XSTEER_VERSION: ${{ github.run_number }}-${{ github.sha }}
         run: android/build-aar.sh
 
       - name: Проверки моста
@@ -95,6 +97,10 @@ jobs:
         run: |
           go vet ./...
           go test ./...
+
+      - name: Стенды разбора настройки
+        working-directory: android
+        run: ./gradlew --no-daemon :tunnel:testDebugUnitTest
 
       - name: Ключ подписи
         env:
@@ -118,12 +124,11 @@ jobs:
           XSTEER_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           XSTEER_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          chmod +x gradlew 2>/dev/null || true
           # Журнал Gradle идёт в файл, а не в `| tail`: ошибки компилятора он печатает В НАЧАЛЕ, а
           # хвост занимают перечисления задач. Первый же отказ этой сборки был именно таким —
           # «Compilation error. See log for more details» и ни слова о том, где.
           log="$RUNNER_TEMP/gradle.log"
-          if ! gradle --no-daemon assembleRelease > "$log" 2>&1; then
+          if ! ./gradlew --no-daemon assembleRelease > "$log" 2>&1; then
             echo "== ошибки =="
             grep -E '^e: |error:|FAILED' "$log" | head -40
             echo "== хвост журнала =="
@@ -137,7 +142,7 @@ jobs:
       - name: Сложить собранное
         run: |
           mkdir -p android/build/out
-          apk=$(find android/app/build/outputs/apk/release -name '*.apk' | head -1)
+          apk=$(find android/ui/build/outputs/apk/release -name '*.apk' | head -1)
           [ -n "$apk" ] || { echo "::error::сборка не дала .apk"; exit 1; }
           cp "$apk" android/build/out/xsteer.apk
           # Отметка о подписи едет рядом с файлом: страница обязана сказать человеку, встанет ли
@@ -161,6 +166,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: xsteer-aar
-          path: android/app/libs/xsteer.aar
+          path: android/tunnel/libs/xsteer.aar
           if-no-files-found: ignore
           retention-days: 14
