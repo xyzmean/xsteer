@@ -77,6 +77,83 @@ function checkNft() {
 
 function initialCheck() { isRoot; checkSystemd; checkTun; checkNft; }
 
+# ---- QR-код ------------------------------------------------------------------
+
+# Ставим qrencode ТОЛЬКО по согласию и только когда QR действительно понадобился.
+#
+# Без него всё работает: конфигурация лежит файлом, ссылка — рядом. QR нужен ровно одному
+# человеку — тому, кто ставит пир на телефон, — и требовать чужой пакет со всех остальных ради
+# этого случая незачем. Отказ ставить не считается ошибкой: тогда вместо картинки печатается
+# ссылка, и её можно перенести руками.
+function haveQrencode() { command -v qrencode >/dev/null 2>&1; }
+
+function offerQrencode() {
+	haveQrencode && return 0
+	echo -e "${ORANGE}нет qrencode${NC} — картинку рисовать нечем."
+	ask QRINST "Поставить его? [y/n]: " y
+	[[ ${QRINST} =~ ^[yY]$ ]] || return 1
+	if command -v apt-get >/dev/null 2>&1; then apt-get update -qq && apt-get install -y -qq qrencode
+	elif command -v dnf >/dev/null 2>&1; then dnf install -y -q qrencode
+	elif command -v yum >/dev/null 2>&1; then yum install -y -q qrencode
+	elif command -v pacman >/dev/null 2>&1; then pacman -S --noconfirm --quiet qrencode
+	elif command -v apk >/dev/null 2>&1; then apk add --quiet libqrencode-tools || apk add --quiet libqrencode
+	elif command -v zypper >/dev/null 2>&1; then zypper --quiet install -y qrencode
+	else echo "неизвестный пакетный менеджер — поставьте qrencode сами"; return 1
+	fi
+	haveQrencode || { echo -e "${RED}qrencode не поставился${NC}"; return 1; }
+	return 0
+}
+
+# Печатает QR прямо в терминал. Аргумент — файл, а не строка: в ссылке приватный ключ, а аргументы
+# команды видны в списке процессов всякому на машине.
+#
+# Кодируется ССЫЛКА, а не файл конфигурации: в QR помещается и то и другое, но картинка со ссылкой
+# вчетверо реже, то есть читается с экрана телефоном, а не только камерой в упор.
+function showQRFile() { # showQRFile <файл> <имя пира>
+	local f="$1" name="$2"
+	[ -s "$f" ] || { echo -e "${RED}нет файла $f${NC}"; return 1; }
+	offerQrencode || { echo "ссылка лежит в $f — перенесите её руками"; return 1; }
+	echo ""
+	printf "${GREEN}QR пира %s${NC} — наведите камеру из приложения xsteer:\n\n" "$name"
+	# Перевод строки из файла в код НЕ попадает: сканеры отдают содержимое как есть, и ссылка с
+	# хвостовым переводом строки у чужого приложения разбирается как неверная.
+	tr -d '\r\n' <"$f" | qrencode -t ansiutf8 -l L
+	printf "${RED}в этом коде приватный ключ — не показывайте его никому и не снимайте на камеру чужого телефона${NC}\n"
+	return 0
+}
+
+# QR по имени пира из меню. Ссылку выпускает хаб при добавлении пира и кладёт рядом с
+# конфигурацией; заново её не собрать — приватного ключа пира у хаба НЕТ, есть только публичный.
+# Поэтому пропавший файл означает «выпустите пира заново», и сказать это надо прямо.
+function peerQR() {
+	local n; n="$(grep -c "^### peer " "$CONF")"
+	[ "$n" = 0 ] && { echo "пиров нет"; return 0; }
+	echo "какому пиру показать QR?"
+	grep "^### peer " "$CONF" | cut -d' ' -f3 | nl -s ') '
+	local num=""
+	until [[ ${num} =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le "$n" ]; do ask num "Номер [1-$n]: "; done
+	local name; name="$(grep "^### peer " "$CONF" | cut -d' ' -f3 | sed -n "${num}p")"
+
+	local link="/root/xsteer-${name}.link"
+	if [ -s "$link" ]; then showQRFile "$link" "$name"; return $?; fi
+
+	local out="/root/xsteer-${name}.conf"
+	if [ -s "$out" ]; then
+		# Ссылки нет, а файл есть: собираем ссылку из файла тем же клиентом, что её и выпускает.
+		if ( umask 077; "$BIN" link "$out" --name "$name" >"$link" 2>/dev/null ); then
+			showQRFile "$link" "$name"; return $?
+		fi
+		rm -f "$link"
+		echo -e "${ORANGE}ссылка из $out не собралась${NC} — QR не покажу, конфигурация в файле."
+		return 1
+	fi
+
+	echo -e "${RED}ни ссылки, ни конфигурации пира ${name} на этом сервере нет${NC}"
+	echo "Приватный ключ пира хаб не хранит — восстановить их нельзя. Выпустите пира заново:"
+	echo "уберите его в меню и добавьте с тем же именем."
+	return 1
+}
+
 # ---- бинарник ----------------------------------------------------------------
 
 # Берём готовый файл из релиза и ПРОВЕРЯЕМ сумму по SHA256SUMS того же релиза.
@@ -521,9 +598,13 @@ EOF
 	if [ -n "$link" ]; then
 		printf "ссылка (тот же доступ одной строкой): %s\n" "$link"
 		echo "  показать:  cat $link"
-		echo "  QR-код:    qrencode -t ansiutf8 < $link"
 		echo "  поднять:   xsteer up - < $link"
 		printf "${RED}в ссылке приватный ключ — открытым каналом её пересылать нельзя${NC}\n"
+		echo ""
+		# QR предлагается, а не печатается сразу: пир на сервере или на десктопе заберёт файл, и
+		# картинка ему не нужна вовсе, а на экране она занимает тридцать строк. Спросить дешевле.
+		ask WANTQR "Показать QR для телефона? [y/n]: " y
+		[[ ${WANTQR} =~ ^[yY]$ ]] && showQRFile "$link" "$PEER_NAME"
 		echo ""
 	fi
 	echo "MTU задавать НЕ НУЖНО: клиент согласует его сам и проверит путь пробами."
@@ -623,19 +704,21 @@ function manageMenu() {
 	echo "Что делаем?"
 	echo "   1) Добавить пира"
 	echo "   2) Показать пиров"
-	echo "   3) Убрать пира"
-	echo "   4) Состояние"
-	echo "   5) Снять хаб"
-	echo "   6) Выход"
+	echo "   3) Показать QR пира — для приложения на телефоне"
+	echo "   4) Убрать пира"
+	echo "   5) Состояние"
+	echo "   6) Снять хаб"
+	echo "   7) Выход"
 	local opt=""
-	until [[ ${opt} =~ ^[1-6]$ ]]; do ask opt "Выбор [1-6]: "; done
+	until [[ ${opt} =~ ^[1-7]$ ]]; do ask opt "Выбор [1-7]: "; done
 	case "${opt}" in
 	1) newPeer ;;
 	2) listPeers ;;
-	3) revokePeer ;;
-	4) showStatus ;;
-	5) uninstallHub ;;
-	6) exit 0 ;;
+	3) peerQR ;;
+	4) revokePeer ;;
+	5) showStatus ;;
+	6) uninstallHub ;;
+	7) exit 0 ;;
 	esac
 }
 
