@@ -21,6 +21,13 @@ jobs:
           go-version: '1.26'
           check-latest: true
 
+      # Клиент под телефон едет ТЕМ ЖЕ релизом, что и десктопные: у человека один адрес, по
+      # которому лежит всё, и версия у них одна. Java и NDK нужны только для него.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
       # Wintun берётся с сайта проекта и проверяется по контрольной сумме.
       #
       # Класть подписанную чужую DLL в свой репозиторий — значит обещать, что она та самая, ничем
@@ -73,7 +80,69 @@ jobs:
             rm -f xsteer
           done
 
+          # Android — в тот же dist, чтобы файл попал и в релиз, и в SHA256SUMS. Собирается
+          # ниже отдельными шагами: gomobile и Gradle не укладываются в этот же блок.
+          echo "== собранное для десктопов =="
+          ls -la dist
+
+      # ---- клиент под телефон --------------------------------------------------
+      #
+      # ДВЕ ЛОВУШКИ, на которые эта сборка уже наступала (см. android.yml). `sdkmanager` не
+      # лежит в PATH у бегунка, а `yes | sdkmanager` под pipefail отказывает даже при удачной
+      # установке: `yes` умирает от SIGPIPE с кодом 141.
+      - name: Поставить NDK
+        run: |
+          set -eu
+          ndk=27.2.12479018
+          if [ ! -d "$ANDROID_HOME/ndk/$ndk" ]; then
+            sdkmanager=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | tail -1 || true)
+            [ -n "$sdkmanager" ] || { echo "::error::в образе бегунка нет cmdline-tools"; exit 1; }
+            "$sdkmanager" --install "ndk;$ndk" <<< "y" > /dev/null
+          fi
+          [ -d "$ANDROID_HOME/ndk/$ndk" ] || { echo "::error::NDK $ndk не поставился"; exit 1; }
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ndk" >> "$GITHUB_ENV"
+
+      - name: Ключ подписи
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -eu
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::warning::ключа проекта нет — .apk подписан отладочным, поверх прежней сборки он не встанет"
+            exit 0
+          fi
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/xsteer.jks"
+          chmod 600 "$RUNNER_TEMP/xsteer.jks"
+          echo "XSTEER_KEYSTORE=$RUNNER_TEMP/xsteer.jks" >> "$GITHUB_ENV"
+
+      - name: Собрать .apk
+        env:
+          XSTEER_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          XSTEER_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          XSTEER_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -eu
+          # Номер сборки — номер прогона: телефон ставит поверх уже стоящего только то, у чего
+          # номер ВЫШЕ, а имя версии берётся то же, что у всего релиза.
+          export BUILD_NUMBER="${{ github.run_number }}"
+          export XSTEER_VERSION="$VER"
+          android/build-aar.sh
+          cd android
+          log="$RUNNER_TEMP/gradle.log"
+          if ! ./gradlew --no-daemon assembleRelease > "$log" 2>&1; then
+            echo "== ошибки =="; grep -E '^e: |error:|FAILED' "$log" | head -40
+            echo "== хвост журнала =="; tail -40 "$log"
+            exit 1
+          fi
+          apk=$(find ui/build/outputs/apk/release -name '*.apk' | head -1)
+          [ -n "$apk" ] || { echo "::error::сборка не дала .apk"; exit 1; }
+          cp "$apk" "../dist/xsteer-android-$VER.apk"
+
+      - name: Суммы
+        run: |
+          set -eu
           (cd dist && sha256sum * > SHA256SUMS)
+          ls -la dist
 
       - name: Создать релиз
         env:
@@ -84,4 +153,7 @@ jobs:
             --notes "Релиз $VER.
 
           Архивы для Windows содержат xsteer.exe и wintun.dll — распакуйте оба в одну папку и
-          запускайте от администратора. Суммы файлов — в SHA256SUMS."
+          запускайте от администратора. Суммы файлов — в SHA256SUMS.
+
+          Для телефона — xsteer-android-$VER.apk. Страница установки со ссылкой и QR:
+          https://xyzmean.github.io/xsteer/"
