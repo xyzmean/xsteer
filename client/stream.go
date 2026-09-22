@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/xyzmean/xsteer/link"
@@ -35,6 +36,51 @@ import (
 // считает канал живым, пока кадры от хаба не старше пяти, так что три пропущенные подряд пробы —
 // уже не случайность.
 const streamProbeMS = 2000
+
+// streamStallGapMS — с какого перерыва между проверками сторожа мы считаем, что не работали МЫ, а
+// не путь. То же число и тот же смысл, что у link.stallGapMS и XSC_STALL_GAP_MS в C: исправный
+// сторож проверяет раз в streamWatchMS, и перерыв в секунду означает, что процессор нам не давали
+// (на телефоне — дремота, в которой процесс заморожен целиком).
+const streamStallGapMS = 1000
+
+// streamWatchMS — как часто сторож потока смотрит на тишину. Тот же шаг, что у ожидания устройства
+// в streamOut: точнее двухсот миллисекунд порог в восемь секунд знать незачем, а лишние
+// пробуждения на телефоне стоят батареи.
+const streamWatchMS = 200
+
+// streamLive — времена последней отправки и последнего приёма ОДНОЙ сессии потока, в миллисекундах.
+// Пишут их горутины отправки и приёма, читает сторож.
+//
+// Отдельно от c.stats.lastRx, и это не дублирование: тот общий на все соединения клиента, и живое
+// соседнее соединение скрывало бы мёртвое.
+type streamLive struct {
+	tx, rx atomic.Int64
+}
+
+// streamJudge — решение «путь мёртв» для потока: мы отправили ПОСЛЕ последнего приёма, и тишина
+// с тех пор дольше link.DeadMS.
+//
+// Форма та же, что у link.Conn.tick и xs_conn_tick, и расхождение в ней означало бы, что один и тот
+// же пир на одном транспорте живёт, а на другом переподнимается. Из тишины вычитается не наша
+// тишина двух видов: нас не исполняли (перерыв между проверками дольше streamStallGapMS) и нам
+// было нечего сказать (tx <= rx). Запас обнуляется на каждом новом приёме.
+type streamJudge struct {
+	tickAt, stall, rxSeen int64
+}
+
+func (j *streamJudge) dead(now, tx, rx int64) bool {
+	if rx != j.rxSeen {
+		j.rxSeen = rx
+		j.stall = 0
+	}
+	if j.tickAt != 0 {
+		if gap := now - j.tickAt; gap > streamStallGapMS || tx <= rx {
+			j.stall += gap
+		}
+	}
+	j.tickAt = now
+	return tx > rx && now-rx-j.stall > link.DeadMS
+}
 
 // streamSession поднимает соединение в режиме потока и работает до его обрыва.
 func (c *Client) streamSession(ctx context.Context, id int, dev tun.Device) error {
@@ -79,6 +125,10 @@ func (c *Client) streamSession(ctx context.Context, id int, dev tun.Device) erro
 	}
 	_ = nc.SetDeadline(time.Time{})
 	tx, rx := hres.tx, hres.rx
+	// Отсчёт тишины — от рукопожатия: ответ хаба на него и есть последний приём. Так же в C
+	// (stream_rx = handshake_at).
+	live := &streamLive{}
+	live.rx.Store(nowMS())
 	defer func() { tx.Close(); rx.Close() }()
 
 	// Согласование MTU: первая ступень та же — минимум пределов сторон. Второй (проб пути) в
@@ -107,7 +157,9 @@ func (c *Client) streamSession(ctx context.Context, id int, dev tun.Device) erro
 	{
 		row := make([]byte, wire.HdrRoom+8+wire.Tag)
 		if n := wire.MTUBuild(row[wire.HdrRoom:wire.HdrRoom+8], mtu); n > 0 {
-			_ = c.streamSend(st, tx, row, n)
+			if c.streamSend(st, tx, row, n) == nil {
+				live.tx.Store(nowMS())
+			}
 		}
 	}
 
@@ -119,9 +171,9 @@ func (c *Client) streamSession(ctx context.Context, id int, dev tun.Device) erro
 	}()
 
 	done := make(chan error, 3)
-	go func() { done <- c.streamIn(sctx, id, st, rx, dev) }()
-	go func() { done <- c.streamOut(sctx, id, st, tx, dev, mtu) }()
-	go func() { done <- c.streamWatch(sctx, netCh) }()
+	go func() { done <- c.streamIn(sctx, id, st, rx, dev, live) }()
+	go func() { done <- c.streamOut(sctx, id, st, tx, dev, mtu, live) }()
+	go func() { done <- c.streamWatch(sctx, netCh, live) }()
 	err = <-done
 	stop()
 	<-done
@@ -143,19 +195,36 @@ func (c *Client) streamSession(ctx context.Context, id int, dev tun.Device) erro
 // закрывает сокет — это единственное, что разблокирует ReadRecord и застрявшую запись. Причина
 // уходит в done ПЕРВОЙ (раньше ошибок чтения на закрытом сокете), поэтому в журнал попадает она,
 // а не «use of closed network connection».
-func (c *Client) streamWatch(ctx context.Context, netCh <-chan struct{}) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-netCh:
-		return errors.New("сеть изменилась — поднимаю соединение заново")
+//
+// МЁРТВЫЙ ХАБ (I-134). Сам поток TCP о смерти хаба узнаёт через минуты: пока ядро не исчерпало
+// повторы, соединение для него живо. У реализации на C правило «шлём, а в ответ тишина дольше
+// порога» стояло в цикле потока с самого начала, у пира на Go — только в поддельном TCP
+// (link.Conn.Tick). Решение — streamJudge, порог тот же link.DeadMS. Проверка живёт ЗДЕСЬ, а не в
+// streamOut, потому что к мёртвому хабу запись застревает: буфер сокета полон, WriteRecord
+// блокирует, и цикл отправки не дошёл бы до проверки никогда.
+func (c *Client) streamWatch(ctx context.Context, netCh <-chan struct{}, live *streamLive) error {
+	t := time.NewTicker(streamWatchMS * time.Millisecond)
+	defer t.Stop()
+	var j streamJudge
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-netCh:
+			return errors.New("сеть изменилась — поднимаю соединение заново")
+		case <-t.C:
+		}
+		if j.dead(nowMS(), live.tx.Load(), live.rx.Load()) {
+			return fmt.Errorf("поток молчит %d мс при активной отправке — поднимаю заново",
+				link.DeadMS)
+		}
 	}
 }
 
 // streamOut: TUN → поток. Пачка собирается так же, как в поддельном TCP, но резать запись на
 // сегменты не нужно — это работа ядра.
 func (c *Client) streamOut(ctx context.Context, id int, st *wire.Stream, tx *noise.Keys,
-	dev tun.Device, mtu int) error {
+	dev tun.Device, mtu int, live *streamLive) error {
 	row := make([]byte, wire.HdrRoom+wire.MaxRecord+wire.Tag)
 	slab := make([]byte, wire.BatchFramesMax*wire.MTUDefault)
 	frames := make([][]byte, 0, wire.BatchFramesMax)
@@ -163,28 +232,35 @@ func (c *Client) streamOut(ctx context.Context, id int, st *wire.Stream, tx *noi
 	last := nowMS()
 	lastProbe := int64(0)
 	for ctx.Err() == nil {
+		// Проба живости. В потоке согласовывать MTU нечем — сегментацией распоряжается ядро, — но
+		// проба нужна не ради размера: хаб отвечает на неё эхом, и это ЕДИНСТВЕННЫЙ признак того,
+		// что канал несёт трафик в обратную сторону. Без него полный туннель не отличил бы
+		// работающий хаб от хаба, который принимает всё и не отвечает ничем, — а разница между
+		// ними для человека это разница между «VPN» и «нет интернета».
+		//
+		// Кадр крохотный (три байта) и уходит раз в две секунды: столько же стоит один keepalive,
+		// а даёт сторожу маршрута непрерывную картину.
+		//
+		// ПО ВРЕМЕНИ, А НЕ ПО ПРОСТОЮ УСТРОЙСТВА (I-134). Прежде проба уходила только из ветки
+		// «устройство молчит», и на односторонней отдаче — закачка наверх, устройство читаемо
+		// всегда — проб не было вовсе: хаб не присылал эха, сторож маршрута слеп, а правило
+		// «тишина при активной отправке» (streamWatch) оборвало бы живую сессию. В C она уходит
+		// из тела цикла безусловно — теперь и здесь.
+		if now := nowMS(); now-lastProbe >= streamProbeMS {
+			if n, ok := wire.ProbeBuild(row[wire.HdrRoom:wire.HdrRoom+wire.ProbeMin], wire.ProbeMin); ok {
+				if err := c.streamSend(st, tx, row, n); err != nil {
+					return err
+				}
+				last = now
+				live.tx.Store(now)
+			}
+			lastProbe = now
+		}
 		ok, err := dev.WaitRead(200 * time.Millisecond)
 		if err != nil {
 			return err
 		}
 		if !ok {
-			// Проба живости. В потоке согласовывать MTU нечем — сегментацией распоряжается ядро,
-			// — но проба нужна не ради размера: хаб отвечает на неё эхом, и это ЕДИНСТВЕННЫЙ
-			// признак того, что канал несёт трафик в обратную сторону. Без него полный туннель
-			// не отличил бы работающий хаб от хаба, который принимает всё и не отвечает ничем, —
-			// а разница между ними для человека это разница между «VPN» и «нет интернета».
-			//
-			// Кадр крохотный (три байта) и уходит раз в две секунды: столько же стоит один
-			// keepalive, а даёт сторожу маршрута непрерывную картину.
-			if now := nowMS(); now-lastProbe >= streamProbeMS {
-				if n, ok := wire.ProbeBuild(row[wire.HdrRoom:wire.HdrRoom+wire.ProbeMin], wire.ProbeMin); ok {
-					if err := c.streamSend(st, tx, row, n); err != nil {
-						return err
-					}
-					last = now
-				}
-				lastProbe = now
-			}
 			// Keepalive: пустая запись с разбросом интервала. Настоящий TCP держит соединение
 			// своими средствами лишь через часы, а отображение NAT живёт минуты.
 			if keep > 0 && nowMS()-last >= keep {
@@ -192,6 +268,7 @@ func (c *Client) streamOut(ctx context.Context, id int, st *wire.Stream, tx *noi
 					return err
 				}
 				last = nowMS()
+				live.tx.Store(last)
 			}
 			continue
 		}
@@ -242,6 +319,7 @@ func (c *Client) streamOut(ctx context.Context, id int, st *wire.Stream, tx *noi
 			return err
 		}
 		last = nowMS()
+		live.tx.Store(last)
 		c.stats.txPkts.Add(uint64(len(frames)))
 		for _, f := range frames {
 			c.stats.txBytes.Add(uint64(len(f)))
@@ -272,7 +350,7 @@ func (c *Client) streamSend(st *wire.Stream, tx *noise.Keys, row []byte, n int) 
 
 // streamIn: поток → TUN.
 func (c *Client) streamIn(ctx context.Context, id int, st *wire.Stream, rx *noise.Keys,
-	dev tun.Device) error {
+	dev tun.Device, live *streamLive) error {
 	s := &sess{} // нужен onFrame: в потоке из него используется только запись в устройство
 	for ctx.Err() == nil {
 		body, hdr, rel, err := st.ReadRecord()
@@ -285,6 +363,8 @@ func (c *Client) streamIn(ctx context.Context, id int, st *wire.Stream, rx *nois
 			// известны только из длины, которой мы уже не верим.
 			return fmt.Errorf("запись не расшифровалась: %w", err)
 		}
+		// Любая расшифрованная запись — ответ хаба, включая keepalive и эхо на пробу.
+		live.rx.Store(nowMS())
 		if len(pt) > 0 && pt[0] == wire.CtlBatch {
 			if !wire.BatchIter(pt, func(f []byte) { c.onFrame(s, id, f, dev) }) {
 				c.stats.dropped.Add(1)
