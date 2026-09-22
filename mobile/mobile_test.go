@@ -256,3 +256,41 @@ func TestKeysType(t *testing.T) {
 		t.Fatal("пустая пара не пуста")
 	}
 }
+
+// Длина префикса и маска описывают одно и то же и обязаны сходиться: их читают разные системы,
+// и расхождение означало бы туннель, у которого на одной платформе своя подсеть, а на другой
+// другая.
+func TestPrefixLenИМаскаСходятся(t *testing.T) {
+	cases := []struct {
+		plen int
+		mask string
+	}{{24, "255.255.255.0"}, {32, "255.255.255.255"}, {16, "255.255.0.0"}, {8, "255.0.0.0"}}
+	for _, c := range cases {
+		tn := NewTunnel()
+		conf := strings.Replace(goodConf, "Address = 10.77.0.2/24",
+			"Address = 10.77.0.2/"+itoa(c.plen), 1)
+		if err := tn.Configure(conf); err != nil {
+			t.Fatalf("/%d: %v", c.plen, err)
+		}
+		if got := tn.PrefixLen(); got != c.plen {
+			t.Fatalf("/%d: длина префикса %d", c.plen, got)
+		}
+		if got := tn.Netmask(); got != c.mask {
+			t.Fatalf("/%d: маска %q, ждали %q", c.plen, got, c.mask)
+		}
+	}
+}
+
+func itoa(v int) string {
+	if v == 0 {
+		return "0"
+	}
+	var b [8]byte
+	i := len(b)
+	for v > 0 {
+		i--
+		b[i] = byte('0' + v%10)
+		v /= 10
+	}
+	return string(b[i:])
+}

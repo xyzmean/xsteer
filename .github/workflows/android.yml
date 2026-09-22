@@ -1,0 +1,93 @@
+# Сборка приложения под Android.
+#
+# ЧЕМ ЭТО ОТЛИЧАЕТСЯ ОТ iOS. Ничем не отличается только то, что собирает бегунок. Всё остальное
+# проще: Android разрешает приложению поднять туннель без особых прав — достаточно объявить
+# службу VpnService, и система сама спросит согласие у человека при первом подключении. Ни
+# платного участия, ни сертификатов, ни чужих профилей. Готовый .apk ставится как есть.
+#
+# Поэтому здесь нет ни выбора «куда девать собранное», ни ключей доступа, ни страницы установки:
+# файл просто лежит в артефактах каждого прогона.
+name: Android
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'android/**'
+      - 'mobile/**'
+      - 'client/**'
+      - 'conf/**'
+      - 'wire/**'
+      - 'noise/**'
+      - 'link/**'
+      - 'tun/**'
+      - 'chello/**'
+      - '.github/workflows/android.yml'
+  pull_request:
+    paths:
+      - 'android/**'
+      - 'mobile/**'
+      - 'tun/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash -eo pipefail {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # NDK ставится отдельно: в образе бегунка есть SDK, но NDK в нём бывает не той версии,
+      # а gomobile без него не соберёт ни одной архитектуры.
+      - name: Поставить NDK
+        run: |
+          yes | sdkmanager --install "ndk;27.2.12479018" >/dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Собрать библиотеку Go в xsteer.aar
+        run: android/build-aar.sh
+
+      - name: Проверки моста
+        working-directory: mobile
+        run: |
+          go vet ./...
+          go test ./...
+
+      - name: Собрать приложение
+        working-directory: android
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          chmod +x gradlew 2>/dev/null || true
+          gradle --no-daemon assembleRelease | tail -30
+
+      - name: Сохранить .apk
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xsteer-android
+          path: |
+            android/app/build/outputs/apk/release/*.apk
+            android/app/libs/xsteer.aar
+          if-no-files-found: ignore
+          retention-days: 30

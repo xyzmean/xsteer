@@ -18,3 +18,10 @@
 /ios/build/
 /ios/Xsteer.xcodeproj/
 /ios/Support/local.xcconfig
+
+# Сборка под Android: библиотека собирается из Go, остальное — Gradle.
+/android/app/libs/*.aar
+/android/app/libs/*.jar
+/android/build/
+/android/app/build/
+/android/.gradle/

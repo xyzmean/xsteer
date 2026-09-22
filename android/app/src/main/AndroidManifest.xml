@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Со тринадцатого Android уведомление показывается только с разрешения. Без него служба
+         работает, но человек не видит ни состояния, ни кнопки «отключить». -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- С четырнадцатого у службы на переднем плане обязан быть объявлен вид. Для туннеля
+         своего вида нет, и специальный — единственный подходящий: он и заведён для случаев,
+         которых остальные виды не описывают. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Xsteer"
+        tools:targetApi="35">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Разрешение BIND_VPN_SERVICE выдаёт система, а не человек: оно означает «только
+             система вправе привязаться к этой службе». Без него Android туннель не поднимет. -->
+        <service
+            android:name=".XsteerVpnService"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:foregroundServiceType="specialUse">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Туннель VPN: служба обязана жить, пока туннель поднят" />
+        </service>
+    </application>
+</manifest>

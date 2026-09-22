@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""Рисует иконки: одну для приложения и две для страницы установки.
+"""Рисует иконки для обоих приложений: под iOS и под Android.
 
 ЗАЧЕМ СКРИПТОМ, А НЕ ФАЙЛАМИ ИЗ РЕДАКТОРА. Иконка тут не художество, а необходимость: без
 файла 1024x1024 Xcode не соберёт приложение с предупреждением, а без двух картинок в manifest
 телефон покажет при установке пустой квадрат. Скриптом — потому что понятно, что нарисовано, и
 можно поправить цвет, не открывая ничего.
 
-Запуск: python3 ios/Support/make-icons.py (нужен Pillow).
+Запуск: python3 contrib/make-icons.py (нужен Pillow).
 """
 import os
 from PIL import Image, ImageDraw
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-IOS = os.path.dirname(HERE)
+ROOT = os.path.dirname(HERE)
+IOS = os.path.join(ROOT, "ios")
+ANDROID = os.path.join(ROOT, "android")
 
 BG = (11, 18, 32)        # почти чёрный синий
 FG = (52, 211, 153)      # тот же зелёный, которым интерфейс показывает «подключено»
@@ -51,6 +53,11 @@ def main() -> None:
         (os.path.join(IOS, "Support/install-page/icon-57.png"), 57),
         (os.path.join(IOS, "Support/install-page/icon-512.png"), 512),
     ]
+    # Android берёт иконку под плотность экрана. Размеры — те, что ждёт система; без них
+    # запуск получает серый квадрат по умолчанию.
+    for dens, size in (("mdpi", 48), ("hdpi", 72), ("xhdpi", 96),
+                       ("xxhdpi", 144), ("xxxhdpi", 192)):
+        out.append((os.path.join(ANDROID, f"app/src/main/res/mipmap-{dens}/ic_launcher.png"), size))
     for path, size in out:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         draw(size).save(path, "PNG", optimize=True)

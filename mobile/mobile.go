@@ -45,7 +45,13 @@ type Tunnel struct {
 	streamPort int
 	logger     Logger
 
-	dev    *Device
+	// dev — устройство, каким его видит клиент: закрыть его надо в любом случае.
+	// pkt — то же устройство, но когда оно наше, с очередью и вызовами. На Android его нет:
+	// там дескриптор, и пакеты в него не кладут, а пишут. Два поля, а не утверждение типа,
+	// потому что «если это вдруг наше» — ровно тот вопрос, который лучше задать один раз при
+	// подъёме, чем на каждый пакет.
+	dev    tun.Device
+	pkt    *Device
 	cli    *client.Client
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -136,6 +142,20 @@ func (t *Tunnel) Netmask() string {
 	return ip4(^uint32(0) << (32 - uint(t.cfg.AddrPlen)))
 }
 
+// PrefixLen — длина префикса своего адреса.
+//
+// Рядом с Netmask, а не вместо неё, потому что двум системам нужно разное: настройкам iOS —
+// маска в виде 255.255.255.0, построителю туннеля на Android — число. Переводить одно в другое
+// на стороне платформы значило бы написать этот перевод дважды, на двух языках.
+func (t *Tunnel) PrefixLen() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.cfg == nil {
+		return 0
+	}
+	return t.cfg.AddrPlen
+}
+
 // MTU — что ставить туннелю в настройках системы. Никогда не больше MaxMTU; почему — см. MaxMTU.
 func (t *Tunnel) MTU() int {
 	t.mu.Lock()
@@ -202,6 +222,38 @@ func (t *Tunnel) HubPort() int {
 // devName попадает только в журнал и в снимок состояния; осмысленно передать сюда имя, которое
 // система дала своему интерфейсу.
 func (t *Tunnel) Start(sink PacketSink, devName string) error {
+	if sink == nil {
+		return fmt.Errorf("нет получателя пакетов")
+	}
+	return t.start(func(mtu int) (tun.Device, error) {
+		d := NewDevice(devName, sink, mtu)
+		t.pkt = d
+		return d, nil
+	})
+}
+
+// StartFD поднимает туннель на ГОТОВОМ дескрипторе, который открыла система.
+//
+// Так работает Android: приложение просит VpnService, обратно получает открытый дескриптор и
+// отдаёт его сюда. Это дешевле пути с вызовами — пакеты не пересекают границу языков вовсе, их
+// читает и пишет тот же код, что на обычном Linux.
+//
+// Дескриптор переходит НАМ, и Stop его закроет. Поэтому отдавать надо detachFd(), а не getFd():
+// иначе дескриптор закроют дважды, и второй раз попадёт в чужой, переиспользованный номер — а
+// проявится это не здесь и не сразу.
+func (t *Tunnel) StartFD(fd int, devName string) error {
+	if fd < 0 {
+		return fmt.Errorf("дескриптор не задан")
+	}
+	return t.start(func(mtu int) (tun.Device, error) {
+		return newFDDevice(fd, devName, mtu)
+	})
+}
+
+// start — общая часть обоих входов. Два способа заполучить устройство отличаются только им
+// самим; всё остальное — настройки клиента, режим потока, слежение за сетью — обязано у них
+// совпадать, и совпадает оно потому, что написано здесь один раз.
+func (t *Tunnel) start(makeDev func(mtu int) (tun.Device, error)) error {
 	t.mu.Lock()
 	if t.cancel != nil {
 		t.mu.Unlock()
@@ -211,15 +263,15 @@ func (t *Tunnel) Start(sink PacketSink, devName string) error {
 		t.mu.Unlock()
 		return fmt.Errorf("настройка не задана: сначала Configure")
 	}
-	if sink == nil {
-		t.mu.Unlock()
-		return fmt.Errorf("нет получателя пакетов")
-	}
 	mtu := MaxMTU
 	if t.cfg.MTU > 0 && t.cfg.MTU < mtu {
 		mtu = t.cfg.MTU
 	}
-	dev := NewDevice(devName, sink, mtu)
+	dev, err := makeDev(mtu)
+	if err != nil {
+		t.mu.Unlock()
+		return err
+	}
 	lg := t.logger
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -283,7 +335,7 @@ func (t *Tunnel) Start(sink PacketSink, devName string) error {
 func (t *Tunnel) Stop() {
 	t.mu.Lock()
 	cancel, done, dev := t.cancel, t.done, t.dev
-	t.cancel, t.done, t.dev = nil, nil, nil
+	t.cancel, t.done, t.dev, t.pkt = nil, nil, nil, nil
 	t.mu.Unlock()
 	if cancel == nil {
 		return
@@ -300,7 +352,7 @@ func (t *Tunnel) Stop() {
 // Inject кладёт пакет от системы в туннель. Зовётся на каждый пакет из readPackets.
 func (t *Tunnel) Inject(p []byte) {
 	t.mu.Lock()
-	dev := t.dev
+	dev := t.pkt
 	t.mu.Unlock()
 	if dev != nil {
 		dev.Inject(p)
@@ -325,7 +377,7 @@ func (t *Tunnel) NetChanged() {
 // и сколько выброшено как слишком крупные. Второе — единственный признак расхождения MTU.
 func (t *Tunnel) StateJSON() string {
 	t.mu.Lock()
-	cli, dev := t.cli, t.dev
+	cli, dev := t.cli, t.pkt
 	t.mu.Unlock()
 	out := map[string]any{"schema": 1, "up": false}
 	if cli != nil {
