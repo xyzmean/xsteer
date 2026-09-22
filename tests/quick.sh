@@ -209,6 +209,14 @@ if [ -f "$LINKDIR/qa.link" ] && [ "$(stat -c %a "$LINKDIR/qa.link" 2>/dev/null)"
 else
 	bad "положенная ссылка закрыта от остальных (права $(stat -c %a "$LINKDIR/qa.link" 2>/dev/null || echo нет))"
 fi
+# Конфигурация С КРЮЧКАМИ — законная для обвязки и отвергаемая клиентом. Проверять присланное
+# клиентом «как есть» значило бы отказывать ровно тем файлам, ради которых обвязка и существует.
+if Qlink add qh < "$WORK/qt.conf" >/dev/null 2>&1 && [ -f "$LINKDIR/qh.conf" ]; then
+	ok "add принимает конфигурацию с крючками"
+else
+	bad "add принимает конфигурацию с крючками"
+fi
+
 if printf 'это не ссылка и не конфигурация\n' | Qlink add qbad >/dev/null 2>&1; then
 	bad "add отвергает то, что не разбирается"
 else
@@ -218,6 +226,12 @@ if [ -e "$LINKDIR/qbad.link" ] || [ -e "$LINKDIR/qbad.conf" ]; then
 	bad "после отказа add ничего не оставляет"
 else
 	ok "после отказа add ничего не оставляет"
+fi
+# Временных файлов после себя add не оставляет тоже — в них тот же приватный ключ.
+if ls "$LINKDIR"/.add.* >/dev/null 2>&1; then
+	bad "add убирает за собой временные файлы"
+else
+	ok "add убирает за собой временные файлы"
 fi
 
 echo

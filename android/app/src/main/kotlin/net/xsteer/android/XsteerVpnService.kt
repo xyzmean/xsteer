@@ -4,6 +4,7 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import androidx.core.app.NotificationCompat
 import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
@@ -249,15 +250,17 @@ class XsteerVpnService : VpnService() {
             PendingIntent.FLAG_IMMUTABLE,
         )
 
-        return Notification.Builder(this, CHANNEL)
+        // NotificationCompat, а не Notification.Builder: второй в виде с каналом появился только
+        // в двадцать шестом уровне, а приложение работает с двадцать четвёртого. Компилировалось
+        // бы и так — а падало бы на телефоне, и только на старом.
+        return NotificationCompat.Builder(this, CHANNEL)
             .setContentTitle(getString(R.string.app_name))
             .setContentText(hub)
-            .setSmallIcon(android.R.drawable.stat_sys_vpn_ic)
+            .setSmallIcon(R.drawable.ic_tunnel)
             .setOngoing(true)
             .setContentIntent(open)
-            .addAction(
-                Notification.Action.Builder(null, "Отключить", stop).build(),
-            )
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .addAction(NotificationCompat.Action.Builder(0, "Отключить", stop).build())
             .build()
     }
 }

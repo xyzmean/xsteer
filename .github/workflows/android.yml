@@ -119,7 +119,18 @@ jobs:
           XSTEER_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           chmod +x gradlew 2>/dev/null || true
-          gradle --no-daemon assembleRelease | tail -30
+          # Журнал Gradle идёт в файл, а не в `| tail`: ошибки компилятора он печатает В НАЧАЛЕ, а
+          # хвост занимают перечисления задач. Первый же отказ этой сборки был именно таким —
+          # «Compilation error. See log for more details» и ни слова о том, где.
+          log="$RUNNER_TEMP/gradle.log"
+          if ! gradle --no-daemon assembleRelease > "$log" 2>&1; then
+            echo "== ошибки =="
+            grep -E '^e: |error:|FAILED' "$log" | head -40
+            echo "== хвост журнала =="
+            tail -40 "$log"
+            exit 1
+          fi
+          tail -15 "$log"
 
       # Артефакт собирается с ПОСТОЯННЫМИ именами: его забирает описание страницы установки, и
       # искать в нём файл перебором значило бы ломать страницу при первом переименовании у Gradle.
