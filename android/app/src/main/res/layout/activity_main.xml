@@ -59,6 +59,28 @@
             android:layout_height="wrap_content"
             android:text="Сохранить" />
 
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginTop="4dp">
+
+            <Button
+                android:id="@+id/scan"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="Сканировать QR" />
+
+            <Button
+                android:id="@+id/paste"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:text="Вставить" />
+        </LinearLayout>
+
         <Button
             android:id="@+id/genkey"
             android:layout_width="match_parent"

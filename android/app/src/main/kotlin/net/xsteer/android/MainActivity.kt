@@ -1,6 +1,7 @@
 package net.xsteer.android
 
 import android.Manifest
+import android.content.ClipboardManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.VpnService
@@ -11,6 +12,8 @@ import android.os.Looper
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import net.xsteer.android.databinding.ActivityMainBinding
 import org.json.JSONObject
 import xsteer.Xsteer
@@ -39,6 +42,17 @@ class MainActivity : AppCompatActivity() {
         if (res.resultCode == RESULT_OK) start() else show("Без разрешения туннель не поднять")
     }
 
+    /**
+     * Чтение QR камерой. Хаб печатает такой код при добавлении пира (`xs-install.sh`, пункт меню
+     * «Показать QR пира»), и в нём та же ссылка xs://, что и в файле рядом.
+     */
+    private val scan = registerForActivityResult(ScanContract()) { res ->
+        val text = res.contents
+        // contents == null означает отмену: человек вышел из сканера или не дал камеру. Это не
+        // отказ, и говорить о нём как об ошибке не надо.
+        if (text != null) applyConf(text)
+    }
+
     private val notifyPerm = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { /* отказ терпим: туннель работает и без уведомления, просто хуже видно */ }
@@ -50,9 +64,23 @@ class MainActivity : AppCompatActivity() {
         prefs = Prefs(this)
         ui.conf.setText(prefs.conf)
 
-        ui.save.setOnClickListener {
-            prefs.conf = ui.conf.text.toString()
-            show("Сохранено")
+        ui.save.setOnClickListener { applyConf(ui.conf.text.toString()) }
+
+        ui.scan.setOnClickListener {
+            scan.launch(
+                ScanOptions()
+                    .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                    .setPrompt("Наведите камеру на QR с настройкой")
+                    .setBeepEnabled(false)
+                    .setOrientationLocked(false),
+            )
+        }
+
+        ui.paste.setOnClickListener {
+            val cm = getSystemService(ClipboardManager::class.java)
+            val text = cm?.primaryClip?.takeIf { it.itemCount > 0 }
+                ?.getItemAt(0)?.coerceToText(this)?.toString()
+            if (text.isNullOrBlank()) show("В буфере обмена пусто") else applyConf(text)
         }
 
         ui.toggle.setOnClickListener {
@@ -76,6 +104,68 @@ class MainActivity : AppCompatActivity() {
             PackageManager.PERMISSION_GRANTED
         ) {
             notifyPerm.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+
+        handleIntent(intent)
+    }
+
+    /**
+     * Ссылка пришла в уже открытое окно. Окно одно (`launchMode=singleTask`), поэтому вторая
+     * ссылка приходит сюда, а не заводит второй экран с другой настройкой.
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIntent(intent)
+    }
+
+    /**
+     * Настройка из ссылки xs:// или из «поделиться текстом».
+     *
+     * НАМЕРЕНИЕ ЗАБЫВАЕТСЯ СРАЗУ ПОСЛЕ РАЗБОРА. Система отдаёт то же самое намерение заново при
+     * каждом создании экрана — поворот телефона, возврат из сканера, смена темы, — и без этого
+     * старая ссылка молча затирала бы настройку, которую человек только что ввёл руками.
+     */
+    private fun handleIntent(i: Intent?) {
+        val text = when (i?.action) {
+            Intent.ACTION_VIEW -> i.data?.toString()
+            Intent.ACTION_SEND -> i.getStringExtra(Intent.EXTRA_TEXT)
+            else -> null
+        }
+        if (text.isNullOrBlank()) return
+        setIntent(Intent(Intent.ACTION_MAIN))
+        applyConf(text)
+    }
+
+    /**
+     * Принять настройку — откуда бы она ни пришла: из поля, из QR, из буфера, из ссылки.
+     *
+     * РАЗБОР ИДЁТ ДО СОХРАНЕНИЯ, и разбирает его та же половина на Go, что поднимает туннель.
+     * Сохранённая непроверенная настройка молчала бы до первого нажатия «Подключить», а к тому
+     * времени и телефон, и человек уже далеко от того места, где ошибка была видна.
+     */
+    private fun applyConf(text: String) {
+        val t = text.trim()
+        if (t.isEmpty()) {
+            show("Настройка пустая")
+            return
+        }
+        val probe = Xsteer.newTunnel()
+        try {
+            probe.configure(t)
+        } catch (e: Exception) {
+            show("Настройка не разобрана: ${e.message}")
+            return
+        }
+        prefs.conf = t
+        if (ui.conf.text.toString() != t) ui.conf.setText(t)
+
+        val name = probe.name()
+        val who = if (name.isNullOrBlank()) probe.hubAddress() else name
+        if (XsteerVpnService.running) {
+            show("Настройка принята: $who. Переподключитесь, чтобы она заработала")
+        } else {
+            show("Настройка принята: $who")
         }
     }
 
