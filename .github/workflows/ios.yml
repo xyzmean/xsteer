@@ -9,6 +9,10 @@
 # платному участию в программе разработчика Apple. Без него собрать можно, поставить — нет.
 # AltStore этого не обходит: он вообще не умеет запрашивать произвольные права.
 #
+# ГДЕ ТЕПЕРЬ СТРАНИЦА УСТАНОВКИ. Её собирает и выкладывает .github/workflows/pages.yml — одно
+# описание на все платформы, потому что выкладка у хранилища одна и заменяет сайт целиком. Здесь
+# сборка только кладёт .ipa в артефакты прогона, а страница забирает его оттуда.
+#
 # ПРОХОД БЕЗ КЛЮЧЕЙ. Если ключей доступа в хранилище нет, задание всё равно полезно: оно
 # собирает библиотеку Go под iOS и проверяет, что проект Xcode цел и код компилируется. Это и
 # есть непрерывная проверка — подписывать для неё нечего.
@@ -35,7 +39,7 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: 'Куда девать собранное'
+        description: 'none — только проверить сборку; page — экспорт для страницы установки; testflight — отправить в TestFlight'
         required: true
         default: page
         type: choice
@@ -195,54 +199,6 @@ jobs:
             | tail -40
           ls -la build/export || true
 
-      # ---- страница установки --------------------------------------------------
-      - name: Собрать страницу установки
-        if: ${{ env.PUBLISH == 'page' }}
-        run: |
-          site=ios/build/site
-          mkdir -p "$site"
-          ipa=$(find ios/build/export -name '*.ipa' | head -1)
-          if [ -z "$ipa" ]; then
-            echo "::error::экспорт не дал файла .ipa"
-            exit 1
-          fi
-          cp "$ipa" "$site/Xsteer.ipa"
-          cp ios/Support/install-page/icon-57.png ios/Support/install-page/icon-512.png "$site/"
-
-          # Адрес страницы выводится из имени хранилища: у страниц проекта он всегда такой.
-          # Своё доменное имя задаётся переменной хранилища PAGES_BASE.
-          owner=${GITHUB_REPOSITORY%%/*}
-          repo=${GITHUB_REPOSITORY##*/}
-          base="${{ vars.PAGES_BASE }}"
-          if [ -z "$base" ]; then base="https://${owner}.github.io/${repo}"; fi
-          base="${base%/}"
-
-          ver="${{ github.run_number }}"
-          sed -e "s|@IPA@|${base}/Xsteer.ipa|g" \
-              -e "s|@ICON57@|${base}/icon-57.png|g" \
-              -e "s|@ICON512@|${base}/icon-512.png|g" \
-              -e "s|@VERSION@|${ver}|g" \
-              ios/Support/install-page/manifest.plist.in > "$site/manifest.plist"
-          sed -e "s|@MANIFEST@|${base}/manifest.plist|g" \
-              -e "s|@VERSION@|${ver}|g" \
-              -e "s|@BUILT@|$(date -u '+%Y-%m-%d %H:%M UTC')|g" \
-              -e "s|@SHA@|${GITHUB_SHA:0:12}|g" \
-              ios/Support/install-page/index.html.in > "$site/index.html"
-
-          # Незакрытая метка означала бы страницу, которая молча не работает: ссылка установки
-          # указывала бы на «@MANIFEST@». Дешевле поймать здесь.
-          if grep -l '@[A-Z0-9_]*@' "$site/index.html" "$site/manifest.plist"; then
-            echo "::error::в странице остались незакрытые метки"
-            exit 1
-          fi
-          ls -la "$site"
-
-      - name: Сохранить страницу для выкладки
-        if: ${{ env.PUBLISH == 'page' }}
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: ios/build/site
-
       - name: Сохранить артефакты
         if: always()
         uses: actions/upload-artifact@v4
@@ -253,23 +209,3 @@ jobs:
             mobile/build/**
           if-no-files-found: ignore
           retention-days: 14
-
-  # Выкладка отдельным заданием: так требует actions/deploy-pages — ему нужны свои права и своя
-  # среда, а давать их заданию сборки значило бы держать право записи там, где собирается чужой
-  # код из запросов на слияние.
-  deploy:
-    needs: build
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish == 'page' }}
-    runs-on: ubuntu-latest
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
-    steps:
-      - id: deploy
-        uses: actions/deploy-pages@v4
-      - name: Где страница
-        run: |
-          echo "Страница установки: ${{ steps.deploy.outputs.page_url }}"

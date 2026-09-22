@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Xsteer — установка</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b1220;
+    --card: #131c2e;
+    --line: #223049;
+    --text: #e6edf6;
+    --dim: #93a4bd;
+    --ok: #34d399;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 16px;
+    background: var(--bg); color: var(--text);
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    display: flex; justify-content: center;
+  }
+  main { width: 100%; max-width: 34rem; }
+  header { display: flex; align-items: center; gap: 14px; margin-bottom: 28px; }
+  header img { width: 60px; height: 60px; border-radius: 14px; }
+  h1 { font-size: 1.5rem; margin: 0; }
+  .sub { color: var(--dim); font-size: .9rem; margin-top: 2px; }
+  h2.platform { font-size: 1.1rem; margin: 30px 0 12px; }
+  a.install {
+    display: block; text-align: center; text-decoration: none;
+    background: var(--ok); color: #05281c; font-weight: 650;
+    padding: 15px; border-radius: 12px; margin-bottom: 10px;
+  }
+  a.install:active { opacity: .8; }
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 12px; padding: 16px; margin-top: 14px;
+  }
+  .card h3 { font-size: .95rem; margin: 0 0 10px; }
+  ol, ul { margin: 0; padding-left: 1.25rem; }
+  li { margin-bottom: 7px; }
+  li:last-child { margin-bottom: 0; }
+  a { color: var(--ok); }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: .85em; background: #0b1220; border: 1px solid var(--line);
+    border-radius: 5px; padding: 1px 5px;
+  }
+  pre {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: .8rem; background: #0b1220; border: 1px solid var(--line);
+    border-radius: 8px; padding: 12px; margin: 0; overflow-x: auto;
+  }
+  dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; font-size: .88rem; }
+  dt { color: var(--dim); }
+  dd { margin: 0; overflow-wrap: anywhere; }
+  .qr { display: flex; justify-content: center; padding: 14px 0 4px; }
+  .qr svg { width: 190px; height: 190px; background: #fff; border-radius: 8px; padding: 8px; }
+  .none { color: var(--dim); }
+  footer { margin-top: 34px; color: var(--dim); font-size: .82rem; text-align: center; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <img src="icon-512.png" alt="">
+    <div>
+      <h1>Xsteer</h1>
+      <div class="sub">Клиент звезды xsteer: телефон, планшет, десктоп</div>
+    </div>
+  </header>
+
+  <h2 class="platform">Android</h2>
+@ANDROID@
+
+  <h2 class="platform">iPhone и iPad</h2>
+@IOS@
+
+  <h2 class="platform">Windows, Linux, macOS</h2>
+  <div class="card">
+    <p style="margin:0 0 10px">Готовые файлы лежат в релизах.</p>
+    <ul>
+      <li><a href="@RELEASES@">Все сборки и суммы SHA256</a></li>
+      <li>Хаб на своём сервере ставится одной командой:</li>
+    </ul>
+    <pre>curl -fsSLO @INSTALLSH@
+sudo bash xs-install.sh</pre>
+  </div>
+
+  <footer>@BUILT@ · <a href="@REPO@">исходники</a></footer>
+</main>
+</body>
+</html>

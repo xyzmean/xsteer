@@ -1,0 +1,125 @@
+# Страница установки: одна на все платформы, и выкладывает её только это описание.
+#
+# ПОЧЕМУ ВЫКЛАДКА ОДНА. У хранилища один сайт, и всякая выкладка заменяет его ЦЕЛИКОМ. Если бы
+# страницу публиковала каждая сборка сама, они стирали бы работу друг друга: страница iOS
+# исчезала бы при первом же коммите в Android, и заметить это можно было бы только с телефона.
+# Поэтому сборки только собирают, а страницу собирает и выкладывает одно описание — это.
+#
+# ОТКУДА БЕРЁТСЯ СОБРАННОЕ. Из артефактов последнего УСПЕШНОГО прогона каждой сборки. Платформа,
+# у которой такого прогона нет (или у которой артефакт уже истёк), получает на странице честное
+# «сборки пока нет» — вместо ссылки, ведущей в никуда.
+name: Pages
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: [Android, iOS]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+
+# Выкладка не отменяется на полпути: прерванная посреди загрузки, она оставила бы сайт наполовину
+# прежним, наполовину новым.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash -eo pipefail {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Поставить qrencode
+        run: sudo apt-get install -y -qq qrencode
+
+      - name: Забрать свежие сборки
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # get_build <имя сборки> <имя артефакта> <куда> <приставка переменных>
+          #
+          # Отсутствие прогона или артефакта — не отказ: раздел страницы просто скажет, что сборки
+          # нет. Отказом здесь была бы страница, обещающая файл, которого не существует.
+          get_build() {
+            local wf="$1" art="$2" dir="$3" pfx="$4" id created
+            id=$(gh run list --workflow "$wf" --branch main --status success --limit 1 \
+                   --json databaseId --jq '.[0].databaseId // empty')
+            if [ -z "$id" ]; then
+              echo "::notice::успешных прогонов «$wf» на main нет"
+              return 0
+            fi
+            if ! gh run download "$id" --name "$art" --dir "$dir"; then
+              echo "::notice::у прогона $id нет артефакта $art — истёк срок хранения?"
+              return 0
+            fi
+            created=$(gh run view "$id" --json createdAt --jq '.createdAt')
+            {
+              echo "${pfx}_VERSION=$(gh run view "$id" --json runNumber --jq '.runNumber')"
+              echo "${pfx}_BUILT=$(date -u -d "$created" '+%Y-%m-%d %H:%M UTC')"
+              echo "${pfx}_SHA=$(gh run view "$id" --json headSha --jq '.headSha[0:12]')"
+            } >> "$GITHUB_ENV"
+          }
+          # Каталоги заводятся всегда, даже пустые: следующий шаг ищет в них файлы, а find по
+          # несуществующему каталогу — отказ, и под `set -e` он уронил бы сборку страницы там, где
+          # правильный ответ «сборки нет».
+          mkdir -p dl/android dl/ios
+          get_build Android xsteer-android dl/android APK
+          get_build iOS ios-build dl/ios IPA
+
+      - name: Собрать страницу
+        run: |
+          # Адрес выводится из имени хранилища: у страниц проекта он всегда такой. Своё доменное
+          # имя задаётся переменной хранилища PAGES_BASE.
+          owner=${GITHUB_REPOSITORY%%/*}
+          repo=${GITHUB_REPOSITORY##*/}
+          base="${{ vars.PAGES_BASE }}"
+          [ -n "$base" ] || base="https://${owner}.github.io/${repo}"
+
+          apk=$(find dl/android -name '*.apk' 2>/dev/null | head -1 || true)
+          ipa=$(find dl/ios -name '*.ipa' 2>/dev/null | head -1 || true)
+          signed=no
+          [ -f dl/android/signed ] && signed=$(tr -d '[:space:]' < dl/android/signed) || true
+
+          python3 site/build-site.py \
+            --out build/site \
+            --base "${base%/}" \
+            --repo "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --built "$(date -u '+%Y-%m-%d %H:%M UTC')" \
+            --apk "$apk" --apk-version "${APK_VERSION:-}" --apk-built "${APK_BUILT:-}" \
+            --apk-sha "${APK_SHA:-}" --apk-signed "$signed" \
+            --ipa "$ipa" --ipa-version "${IPA_VERSION:-}" --ipa-built "${IPA_BUILT:-}" \
+            --ipa-sha "${IPA_SHA:-}"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: build/site
+
+  # Выкладка отдельным заданием: так требует actions/deploy-pages — ему нужны свои права и своя
+  # среда, а держать право записи в задании, где собирается страница, незачем.
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      # enablement: true включает страницы у хранилища, если они ещё не включены. Без этого первая
+      # выкладка отказывает с «Not Found», и выглядит это как поломка описания сборки.
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+      - id: deploy
+        uses: actions/deploy-pages@v4
+      - name: Где страница
+        run: |
+          echo "Страница установки: ${{ steps.deploy.outputs.page_url }}"

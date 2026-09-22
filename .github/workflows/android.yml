@@ -5,8 +5,14 @@
 # службу VpnService, и система сама спросит согласие у человека при первом подключении. Ни
 # платного участия, ни сертификатов, ни чужих профилей. Готовый .apk ставится как есть.
 #
-# Поэтому здесь нет ни выбора «куда девать собранное», ни ключей доступа, ни страницы установки:
-# файл просто лежит в артефактах каждого прогона.
+# Собранное лежит в артефактах прогона, а страницу установки собирает и выкладывает отдельное
+# описание — .github/workflows/pages.yml. Выкладка у хранилища одна на весь сайт, поэтому и
+# выкладывающее описание одно: две сборки, публикующие каждая своё, стирали бы работу друг друга.
+#
+# ПРО ПОДПИСЬ. Android ставит новую версию поверх прежней только при совпадении ключа, а
+# отладочный ключ на чистом бегунке каждый раз новый. Ключ проекта берётся из секретов хранилища
+# (ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD);
+# без них сборка идёт с отладочным ключом, и страница установки говорит об этом прямо.
 name: Android
 
 on:
@@ -73,13 +79,43 @@ jobs:
           go vet ./...
           go test ./...
 
+      - name: Ключ подписи
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "SIGNED=no" >> "$GITHUB_ENV"
+            echo "::notice::ключа проекта нет — подпись отладочная, поверх прежней сборки не встанет"
+            exit 0
+          fi
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/xsteer.jks"
+          chmod 600 "$RUNNER_TEMP/xsteer.jks"
+          echo "XSTEER_KEYSTORE=$RUNNER_TEMP/xsteer.jks" >> "$GITHUB_ENV"
+          echo "SIGNED=yes" >> "$GITHUB_ENV"
+
       - name: Собрать приложение
         working-directory: android
         env:
           BUILD_NUMBER: ${{ github.run_number }}
+          XSTEER_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          XSTEER_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          XSTEER_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           chmod +x gradlew 2>/dev/null || true
           gradle --no-daemon assembleRelease | tail -30
+
+      # Артефакт собирается с ПОСТОЯННЫМИ именами: его забирает описание страницы установки, и
+      # искать в нём файл перебором значило бы ломать страницу при первом переименовании у Gradle.
+      - name: Сложить собранное
+        run: |
+          mkdir -p android/build/out
+          apk=$(find android/app/build/outputs/apk/release -name '*.apk' | head -1)
+          [ -n "$apk" ] || { echo "::error::сборка не дала .apk"; exit 1; }
+          cp "$apk" android/build/out/xsteer.apk
+          # Отметка о подписи едет рядом с файлом: страница обязана сказать человеку, встанет ли
+          # эта сборка поверх прежней, а узнать это можно только здесь.
+          printf '%s\n' "${SIGNED:-no}" > android/build/out/signed
+          ls -la android/build/out
 
       - name: Сохранить .apk
         if: always()
@@ -87,7 +123,16 @@ jobs:
         with:
           name: xsteer-android
           path: |
-            android/app/build/outputs/apk/release/*.apk
-            android/app/libs/xsteer.aar
+            android/build/out/xsteer.apk
+            android/build/out/signed
           if-no-files-found: ignore
           retention-days: 30
+
+      - name: Сохранить библиотеку Go
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xsteer-aar
+          path: android/app/libs/xsteer.aar
+          if-no-files-found: ignore
+          retention-days: 14

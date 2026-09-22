@@ -1,0 +1,30 @@
+  <a class="install" href="@APK@">Скачать @APKNAME@ · @APKSIZE@</a>
+
+  <div class="card">
+    <h3>С компьютера — наведите камеру телефона</h3>
+    <div class="qr">@APKQR@</div>
+  </div>
+
+  <div class="card">
+    <h3>Установка</h3>
+    <ol>
+      <li>Откройте скачанный файл. Android спросит разрешение ставить приложения из этого источника — дайте его.</li>
+      <li>Запустите Xsteer и внесите настройку: нажмите «Сканировать QR» и наведите камеру на код, который показал хаб.</li>
+      <li>Нажмите «Подключить» и разрешите добавить конфигурацию VPN.</li>
+    </ol>
+  </div>
+
+  <div class="card">
+    <h3>@SIGNNOTE_TITLE@</h3>
+    <p style="margin:0">@SIGNNOTE@</p>
+  </div>
+
+  <div class="card">
+    <h3>Об этой сборке</h3>
+    <dl>
+      <dt>Сборка</dt><dd>@VERSION@</dd>
+      <dt>Собрана</dt><dd>@BUILT@</dd>
+      <dt>Ревизия</dt><dd><code>@SHA@</code></dd>
+      <dt>SHA256</dt><dd><code>@APKSHA256@</code></dd>
+    </dl>
+  </div>
