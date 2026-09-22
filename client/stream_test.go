@@ -14,6 +14,7 @@ package client
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand"
 	"net"
 	"strings"
@@ -450,5 +451,106 @@ func TestСудьяПотокаНеСчитаетНашуНезанятость(
 	rx = now
 	if j.dead(now+200, now+200, rx) {
 		t.Error("сразу после ответа хаба путь мёртв")
+	}
+}
+
+// ---- кадры, которым в туннеле некуда идти ----------------------------------------------------
+
+// ip6Pkt — пакет IPv6 длиной n (минимум — заголовок в сорок байт).
+func ip6Pkt(n int) []byte {
+	p := make([]byte, n)
+	p[0] = 0x60
+	p[4], p[5] = byte((n-40)>>8), byte(n-40)
+	p[6] = 58 // ICMPv6: ровно то, чем Android проверяет связь
+	p[7] = 255
+	return p
+}
+
+// TestПотокНеВезётНеIPv4: IPv6 и мусор из устройства не уходят к хабу и в потери не пишутся.
+//
+// Отброс стоял только в outbound (поддельный TCP), а на телефоне клиент работает потоком: IPv6,
+// которым Android постоянно проверяет связь, уезжал к хабу, съедал место в записи и сходил за
+// активную отправку. Счёт — отдельный от потерь, как и обещано у поля noV6: это не потеря пути.
+func TestПотокНеВезётНеIPv4(t *testing.T) {
+	t.Parallel()
+	h := newStubHub(t)
+	c := standStreamClient(t, h)
+	dev := &memDev{}
+	done, _ := runStream(t, c, dev)
+
+	dev.push(ip6Pkt(80))
+	dev.push([]byte{0x45, 0, 0, 10, 0, 0, 0, 0, 64, 17}) // короче заголовка IPv4
+	dev.push(ip4Pkt(100))
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		v4, _ := h.ipKinds()
+		if v4 >= 1 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if ok, err := alive(done, 300*time.Millisecond); !ok {
+		t.Fatalf("сессия оборвалась: %v", err)
+	}
+	v4, other := h.ipKinds()
+	if v4 != 1 {
+		t.Errorf("до хаба дошло кадров IPv4: %d, ждали 1", v4)
+	}
+	if other != 0 {
+		t.Errorf("до хаба дошло кадров не IPv4: %d — в потоке их никто не отбрасывает", other)
+	}
+	if n := c.noV6.Load(); n != 1 {
+		t.Errorf("кадров IPv6 сосчитано %d, ждали 1", n)
+	}
+	if n := c.noIP.Load(); n != 1 {
+		t.Errorf("кадров не IP сосчитано %d, ждали 1: короткий кадр — не IPv6", n)
+	}
+	if n := c.stats.dropped.Load(); n != 0 {
+		t.Errorf("в потери записано %d: отброшенный не-IPv4 — не потеря пути", n)
+	}
+}
+
+// TestКадрыНеIPv4СчитаютсяПоРоду: одна проверка на оба транспорта, и каждый род — в свой счётчик.
+//
+// Короткий кадр и кадр с чужой версией прежде назывались в журнале «IPv6», а все вместе ложились
+// ещё и в потери — хотя поле noV6 обещало обратное.
+func TestКадрыНеIPv4СчитаютсяПоРоду(t *testing.T) {
+	var log []string
+	c := &Client{opt: Options{Logf: func(f string, a ...any) {
+		log = append(log, fmt.Sprintf(f, a...))
+	}}}
+	cases := []struct {
+		name string
+		f    []byte
+		ok   bool
+	}{
+		{"IPv4", ip4Pkt(60), true},
+		{"IPv4 ровно заголовок", ip4Pkt(20), true},
+		{"IPv6", ip6Pkt(40), false},
+		{"IPv4 короче заголовка", ip4Pkt(60)[:19], false},
+		{"IPv6 короче заголовка", ip6Pkt(60)[:39], false},
+		{"версия 5", append([]byte{0x55}, make([]byte, 59)...), false},
+		{"пустой", nil, false},
+	}
+	for _, k := range cases {
+		if got := c.tunnelable(k.f); got != k.ok {
+			t.Errorf("%s: tunnelable = %v, ждали %v", k.name, got, k.ok)
+		}
+	}
+	if n := c.noV6.Load(); n != 1 {
+		t.Errorf("IPv6 сосчитано %d, ждали 1", n)
+	}
+	if n := c.noIP.Load(); n != 4 {
+		t.Errorf("не IP сосчитано %d, ждали 4", n)
+	}
+	if n := c.stats.dropped.Load(); n != 0 {
+		t.Errorf("в потери записано %d, ждали 0", n)
+	}
+	// Журнал: по одной строке на род (дальше — раз в минуту), и IPv6 назван только IPv6.
+	if len(log) != 2 {
+		t.Fatalf("строк журнала %d, ждали 2: %q", len(log), log)
+	}
+	if !strings.Contains(log[0], "IPv6") || strings.Contains(log[1], "IPv6 в туннель") {
+		t.Errorf("журнал путает рода: %q", log)
 	}
 }

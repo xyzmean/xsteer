@@ -298,6 +298,11 @@ func (c *Client) streamOut(ctx context.Context, id int, st *wire.Stream, tx *noi
 				break
 			}
 			f := slab[used : used+n]
+			// Тот же отброс, что в outbound: IPv6 и мусор к хабу не едут и за активную отправку
+			// не сходят (см. tunnelable).
+			if !c.tunnelable(f) {
+				continue
+			}
 			route.MSSClamp(f, mtu)
 			frames = append(frames, f)
 			used += n
