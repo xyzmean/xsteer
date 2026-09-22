@@ -59,11 +59,23 @@ jobs:
               echo "::notice::у прогона $id нет артефакта $art — истёк срок хранения?"
               return 0
             fi
-            created=$(gh run view "$id" --json createdAt --jq '.createdAt')
+            # Сведения о прогоне берутся ОДНИМ запросом и проверяются. Первая редакция спрашивала
+            # поле `runNumber`, которого у `gh run view` нет (оно `number`), и получала пустоту:
+            # `set -e` на отказ ВНУТРИ подстановки в аргументе не срабатывает, поэтому страница
+            # молча выходила с прочерками вместо номера, даты и ревизии.
+            local meta num created sha
+            meta=$(gh run view "$id" --json number,createdAt,headSha --jq '[.number, .createdAt, .headSha] | @tsv')
+            num=$(printf '%s' "$meta" | cut -f1)
+            created=$(printf '%s' "$meta" | cut -f2)
+            sha=$(printf '%s' "$meta" | cut -f3)
+            if [ -z "$num" ] || [ -z "$created" ] || [ -z "$sha" ]; then
+              echo "::error::не прочитал сведения о прогоне $id: «$meta»"
+              exit 1
+            fi
             {
-              echo "${pfx}_VERSION=$(gh run view "$id" --json runNumber --jq '.runNumber')"
+              echo "${pfx}_VERSION=$num"
               echo "${pfx}_BUILT=$(date -u -d "$created" '+%Y-%m-%d %H:%M UTC')"
-              echo "${pfx}_SHA=$(gh run view "$id" --json headSha --jq '.headSha[0:12]')"
+              echo "${pfx}_SHA=$(printf '%s' "$sha" | cut -c1-12)"
             } >> "$GITHUB_ENV"
           }
           # Каталоги заводятся всегда, даже пустые: следующий шаг ищет в них файлы, а find по
