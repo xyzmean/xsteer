@@ -351,6 +351,52 @@ func (t *Tunnel) StateJSON() string {
 // Генерации пары в пакете conf нет — она живёт в консольной половине, и повторить её здесь
 // дешевле, чем тащить зависимость от cmd. Формат тот же: 32 байта в base64, ровно 44 символа.
 
+// Keys — пара ключей для той стороны, что на Swift.
+//
+// ПОЧЕМУ ТИПОМ, А НЕ ФУНКЦИЯМИ УРОВНЯ ПАКЕТА. Функция Go, возвращающая (string, error),
+// выносится gomobile в функцию C с выходным параметром и признаком успеха, а не в метод с
+// NSError, — и Swift такую как throws не видит: она у него просто не находится по имени.
+// Методы связанного типа выносятся методами Objective-C с NSError**, а их Swift превращает в
+// throws сам. Поэтому наружу отдаётся тип, а функции ниже остаются для Go и тестов.
+type Keys struct {
+	priv string
+	pub  string
+}
+
+// NewKeys создаёт пустую пару. Дальше Generate или DeriveFrom.
+func NewKeys() *Keys { return &Keys{} }
+
+// Generate делает новую пару.
+func (k *Keys) Generate() error {
+	priv, err := GenerateKey()
+	if err != nil {
+		return err
+	}
+	pub, err := PublicKeyOf(priv)
+	if err != nil {
+		return err
+	}
+	k.priv, k.pub = priv, pub
+	return nil
+}
+
+// DeriveFrom выводит публичный ключ из готового приватного. Отказ означает, что приватный
+// ключ записан неверно, — тем же текстом, что в консольной половине.
+func (k *Keys) DeriveFrom(priv string) error {
+	pub, err := PublicKeyOf(priv)
+	if err != nil {
+		return err
+	}
+	k.priv, k.pub = priv, pub
+	return nil
+}
+
+// Названия НЕ Private и Public нарочно: и то, и другое — ключевые слова Swift, и обращение к
+// ним потребовало бы обратных кавычек. Имя, которое на другой стороне надо экранировать, — плохое
+// имя.
+func (k *Keys) PrivateKey() string { return k.priv }
+func (k *Keys) PublicKey() string  { return k.pub }
+
 // GenerateKey создаёт приватный ключ.
 func GenerateKey() (string, error) {
 	var priv [32]byte

@@ -230,3 +230,29 @@ func TestGenerateKeyDiffers(t *testing.T) {
 		t.Fatal("два ключа подряд совпали")
 	}
 }
+
+// Пара ключей, вынесенная типом: именно её видит Swift.
+func TestKeysType(t *testing.T) {
+	k := NewKeys()
+	if err := k.Generate(); err != nil {
+		t.Fatalf("пара не создалась: %v", err)
+	}
+	if len(k.PrivateKey()) != 44 || len(k.PublicKey()) != 44 {
+		t.Fatalf("длины %d и %d", len(k.PrivateKey()), len(k.PublicKey()))
+	}
+	// Вывод из готового приватного даёт тот же публичный.
+	k2 := NewKeys()
+	if err := k2.DeriveFrom(k.PrivateKey()); err != nil {
+		t.Fatalf("вывод не удался: %v", err)
+	}
+	if k2.PublicKey() != k.PublicKey() {
+		t.Fatal("публичный ключ не воспроизвёлся")
+	}
+	if err := NewKeys().DeriveFrom("не ключ"); err == nil {
+		t.Fatal("мусор принят за приватный ключ")
+	}
+	// Пустая пара — пустые строки, а не мусор: интерфейс покажет её до нажатия.
+	if NewKeys().PrivateKey() != "" || NewKeys().PublicKey() != "" {
+		t.Fatal("пустая пара не пуста")
+	}
+}

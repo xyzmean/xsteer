@@ -7,7 +7,9 @@ struct ContentView: View {
     @EnvironmentObject private var tunnel: TunnelManager
     @State private var conf = ""
     @State private var showImporter = false
-    @State private var newKey: String?
+    @State private var keys = XsteerNewKeys()
+    @State private var keysMade = false
+    @State private var keysError: String?
 
     var body: some View {
         NavigationStack {
@@ -76,17 +78,21 @@ struct ContentView: View {
                 }
 
                 Section("Новый ключ") {
-                    if let k = newKey {
-                        Text(k)
-                            .font(.system(.footnote, design: .monospaced))
-                            .textSelection(.enabled)
-                        Text(publicOf(k))
-                            .font(.system(.footnote, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
+                    if keysMade, let k = keys {
+                        labelled("Приватный", k.privateKey())
+                        labelled("Публичный", k.publicKey())
+                    }
+                    if let e = keysError {
+                        Text(e).foregroundStyle(.red).font(.footnote)
                     }
                     Button("Создать пару ключей") {
-                        newKey = try? XsteerGenerateKey()
+                        do {
+                            try keys?.generate()
+                            keysMade = true
+                            keysError = nil
+                        } catch {
+                            keysError = error.localizedDescription
+                        }
                     }
                 }
 
@@ -134,8 +140,15 @@ struct ContentView: View {
         }
     }
 
-    private func publicOf(_ priv: String) -> String {
-        (try? XsteerPublicKeyOf(priv)) ?? ""
+    /// Ключ показывается целиком и выделяемым: его надо перенести в настройку хаба, а
+    /// обрезанный ключ перенести нельзя.
+    private func labelled(_ k: String, _ v: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(k).font(.caption).foregroundStyle(.secondary)
+            Text(v)
+                .font(.system(.footnote, design: .monospaced))
+                .textSelection(.enabled)
+        }
     }
 
     private func row(_ k: String, _ v: String) -> some View {
