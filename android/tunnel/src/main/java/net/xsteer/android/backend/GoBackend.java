@@ -25,10 +25,10 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.net.ConnectivityManager;
 import android.net.Network;
-import android.net.NetworkRequest;
 import android.os.PowerManager;
 import android.os.Build;
 import android.os.ParcelFileDescriptor;
+import android.os.SystemClock;
 import android.system.OsConstants;
 import android.util.Log;
 
@@ -64,12 +64,17 @@ import androidx.collection.ArraySet;
 public final class GoBackend implements Backend {
     private static final int DNS_RESOLUTION_RETRIES = 10;
     private static final String TAG = "xsteer/Backend";
+    // Пробуждение приходит несколькими извещениями подряд (экран, разблокировка, выход из
+    // дремоты); переподнимать соединения на каждое — рвать только что поднятые.
+    private static final long WAKE_GAP_MS = 2000;
     @Nullable private static AlwaysOnCallback alwaysOnCallback;
     private static CompletableFuture<VpnService> vpnService = new CompletableFuture<>();
     private final Context context;
     @Nullable private Config currentConfig;
     @Nullable private Tunnel currentTunnel;
-    @Nullable private xsteer.Tunnel goTunnel;
+    // volatile: пишется при подъёме и снятии (поток вызывающего setState), а читается из
+    // обратных вызовов сети и приёмника пробуждения — у них свои потоки.
+    @Nullable private volatile xsteer.Tunnel goTunnel;
     @Nullable private ConnectivityManager.NetworkCallback netCallback;
     @Nullable private BroadcastReceiver wakeReceiver;
 
@@ -405,13 +410,25 @@ public final class GoBackend implements Backend {
      *
      * ДВА ИСТОЧНИКА, И ВТОРОЙ ВАЖНЕЕ ПЕРВОГО НА ТЕЛЕФОНЕ.
      *
-     * 1. Смена сети: Wi-Fi ушёл, пришла мобильная. Обычный `NetworkCallback`.
+     * 1. Смена сети: Wi-Fi ушёл, пришла мобильная. `registerDefaultNetworkCallback` — сеть ПО
+     *    УМОЛЧАНИЮ, то есть та, в которой движок и открывает соединения к хабу (само приложение из
+     *    туннеля исключено). Прежде стоял `registerNetworkCallback` с пустым запросом: он сообщает
+     *    о КАЖДОЙ сети, какая есть у телефона, и сразу после регистрации — о каждой уже
+     *    существующей. Пока смена поколения до режима потока не доходила, это было безвредно; теперь
+     *    каждое такое извещение рвёт здоровые соединения. Поэтому реагируем только на СМЕНУ сети
+     *    по умолчанию: первое извещение после регистрации — это та сеть, в которой туннель только
+     *    что поднялся, и оно запоминается, а не исполняется.
      * 2. ВОЗВРАЩЕНИЕ ИЗ СНА. Экран гаснет, телефон засыпает, и всё, что у нас есть, —
      *    соединение TCP: оно переживает сон только до тех пор, пока его держит чужой NAT, а
      *    записей от нас в это время не уходит вовсе. Хаб освобождает сессию по простою,
      *    оператор закрывает трансляцию, и после разблокировки туннель «поднят», а не несёт
      *    ничего. Событий сети при этом НЕ БЫЛО — сеть та же самая, — поэтому первый источник
      *    молчит. Отсюда второй: включение экрана, разблокировка и выход из дремоты.
+     *
+     *    Включение экрана и разблокировка приходят парой, с разницей в секунды, и каждое
+     *    извещение переподнимает все соединения. Поэтому они склеиваются: не чаще одного раза в
+     *    WAKE_GAP_MS. Смена режима дремоты приходит и на входе в неё — там переподнимать нечего и
+     *    не во что, — поэтому исполняется только выход.
      */
     private void watchPath(final Context context) {
         stopWatchingPath(context);
@@ -419,19 +436,41 @@ public final class GoBackend implements Backend {
         final ConnectivityManager cm = context.getSystemService(ConnectivityManager.class);
         if (cm != null) {
             final ConnectivityManager.NetworkCallback cb = new ConnectivityManager.NetworkCallback() {
+                // Обратные вызовы одного NetworkCallback приходят в одном потоке по очереди, так
+                // что оба поля принадлежат ему и замка не требуют.
+                private boolean seeded;
+                @Nullable private Network current;
+
                 @Override
                 public void onAvailable(final Network network) {
+                    if (!seeded) {
+                        // Первое извещение после регистрации: сеть, в которой туннель только что
+                        // поднялся. Сменой это не является.
+                        seeded = true;
+                        current = network;
+                        return;
+                    }
+                    if (network.equals(current))
+                        return;
+                    current = network;
                     Log.i(TAG, "сеть сменилась — переподнимаю соединения");
                     netChanged();
                 }
 
                 @Override
                 public void onLost(final Network network) {
+                    // Сеть по умолчанию пропала, а замены нет: соединения в ней мертвы. Следующая
+                    // появившаяся сеть отличается от «никакой» и переподнимет их ещё раз — уже
+                    // туда, где путь есть.
+                    if (!network.equals(current))
+                        return;
+                    current = null;
+                    Log.i(TAG, "сеть пропала — переподнимаю соединения");
                     netChanged();
                 }
             };
             try {
-                cm.registerNetworkCallback(new NetworkRequest.Builder().build(), cb);
+                cm.registerDefaultNetworkCallback(cb);
                 netCallback = cb;
             } catch (final Exception e) {
                 Log.w(TAG, "слежение за сетью не завелось: " + e.getMessage());
@@ -439,9 +478,22 @@ public final class GoBackend implements Backend {
         }
 
         final BroadcastReceiver rx = new BroadcastReceiver() {
+            // Приёмник, зарегистрированный без Handler, зовётся в главном потоке — поле его.
+            private long lastWakeAt = -WAKE_GAP_MS;
+
             @Override
             public void onReceive(final Context ctx, final Intent intent) {
-                Log.i(TAG, "телефон проснулся (" + intent.getAction() + ") — переподнимаю соединения");
+                final String action = intent.getAction();
+                if (PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED.equals(action)) {
+                    final PowerManager pm = ctx.getSystemService(PowerManager.class);
+                    if (pm == null || pm.isDeviceIdleMode())
+                        return;
+                }
+                final long now = SystemClock.elapsedRealtime();
+                if (now - lastWakeAt < WAKE_GAP_MS)
+                    return;
+                lastWakeAt = now;
+                Log.i(TAG, "телефон проснулся (" + action + ") — переподнимаю соединения");
                 netChanged();
             }
         };
