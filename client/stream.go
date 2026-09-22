@@ -38,6 +38,9 @@ const streamProbeMS = 2000
 
 // streamSession поднимает соединение в режиме потока и работает до его обрыва.
 func (c *Client) streamSession(ctx context.Context, id int, dev tun.Device) error {
+	// Подписка на смену сети — ДО набора номера, как и в worker: смена, случившаяся во время
+	// подключения или рукопожатия, тоже означает, что этот сокет открыт в прежней сети.
+	netCh := c.netChanged()
 	addr := net.JoinHostPort(c.opt.Conf.Peers[0].Endpoint, fmt.Sprint(c.streamPort()))
 	// Control привязывает СВОЙ сокет к физическому интерфейсу, чтобы соединение к хабу не ушло в
 	// туннель (см. tun/pin_windows.go). Там же объяснено, почему это лучше маршрута-обхода: чужой
@@ -115,13 +118,38 @@ func (c *Client) streamSession(ctx context.Context, id int, dev tun.Device) erro
 		nc.Close() // разбудить чтение: у потока нет опроса с таймаутом
 	}()
 
-	done := make(chan error, 2)
+	done := make(chan error, 3)
 	go func() { done <- c.streamIn(sctx, id, st, rx, dev) }()
 	go func() { done <- c.streamOut(sctx, id, st, tx, dev, mtu) }()
+	go func() { done <- c.streamWatch(sctx, netCh) }()
 	err = <-done
 	stop()
 	<-done
+	<-done
 	return err
+}
+
+// streamWatch — сторож сессии потока: возвращает причину, по которой её надо оборвать, или
+// ошибку контекста, когда сессия кончилась сама.
+//
+// СМЕНА ПОКОЛЕНИЯ СЕТИ. У поддельного TCP её читает timeLoop, а у потока долго не читал никто —
+// и на телефоне это был единственный режим. Сессия потока висит в блокирующем ReadRecord без
+// срока: после пробуждения (NAT и хаб уже забыли соединение) или смены Wi-Fi на LTE сокет,
+// открытый в прежней сети, «жив» для ядра, пробы ложатся в его буфер, а туннель не несёт ничего,
+// пока ядро не сдастся по повторам — при tcp_retries2 = 15 это около пятнадцати минут. Сигнал о
+// смене был (NetChanged с платформы, netlink на Linux), но до потока он не доходил.
+//
+// Обрыв делается возвратом отсюда: streamSession отменяет контекст сессии, и горутина-будильник
+// закрывает сокет — это единственное, что разблокирует ReadRecord и застрявшую запись. Причина
+// уходит в done ПЕРВОЙ (раньше ошибок чтения на закрытом сокете), поэтому в журнал попадает она,
+// а не «use of closed network connection».
+func (c *Client) streamWatch(ctx context.Context, netCh <-chan struct{}) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-netCh:
+		return errors.New("сеть изменилась — поднимаю соединение заново")
+	}
 }
 
 // streamOut: TUN → поток. Пачка собирается так же, как в поддельном TCP, но резать запись на
