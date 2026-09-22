@@ -15,6 +15,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 IOS = os.path.join(ROOT, "ios")
 ANDROID = os.path.join(ROOT, "android")
+SITE = os.path.join(ROOT, "site")
 
 BG = (11, 18, 32)        # почти чёрный синий
 FG = (52, 211, 153)      # тот же зелёный, которым интерфейс показывает «подключено»
@@ -50,8 +51,9 @@ def draw(size: int) -> Image.Image:
 def main() -> None:
     out = [
         (os.path.join(IOS, "App/Resources/Assets.xcassets/AppIcon.appiconset/icon-1024.png"), 1024),
-        (os.path.join(IOS, "Support/install-page/icon-57.png"), 57),
-        (os.path.join(IOS, "Support/install-page/icon-512.png"), 512),
+        # Картинки страницы установки: она одна на все платформы, поэтому лежат в site/.
+        (os.path.join(SITE, "icon-57.png"), 57),
+        (os.path.join(SITE, "icon-512.png"), 512),
     ]
     # Android берёт иконку под плотность экрана. Размеры — те, что ждёт система; без них
     # запуск получает серый квадрат по умолчанию.

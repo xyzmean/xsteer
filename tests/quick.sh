@@ -157,6 +157,69 @@ else
 	ok "процесс клиента остановлен"
 fi
 
+# 7. ССЫЛКА xs:// ВМЕСТО ФАЙЛА. Хаб выдаёт доступ двумя видами — файлом и одной строкой, — и
+# приходит к человеку чаще строка: её пересылают, её же читает камерой приложение на телефоне.
+# Обвязка обязана понимать оба вида и обоими способами: и путём прямо на .link, и именем, рядом с
+# которым лежит .link. Проверяется здесь и то, что снятие не жалуется на отсутствующий .conf.
+LINKDIR="$WORK/conf"; mkdir -p "$LINKDIR"; chmod 700 "$LINKDIR"
+"$GO" link "$WORK/stripped.conf" --name ql 2>/dev/null > "$LINKDIR/ql.link"
+chmod 600 "$LINKDIR/ql.link"
+Qlink() { timeout 30 ip netns exec $NSA env XSTEER_BIN="$GO" XS_RUNDIR="$WORK/run" XS_CONFDIR="$LINKDIR" "$Q" "$@"; }
+
+if Qlink strip "$LINKDIR/ql.link" 2>/dev/null | grep -q '^PrivateKey'; then
+	ok "strip по пути на .link печатает конфигурацию"
+else
+	bad "strip по пути на .link печатает конфигурацию"
+fi
+
+if Qlink up ql > "$WORK/uplink.log" 2>&1; then
+	ok "up по имени поднимает туннель из ссылки"
+else
+	bad "up по имени поднимает туннель из ссылки"
+	sed 's/^/      /' "$WORK/uplink.log" 2>/dev/null || true
+fi
+if ip netns exec $NSA ping -c 2 -W 3 -q 10.88.0.1 >/dev/null 2>&1; then
+	ok "туннель из ссылки несёт трафик"
+else
+	bad "туннель из ссылки несёт трафик"
+fi
+
+Qlink down ql > "$WORK/downlink.log" 2>&1 || true
+if grep -qiE "can.t open|no such file" "$WORK/downlink.log"; then
+	bad "снятие туннеля из ссылки проходит без жалоб на .conf"
+	sed 's/^/      /' "$WORK/downlink.log"
+else
+	ok "снятие туннеля из ссылки проходит без жалоб на .conf"
+fi
+if ip netns exec $NSA ip link show ql >/dev/null 2>&1; then
+	bad "устройство туннеля из ссылки убрано"
+else
+	ok "устройство туннеля из ссылки убрано"
+fi
+
+# 8. Ссылка кладётся на место одной командой: то же движение, что «сканировать QR» на телефоне.
+# Класть её руками значило бы каждый раз вспоминать и про права на файл, и про каталог.
+if printf '%s' "$(cat "$LINKDIR/ql.link")" | Qlink add qa >/dev/null 2>&1; then
+	ok "add кладёт ссылку в каталог настроек"
+else
+	bad "add кладёт ссылку в каталог настроек"
+fi
+if [ -f "$LINKDIR/qa.link" ] && [ "$(stat -c %a "$LINKDIR/qa.link" 2>/dev/null)" = 600 ]; then
+	ok "положенная ссылка закрыта от остальных"
+else
+	bad "положенная ссылка закрыта от остальных (права $(stat -c %a "$LINKDIR/qa.link" 2>/dev/null || echo нет))"
+fi
+if printf 'это не ссылка и не конфигурация\n' | Qlink add qbad >/dev/null 2>&1; then
+	bad "add отвергает то, что не разбирается"
+else
+	ok "add отвергает то, что не разбирается"
+fi
+if [ -e "$LINKDIR/qbad.link" ] || [ -e "$LINKDIR/qbad.conf" ]; then
+	bad "после отказа add ничего не оставляет"
+else
+	ok "после отказа add ничего не оставляет"
+fi
+
 echo
 if [ "$fails" -gt 0 ]; then echo "ЕСТЬ ПРОВАЛЫ: $fails"; exit 1; fi
 echo "обвязка работает"

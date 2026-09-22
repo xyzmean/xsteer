@@ -430,11 +430,13 @@ xs://<приватный ключ пира>@<хост>:<порт>?pk=<публи
 ```sh
 # Linux-клиент: как wg-quick, с крючками и Table = off
 sudo install -m 755 contrib/xs-quick /usr/local/sbin/xs-quick
-sudo xs-quick up home            # /etc/xsteer/home.conf
+sudo xs-quick add home < xsteer-home.link   # ссылка или конфигурация от хаба
+sudo xs-quick up home                       # /etc/xsteer/home.conf или .link
 sudo systemctl enable --now xs-quick@home
 
-# хаб на сервере: вопросы, юнит, masquerade, меню выдачи пиров
-sudo bash server/xs-install.sh
+# хаб на сервере: вопросы, юнит, masquerade, меню выдачи пиров и QR для телефона
+curl -fsSLO https://raw.githubusercontent.com/xyzmean/xsteer/main/server/xs-install.sh
+sudo bash xs-install.sh
 
 # проверить конфигурацию, ничего не поднимая
 xsteer check /etc/xsteer/hub.conf
