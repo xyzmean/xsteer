@@ -3,16 +3,15 @@
 # ЧТО ЭТО РЕШАЕТ. Собрать приложение под iOS можно только Xcode, а Xcode бывает только на
 # macOS. Бегунки macOS у GitHub идут с предустановленным Xcode и для ОТКРЫТЫХ хранилищ
 # бесплатны — значит своего Mac не нужно ни для сборки, ни для подписи, ни для установки на
-# телефон. Установка идёт через TestFlight: сборка уезжает в App Store Connect, а на телефоне
-# её ставит приложение TestFlight. Внутренним испытателям (то есть себе) сборка достаётся
-# сразу, без проверки Apple, и живёт 90 дней вместо семи у недельного сертификата.
+# телефон.
 #
 # ЧЕГО ЭТО НЕ РЕШАЕТ. Тоннелю нужно право packet-tunnel-provider, а оно открывается только
 # платному участию в программе разработчика Apple. Без него собрать можно, поставить — нет.
+# AltStore этого не обходит: он вообще не умеет запрашивать произвольные права.
 #
 # ПРОХОД БЕЗ КЛЮЧЕЙ. Если ключей доступа в хранилище нет, задание всё равно полезно: оно
-# собирает библиотеку Go под iOS и проверяет, что проект Xcode цел и код компилируется. Это
-# и есть непрерывная проверка — подписывать для неё нечего.
+# собирает библиотеку Go под iOS и проверяет, что проект Xcode цел и код компилируется. Это и
+# есть непрерывная проверка — подписывать для неё нечего.
 name: iOS
 
 on:
@@ -35,11 +34,15 @@ on:
       - 'mobile/**'
   workflow_dispatch:
     inputs:
-      upload:
-        description: 'Отправить в TestFlight (нужны ключи доступа)'
-        required: false
-        default: false
-        type: boolean
+      publish:
+        description: 'Куда девать собранное'
+        required: true
+        default: page
+        type: choice
+        options:
+          - none
+          - page
+          - testflight
 
 permissions:
   contents: read
@@ -60,6 +63,8 @@ jobs:
     defaults:
       run:
         shell: bash -eo pipefail {0}
+    env:
+      PUBLISH: ${{ github.event_name == 'workflow_dispatch' && inputs.publish || 'none' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -72,7 +77,6 @@ jobs:
       # без предупреждения вместе с образом — сборка под iOS ломалась бы в день обновления.
       - name: Выбрать Xcode
         run: |
-          ls /Applications | grep -i xcode
           sudo xcode-select -s /Applications/Xcode.app
           xcodebuild -version
 
@@ -83,13 +87,8 @@ jobs:
         run: |
           brew install --quiet xcodegen
           cd ios
-          cp -n Support/local.xcconfig.example Support/local.xcconfig || true
           # Группа разработчика в проходе без ключей не нужна и мешает: подписи нет вовсе.
-          if [ -n "${{ secrets.IOS_TEAM_ID }}" ]; then
-            printf 'DEVELOPMENT_TEAM = %s\n' "${{ secrets.IOS_TEAM_ID }}" > Support/local.xcconfig
-          else
-            printf 'DEVELOPMENT_TEAM = \n' > Support/local.xcconfig
-          fi
+          printf 'DEVELOPMENT_TEAM = %s\n' "${{ secrets.IOS_TEAM_ID }}" > Support/local.xcconfig
           xcodegen generate
 
       # ---- проход без подписи: только проверка, что всё компилируется ----------
@@ -98,7 +97,7 @@ jobs:
       # Расширение тоннеля под симулятором не работает (тоннеля в симуляторе нет), но
       # СОБИРАЕТСЯ — а проверяем мы здесь именно сборку.
       - name: Проверить сборку без подписи
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.upload) }}
+        if: ${{ (github.event_name == 'workflow_dispatch' && inputs.publish || 'none') == 'none' }}
         run: |
           cd ios
           xcodebuild build \
@@ -109,18 +108,18 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             | tail -40
 
-      # ---- проход с подписью: архив и отправка в TestFlight --------------------
+      # ---- проход с подписью ---------------------------------------------------
       #
       # Подпись автоматическая, ключом доступа к App Store Connect: с ним Xcode сам заводит
-      # сертификат и профили, включая право на тоннель. Это три значения в хранилище вместо
-      # пяти файлов, и профили не надо обновлять руками, когда они истекут.
+      # сертификат и профили, включая право на тоннель и список устройств. Это три значения в
+      # хранилище вместо пяти файлов, и профили не надо обновлять руками, когда они истекут.
       - name: Ключ доступа к App Store Connect
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.upload }}
+        if: ${{ env.PUBLISH != 'none' }}
         env:
           ASC_KEY_P8_BASE64: ${{ secrets.ASC_KEY_P8_BASE64 }}
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
         run: |
-          if [ -z "$ASC_KEY_P8_BASE64" ]; then
+          if [ -z "$ASC_KEY_P8_BASE64" ] || [ -z "${{ secrets.IOS_TEAM_ID }}" ]; then
             echo "::error::нет ключа доступа: заведите ASC_KEY_P8_BASE64, ASC_KEY_ID, ASC_ISSUER_ID и IOS_TEAM_ID"
             exit 1
           fi
@@ -129,12 +128,14 @@ jobs:
           chmod 600 ~/private_keys/AuthKey_${ASC_KEY_ID}.p8
 
       - name: Архив
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.upload }}
+        if: ${{ env.PUBLISH != 'none' }}
         env:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         run: |
           cd ios
+          # Номер сборки — номер прогона. Телефон ставит поверх уже стоящего только то, у чего
+          # номер ВЫШЕ: с постоянной единицей вторая установка молча не заменяла бы первую.
           xcodebuild archive \
             -project Xsteer.xcodeproj \
             -scheme Xsteer \
@@ -145,25 +146,41 @@ jobs:
             -authenticationKeyPath ~/private_keys/AuthKey_${ASC_KEY_ID}.p8 \
             -authenticationKeyID "$ASC_KEY_ID" \
             -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            CURRENT_PROJECT_VERSION=${{ github.run_number }} \
             | tail -60
 
-      - name: Экспорт и отправка в TestFlight
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.upload }}
+      - name: Экспорт
+        if: ${{ env.PUBLISH != 'none' }}
         env:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
           IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
         run: |
           cd ios
+          if [ "$PUBLISH" = testflight ]; then
+            method=app-store-connect
+            dest=upload
+          else
+            # release-testing — это то, что прежде звалось ad-hoc: сборка ставится на устройства,
+            # заранее внесённые в список у разработчика, и больше ни на какие.
+            method=release-testing
+            dest=export
+          fi
           cat > build/ExportOptions.plist <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
-              <key>method</key><string>app-store-connect</string>
+              <key>method</key><string>${method}</string>
+              <key>destination</key><string>${dest}</string>
               <key>teamID</key><string>${IOS_TEAM_ID}</string>
+              <key>signingStyle</key><string>automatic</string>
               <key>uploadSymbols</key><true/>
-              <key>destination</key><string>upload</string>
+              <key>stripSwiftSymbols</key><true/>
+              <key>compileBitcode</key><false/>
+              <!-- Без прореживания: файл выходит крупнее, зато ставится на любое устройство из
+                   списка, а не только на то, под чьё железо его прорезали. -->
+              <key>thinning</key><string>&lt;none&gt;</string>
           </dict>
           </plist>
           PLIST
@@ -176,6 +193,55 @@ jobs:
             -authenticationKeyID "$ASC_KEY_ID" \
             -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
             | tail -40
+          ls -la build/export || true
+
+      # ---- страница установки --------------------------------------------------
+      - name: Собрать страницу установки
+        if: ${{ env.PUBLISH == 'page' }}
+        run: |
+          site=ios/build/site
+          mkdir -p "$site"
+          ipa=$(find ios/build/export -name '*.ipa' | head -1)
+          if [ -z "$ipa" ]; then
+            echo "::error::экспорт не дал файла .ipa"
+            exit 1
+          fi
+          cp "$ipa" "$site/Xsteer.ipa"
+          cp ios/Support/install-page/icon-57.png ios/Support/install-page/icon-512.png "$site/"
+
+          # Адрес страницы выводится из имени хранилища: у страниц проекта он всегда такой.
+          # Своё доменное имя задаётся переменной хранилища PAGES_BASE.
+          owner=${GITHUB_REPOSITORY%%/*}
+          repo=${GITHUB_REPOSITORY##*/}
+          base="${{ vars.PAGES_BASE }}"
+          if [ -z "$base" ]; then base="https://${owner}.github.io/${repo}"; fi
+          base="${base%/}"
+
+          ver="${{ github.run_number }}"
+          sed -e "s|@IPA@|${base}/Xsteer.ipa|g" \
+              -e "s|@ICON57@|${base}/icon-57.png|g" \
+              -e "s|@ICON512@|${base}/icon-512.png|g" \
+              -e "s|@VERSION@|${ver}|g" \
+              ios/Support/install-page/manifest.plist.in > "$site/manifest.plist"
+          sed -e "s|@MANIFEST@|${base}/manifest.plist|g" \
+              -e "s|@VERSION@|${ver}|g" \
+              -e "s|@BUILT@|$(date -u '+%Y-%m-%d %H:%M UTC')|g" \
+              -e "s|@SHA@|${GITHUB_SHA:0:12}|g" \
+              ios/Support/install-page/index.html.in > "$site/index.html"
+
+          # Незакрытая метка означала бы страницу, которая молча не работает: ссылка установки
+          # указывала бы на «@MANIFEST@». Дешевле поймать здесь.
+          if grep -l '@[A-Z0-9_]*@' "$site/index.html" "$site/manifest.plist"; then
+            echo "::error::в странице остались незакрытые метки"
+            exit 1
+          fi
+          ls -la "$site"
+
+      - name: Сохранить страницу для выкладки
+        if: ${{ env.PUBLISH == 'page' }}
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ios/build/site
 
       - name: Сохранить артефакты
         if: always()
@@ -187,3 +253,23 @@ jobs:
             mobile/build/**
           if-no-files-found: ignore
           retention-days: 14
+
+  # Выкладка отдельным заданием: так требует actions/deploy-pages — ему нужны свои права и своя
+  # среда, а давать их заданию сборки значило бы держать право записи там, где собирается чужой
+  # код из запросов на слияние.
+  deploy:
+    needs: build
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish == 'page' }}
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
+      - name: Где страница
+        run: |
+          echo "Страница установки: ${{ steps.deploy.outputs.page_url }}"
