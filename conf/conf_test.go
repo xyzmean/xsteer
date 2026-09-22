@@ -343,3 +343,27 @@ func TestПереполнения(t *testing.T) {
 
 	refuses(t, "файл больше предела", strings.Repeat("# набивка\n", ConfMax/10+10), RoleSpoke)
 }
+
+// Пример пира из steer/docs/xsteer.md — с комментариями в конце строк, как его и копируют.
+// Разбор на C (xsconf.c) снимает «#» после пробела или табуляции, как wg-quick; две реализации
+// одного формата обязаны читать один файл одинаково. Прежде Go такой пример отвергал на MTU.
+func TestКомментарийВКонцеСтроки(t *testing.T) {
+	text := "# пир (роутер)\n[Interface]\nPrivateKey = " + keyA + "\nAddress    = 10.7.0.2/24\n" +
+		"MTU        = 1439          # необязательно: считается из канала\nSNI        = www.example.com\n" +
+		"\n[Peer]                     # у пира ровно одна секция — хаб\nPublicKey  = " + keyB + "\n" +
+		"Endpoint   = 203.0.113.10:443   # адресом, не именем\n" +
+		"AllowedIPs = 10.7.0.0/24, 192.168.9.0/24\nPersistentKeepalive = 25\t# табуляцией\n"
+	c, _ := mustParse(t, text, RoleSpoke)
+	if c.MTU != 1439 {
+		t.Errorf("MTU = %d, ждали 1439", c.MTU)
+	}
+	if len(c.Peers) != 1 || c.Peers[0].Endpoint != "203.0.113.10" || c.Peers[0].EndpointPort != 443 {
+		t.Fatalf("Endpoint разобран неверно: %+v", c.Peers)
+	}
+	if c.Peers[0].Keepalive != 25 {
+		t.Errorf("Keepalive = %d, ждали 25", c.Peers[0].Keepalive)
+	}
+	// «#» вплотную к значению — не комментарий, а хвост числа: отказ, как у C.
+	refuses(t, "решётка вплотную к числу", "[Interface]\nPrivateKey = "+keyA+"\nAddress = 10.7.0.2/24\nMTU = 1400#x\n"+
+		"[Peer]\nPublicKey = "+keyB+"\nEndpoint = 203.0.113.10:443\nAllowedIPs = 10.7.0.0/24\n", RoleSpoke)
+}
