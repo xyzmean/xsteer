@@ -82,6 +82,9 @@ android {
 
 dependencies {
     implementation(project(":tunnel"))
+    // Половина на Go: в приложение она входит целиком — и классами, и своими .so под четыре
+    // архитектуры. Модуль :tunnel компилируется против неё же, но включить её в себя не может.
+    implementation(files("../tunnel/libs/xsteer.aar"))
     implementation(libs.androidx.activity.ktx)
     implementation(libs.androidx.annotation)
     implementation(libs.androidx.appcompat)

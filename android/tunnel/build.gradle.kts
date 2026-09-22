@@ -35,9 +35,13 @@ android {
 
 dependencies {
     // Половина на Go: протокол, шифрование, рукопожатие, разбор настройки и согласование MTU.
-    // Кладёт файл android/build-aar.sh; без него сборка отказывает, и это правильно — приложение
-    // без движка ставиться не должно.
-    api(files("libs/xsteer.aar"))
+    // Кладёт файл android/build-aar.sh.
+    //
+    // ТОЛЬКО ДЛЯ КОМПИЛЯЦИИ, и это не выбор: библиотека Android не имеет права зависеть от
+    // лежащего рядом .aar — собранная из неё библиотека вышла бы без его классов, и Gradle такую
+    // сборку прекращает («Direct local .aar file dependencies are not supported when building an
+    // AAR»). Поэтому здесь только заголовки, а в приложение (:ui) тот же файл входит целиком.
+    compileOnly(files("libs/xsteer.aar"))
     implementation(libs.androidx.annotation)
     implementation(libs.androidx.collection)
     compileOnly(libs.jsr305)
