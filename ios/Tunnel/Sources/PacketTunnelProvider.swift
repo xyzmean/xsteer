@@ -197,7 +197,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 ///
 /// Поэтому признак конца всплеска берётся у платформы: пакеты копятся, а отдача назначается на
 /// следующий виток очереди. Виток наступит обязательно и без чьей-либо доброй воли.
-final class Sink: NSObject, XsteerPacketSink {
+/// ПРО ИМЯ ПРОТОКОЛА. gomobile выносит интерфейс Go сразу двумя сущностями: протоколом
+/// (для того, кто его реализует здесь) и одноимённым классом (обёрткой над значением,
+/// реализованным в Go). Когда в Objective-C класс и протокол зовутся одинаково, Swift
+/// переименовывает протокол, приписывая Protocol, — поэтому здесь XsteerPacketSinkProtocol, а не
+/// XsteerPacketSink. С последним компилятор говорит «multiple inheritance from classes».
+final class Sink: NSObject, XsteerPacketSinkProtocol {
     private let flow: NEPacketTunnelFlow
     private let log: Logger
     private let queue = DispatchQueue(label: "com.xyzmean.xsteer.sink")
@@ -248,7 +253,7 @@ final class Sink: NSObject, XsteerPacketSink {
 /// Переходник журнала. Обязан быть потокобезопасным: клиент пишет в журнал из подъёма, из
 /// слежения за сетью и из каждого соединения одновременно, без всякой синхронизации со своей
 /// стороны. Logger из OSLog таким и является.
-final class BridgeLogger: NSObject, XsteerLogger {
+final class BridgeLogger: NSObject, XsteerLoggerProtocol {
     private let log: Logger
     init(log: Logger) {
         self.log = log
