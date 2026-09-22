@@ -1293,8 +1293,18 @@ func (c *Client) timeLoop(ctx context.Context, id int, s *sess, dev tun.Device, 
 				}
 				if s.pCur > 0 {
 					probe := make([]byte, wire.HdrRoom+s.pCur+wire.Tag)
+					// ОТКАЗ СОБСТВЕННОЙ ОТПРАВКИ — НЕ ПРИГОВОР ПУТИ. Прежде ошибка отсюда
+					// отбрасывалась, и кадр, который не ушёл из нашего же сокета, считался «путь
+					// этого размера не несёт». Человек получал строку про недошедшие пробы, а
+					// пробы никуда и не отправлялись.
 					if n, ok := wire.ProbeBuild(probe[wire.HdrRoom:wire.HdrRoom+s.pCur], s.pCur); ok {
-						_ = c.sendFrame(s, probe, n)
+						if err := c.sendFrame(s, probe, n); err != nil {
+							c.logf("проба %d байт не ушла из сокета (%v) — это наш отказ, а не "+
+								"путь; проверю ещё раз", s.pCur, err)
+							s.probeSent = now
+							s.pTries = 0 // попытка не состоялась: путь о ней не спрашивали
+							continue
+						}
 					}
 					s.probeSent = now
 				}
@@ -1349,7 +1359,7 @@ func (c *Client) timeLoop(ctx context.Context, id int, s *sess, dev tun.Device, 
 		// одного и того же размера ровно каждые пятнадцать секунд не встречается ни в одном
 		// браузерном соединении, и находится он простым подсчётом пауз между мелкими пакетами.
 		// Разброс ±20% ничего не стоит и делает такой подсчёт бессмысленным.
-		if keepalive > 0 && s.conn.SinceTX() >= s.keepNext {
+		if keepalive > 0 && s.conn.SinceDataTX() >= s.keepNext {
 			frame := make([]byte, wire.HdrRoom+wire.Tag)
 			_ = c.sendFrame(s, frame, 0)
 			s.keepNext = keepalive*8/10 + rand.Int64N(keepalive*4/10+1)
@@ -1400,6 +1410,15 @@ func (c *Client) probeDone(s *sess, id int, dev tun.Device, devName string) {
 			"доходят вовсе", wire.MTUFloor)
 		c.applyMTU(dev, devName, wire.MTUFloor, "путь не подтвердил ничего выше низа")
 		s.mtuConfirmed = 0
+		// ХАБУ ГОВОРИМ И ЭТОТ ИСХОД. Прежде кадр итога уходил только при удачном пробое, и
+		// сторона, спустившаяся на безопасный низ, оставляла хаб с прежним согласованным
+		// размером: тот продолжал подрезать MSS по нему и слать полноразмерные записи в путь,
+		// который мы только что признали узким. Молчание здесь означало «ничего не изменилось», а
+		// изменилось как раз то, ради чего согласование и существует.
+		frame := make([]byte, wire.HdrRoom+8+wire.Tag)
+		if n := wire.MTUBuild(frame[wire.HdrRoom:wire.HdrRoom+8], wire.MTUFloor); n > 0 {
+			_ = c.sendFrame(s, frame, n)
+		}
 		return
 	}
 	// Сравнение — с тем, что СТОИТ НА УСТРОЙСТВЕ, а не с прошлым подтверждённым значением.
