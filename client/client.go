@@ -90,6 +90,31 @@ type Options struct {
 	// маршрут остаётся в мёртвом туннеле: трафик не пойдёт вовсе, но и наружу открытым не
 	// выйдет. Второе нужно тому, для кого утечка дороже простоя.
 	KillSwitch bool
+	// Devs — ГОТОВЫЕ устройства вместо открытия своего. Пусто означает «открой сам».
+	//
+	// Нужно там, где устройство принадлежит не нам и дескриптора у него нет вовсе. Ровно такова
+	// iOS: тоннель живёт в расширении, пакеты приходят и уходят через объект системы
+	// (NEPacketTunnelFlow), а /dev/net/tun там нет и быть не может. То же понадобится Android и
+	// любому встраиванию в чужой процесс.
+	//
+	// Закрывает их всё равно клиент: устройство — это очередь и признак закрытия, а не владение
+	// объектом системы, и у встраивающего остаётся его собственный объект.
+	Devs []tun.Device
+	// NoNetWatch — не следить за сменой сети своими силами.
+	//
+	// Своё слежение там, где нет netlink, сводится к опросу адреса выхода раз в пять секунд
+	// (netwatch_other.go). Внутри расширения iOS это не просто бесполезно, а вредно: адресом
+	// источника ядро может назвать адрес самого туннеля, и опрос решит, что сеть сменилась, —
+	// то есть переподнимет все соединения, и так каждые пять секунд. У платформы для этого есть
+	// свой источник правды (NWPathMonitor), и встраивающий обязан двигать поколение сам —
+	// методом NetChanged.
+	NoNetWatch bool
+	// Ready — зовётся один раз, когда клиент собран, но соединения ещё не пошли.
+	//
+	// Единственный способ дотянуться до поднятого клиента: Run блокирует до отмены контекста и
+	// наружу ничего не отдаёт. Встраивающему это нужно для двух вещей — двигать поколение сети
+	// (NetChanged) и снимать состояние (StateNow) без файла на диске.
+	Ready func(*Client)
 	// NoBatch — не собирать кадры в одну запись и не разрезать записи между сегментами.
 	//
 	// Нужно ровно для одного: разговора с хабом на C, который ни пачек, ни сборки пока не умеет.
@@ -154,6 +179,20 @@ func (c *Client) netChanged() <-chan struct{} {
 }
 
 // bumpNet объявляет, что сеть изменилась: поколение вперёд, все ждущие разбужены.
+// NetChanged говорит клиенту, что сеть под ним сменилась: все соединения надо переподнять, не
+// дожидаясь таймаутов. Для тех, кто отключил своё слежение ключом NoNetWatch и получает
+// извещения от платформы (NWPathMonitor на iOS, ConnectivityManager на Android).
+func (c *Client) NetChanged() { c.bumpNet() }
+
+// StateNow — снимок состояния без файла на диске. Тот же, что пишет StatePath.
+func (c *Client) StateNow() State {
+	name := ""
+	if len(c.devs) > 0 {
+		name = c.devs[0].Name()
+	}
+	return c.Snapshot(name)
+}
+
 func (c *Client) bumpNet() {
 	c.netGen.Add(1)
 	c.netMu.Lock()
@@ -263,13 +302,17 @@ func Run(ctx context.Context, opt Options) error {
 		conns = wire.ConnsMax
 	}
 
-	open := tun.OpenQueues
-	if opt.NoOffload {
-		open = tun.OpenQueuesPlain
-	}
-	devs, err := open(dev, conns)
-	if err != nil {
-		return err
+	devs := opt.Devs
+	if len(devs) == 0 {
+		open := tun.OpenQueues
+		if opt.NoOffload {
+			open = tun.OpenQueuesPlain
+		}
+		var err error
+		devs, err = open(dev, conns)
+		if err != nil {
+			return err
+		}
 	}
 	c.devs = devs
 	name := devs[0].Name()
@@ -388,11 +431,16 @@ func Run(ctx context.Context, opt Options) error {
 	}
 	// Слежение за сетью поднимается ДО соединений: смена сети во время первого подключения — самый
 	// обычный случай (служба стартует, пока интерфейс ещё поднимается), и заметить её надо сразу.
-	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
-		c.watchNet(ctx)
-	}()
+	if !opt.NoNetWatch {
+		c.wg.Add(1)
+		go func() {
+			defer c.wg.Done()
+			c.watchNet(ctx)
+		}()
+	}
+	if opt.Ready != nil {
+		opt.Ready(c)
+	}
 	for i := 0; i < conns; i++ {
 		c.wg.Add(1)
 		go func(id int) {

@@ -1,0 +1,181 @@
+# Сборка приложения под iOS на бегунке macOS, потому что Mac есть не у всех.
+#
+# ЧТО ЭТО РЕШАЕТ. Собрать приложение под iOS можно только Xcode, а Xcode бывает только на
+# macOS. Бегунки macOS у GitHub идут с предустановленным Xcode и для ОТКРЫТЫХ хранилищ
+# бесплатны — значит своего Mac не нужно ни для сборки, ни для подписи, ни для установки на
+# телефон. Установка идёт через TestFlight: сборка уезжает в App Store Connect, а на телефоне
+# её ставит приложение TestFlight. Внутренним испытателям (то есть себе) сборка достаётся
+# сразу, без проверки Apple, и живёт 90 дней вместо семи у недельного сертификата.
+#
+# ЧЕГО ЭТО НЕ РЕШАЕТ. Тоннелю нужно право packet-tunnel-provider, а оно открывается только
+# платному участию в программе разработчика Apple. Без него собрать можно, поставить — нет.
+#
+# ПРОХОД БЕЗ КЛЮЧЕЙ. Если ключей доступа в хранилище нет, задание всё равно полезно: оно
+# собирает библиотеку Go под iOS и проверяет, что проект Xcode цел и код компилируется. Это
+# и есть непрерывная проверка — подписывать для неё нечего.
+name: iOS
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ios/**'
+      - 'mobile/**'
+      - 'client/**'
+      - 'conf/**'
+      - 'wire/**'
+      - 'noise/**'
+      - 'link/**'
+      - 'tun/**'
+      - 'chello/**'
+      - '.github/workflows/ios.yml'
+  pull_request:
+    paths:
+      - 'ios/**'
+      - 'mobile/**'
+  workflow_dispatch:
+    inputs:
+      upload:
+        description: 'Отправить в TestFlight (нужны ключи доступа)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      # Xcode выбирается явно. На бегунке их несколько, и «тот, что по умолчанию» меняется
+      # без предупреждения вместе с образом — сборка под iOS ломалась бы в день обновления.
+      - name: Выбрать Xcode
+        run: |
+          ls /Applications | grep -i xcode
+          sudo xcode-select -s /Applications/Xcode.app
+          xcodebuild -version
+
+      - name: Собрать библиотеку Go в XCFramework
+        run: ios/build-framework.sh
+
+      - name: Собрать проект Xcode
+        run: |
+          brew install --quiet xcodegen
+          cd ios
+          cp -n Support/local.xcconfig.example Support/local.xcconfig || true
+          # Группа разработчика в проходе без ключей не нужна и мешает: подписи нет вовсе.
+          if [ -n "${{ secrets.IOS_TEAM_ID }}" ]; then
+            printf 'DEVELOPMENT_TEAM = %s\n' "${{ secrets.IOS_TEAM_ID }}" > Support/local.xcconfig
+          else
+            printf 'DEVELOPMENT_TEAM = \n' > Support/local.xcconfig
+          fi
+          xcodegen generate
+
+      # ---- проход без подписи: только проверка, что всё компилируется ----------
+      #
+      # Собирается под симулятор: там подпись не нужна вовсе, а компилируется тот же код.
+      # Расширение тоннеля под симулятором не работает (тоннеля в симуляторе нет), но
+      # СОБИРАЕТСЯ — а проверяем мы здесь именно сборку.
+      - name: Проверить сборку без подписи
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.upload) }}
+        run: |
+          cd ios
+          xcodebuild build \
+            -project Xsteer.xcodeproj \
+            -scheme Xsteer \
+            -destination 'generic/platform=iOS Simulator' \
+            -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO \
+            | tail -40
+
+      # ---- проход с подписью: архив и отправка в TestFlight --------------------
+      #
+      # Подпись автоматическая, ключом доступа к App Store Connect: с ним Xcode сам заводит
+      # сертификат и профили, включая право на тоннель. Это три значения в хранилище вместо
+      # пяти файлов, и профили не надо обновлять руками, когда они истекут.
+      - name: Ключ доступа к App Store Connect
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.upload }}
+        env:
+          ASC_KEY_P8_BASE64: ${{ secrets.ASC_KEY_P8_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          if [ -z "$ASC_KEY_P8_BASE64" ]; then
+            echo "::error::нет ключа доступа: заведите ASC_KEY_P8_BASE64, ASC_KEY_ID, ASC_ISSUER_ID и IOS_TEAM_ID"
+            exit 1
+          fi
+          mkdir -p ~/private_keys
+          printf '%s' "$ASC_KEY_P8_BASE64" | base64 --decode > ~/private_keys/AuthKey_${ASC_KEY_ID}.p8
+          chmod 600 ~/private_keys/AuthKey_${ASC_KEY_ID}.p8
+
+      - name: Архив
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.upload }}
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          cd ios
+          xcodebuild archive \
+            -project Xsteer.xcodeproj \
+            -scheme Xsteer \
+            -destination 'generic/platform=iOS' \
+            -configuration Release \
+            -archivePath build/Xsteer.xcarchive \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath ~/private_keys/AuthKey_${ASC_KEY_ID}.p8 \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            | tail -60
+
+      - name: Экспорт и отправка в TestFlight
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.upload }}
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+        run: |
+          cd ios
+          cat > build/ExportOptions.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>method</key><string>app-store-connect</string>
+              <key>teamID</key><string>${IOS_TEAM_ID}</string>
+              <key>uploadSymbols</key><true/>
+              <key>destination</key><string>upload</string>
+          </dict>
+          </plist>
+          PLIST
+          xcodebuild -exportArchive \
+            -archivePath build/Xsteer.xcarchive \
+            -exportOptionsPlist build/ExportOptions.plist \
+            -exportPath build/export \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath ~/private_keys/AuthKey_${ASC_KEY_ID}.p8 \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            | tail -40
+
+      - name: Сохранить артефакты
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build
+          path: |
+            ios/build/export/**
+            mobile/build/**
+          if-no-files-found: ignore
+          retention-days: 14

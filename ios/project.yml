@@ -1,0 +1,89 @@
+# Описание проекта для XcodeGen: `xcodegen generate` собирает из него Xsteer.xcodeproj.
+#
+# ПОЧЕМУ НЕ ГОТОВЫЙ .xcodeproj. Он представляет собой каталог с машинным plist, в котором
+# каждая ссылка — двадцатичетырёхзначный идентификатор. Такой файл нельзя ни прочитать
+# глазами, ни разумно править, ни слить при расхождении; написанный руками, он ломается
+# молча. XcodeGen ставится одной командой (`brew install xcodegen`), а этот файл читается
+# и правится как обычный текст.
+name: Xsteer
+options:
+  bundleIdPrefix: com.xyzmean
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  # Группа разработчика подставляется снаружи: у платного участия она своя, у бесплатной
+  # личной команды — своя, и записывать её в файл проекта значит ломать сборку у всех
+  # остальных. Смотри ios/Support/local.xcconfig.example.
+  defaultConfig: Debug
+
+configs:
+  Debug: debug
+  Release: release
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    # Подпись и группа разработчика приходят из local.xcconfig, который в git не лежит.
+    CODE_SIGN_STYLE: Automatic
+
+configFiles:
+  Debug: Support/local.xcconfig
+  Release: Support/local.xcconfig
+
+packages: {}
+
+targets:
+  # ---- приложение-контейнер -------------------------------------------------
+  #
+  # Само оно трафик не несёт: на iOS это делает только расширение. Приложение
+  # заводит настройку туннеля в системе, показывает состояние и включает-выключает
+  # соединение. Настройка уезжает в расширение через providerConfiguration, а не
+  # через общую группу приложений: группа — это отдельное право в профиле подписи,
+  # и без неё меньше того, что может не выдаться.
+  Xsteer:
+    type: application
+    platform: iOS
+    sources:
+      - path: App/Sources
+      - path: App/Resources
+        optional: true
+    dependencies:
+      - target: XsteerTunnel
+        embed: true
+      - framework: ../mobile/build/Xsteer.xcframework
+        embed: true
+        codeSign: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.xyzmean.xsteer
+        PRODUCT_NAME: Xsteer
+        INFOPLIST_FILE: App/Info.plist
+        CODE_SIGN_ENTITLEMENTS: App/Xsteer.entitlements
+        TARGETED_DEVICE_FAMILY: "1,2"
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+
+  # ---- расширение: сам туннель ----------------------------------------------
+  #
+  # NEPacketTunnelProvider. Именно этому целевому файлу нужно право
+  # com.apple.developer.networking.networkextension со значением
+  # packet-tunnel-provider, и именно оно доступно только платному участию в
+  # программе Apple. Бесплатный недельный сертификат такое расширение не подпишет.
+  XsteerTunnel:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Tunnel/Sources
+    dependencies:
+      - framework: ../mobile/build/Xsteer.xcframework
+        embed: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.xyzmean.xsteer.tunnel
+        PRODUCT_NAME: XsteerTunnel
+        INFOPLIST_FILE: Tunnel/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Tunnel/XsteerTunnel.entitlements
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"

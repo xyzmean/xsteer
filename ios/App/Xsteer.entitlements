@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- ЭТО ПРАВО И ЕСТЬ ГЛАВНОЕ ОГРАНИЧЕНИЕ. Тоннель на iOS умеет только
+         расширение с packet-tunnel-provider, и это право открывается
+         самообслуживанием лишь платному участию в программе Apple. Бесплатная
+         личная команда с недельным профилем его не получает: сборка соберётся,
+         а установка на устройство будет отвергнута.
+
+         Приложению-контейнеру право нужно затем, чтобы NETunnelProviderManager
+         имел право заводить и менять настройку туннеля в системе. -->
+    <key>com.apple.developer.networking.networkextension</key>
+    <array>
+        <string>packet-tunnel-provider</string>
+    </array>
+</dict>
+</plist>
