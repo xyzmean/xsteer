@@ -59,6 +59,13 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.xyzmean.xsteer
         PRODUCT_NAME: Xsteer
+        # ИМЯ МОДУЛЯ РАЗВЕДЕНО С ИМЕНЕМ ФРЕЙМВОРКА НАРОЧНО. Библиотека из Go зовётся Xsteer, и
+        # если модуль приложения зовётся так же, то `import Xsteer` внутри приложения импортирует
+        # САМО ПРИЛОЖЕНИЕ: компилятор находит свой модуль, а не библиотеку, и все её имена
+        # объявляет ненайденными. В расширении этого не было видно — там модуль XsteerTunnel, и
+        # импорт попадал куда надо. Приложение при этом остаётся Xsteer для человека:
+        # PRODUCT_NAME выше не меняется.
+        PRODUCT_MODULE_NAME: XsteerApp
         INFOPLIST_FILE: App/Info.plist
         CODE_SIGN_ENTITLEMENTS: App/Xsteer.entitlements
         TARGETED_DEVICE_FAMILY: "1,2"
